@@ -6,7 +6,7 @@ without changing UB3 or UB4 firmware.
 
 ## What it does now
 
-- Dashboard, **OneROM Control**, **DriveHUD**, and **Options** tabs.
+- **OneROM Control**, **DriveHUD**, and **Options** tabs.
 - Preserves the current UB3 ROM, boot IEC address, and write-protect workflow.
 - Preserves the current UB4 telemetry grammar and display fields.
 - Saves window geometry/maximize state and tab visibility locally.
