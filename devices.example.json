@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "devices": {
+    "ub3_active_onerom": {"usb_serial": null, "expected_role": "active-rom-control"},
+    "ub4_drivehud": {"usb_serial": null, "expected_role": "drivehud-passive-monitor"}
+  }
+}
