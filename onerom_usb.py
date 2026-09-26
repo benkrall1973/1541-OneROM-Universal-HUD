@@ -242,7 +242,13 @@ class DriveTelemetryParser:
             self.state.head = "PARK"
 
     def _set_track(self, track: int) -> None:
-        self.state.position_half_tracks = max(2, track * 2)
+        # $0022 is a DOS destination-track hint, not a continuously reliable
+        # head-position source.  Use it only for the initial anchor.  Once
+        # phase traffic or a status position has established a position, the
+        # reference HUD never lets later $0022 writes snap the display back
+        # to Track 1.0.
+        if self.state.position_half_tracks is None:
+            self.state.position_half_tracks = max(2, track * 2)
 
     def _phase(self, delta: int) -> None:
         if delta == 1 and self.state.position_half_tracks is not None:

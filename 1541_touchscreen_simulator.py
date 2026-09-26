@@ -93,11 +93,17 @@ class TouchSimulator(tk.Tk):
         self.usb_links: dict[str, CdcBoardLink] = {}
         self.telemetry_parser = DriveTelemetryParser()
         self.usb_status = tk.StringVar(value="USB discovery has not run.")
+        self.serial_last_error = tk.StringVar(value="")
+        self.serial_diagnostic_path = Path(__file__).with_name("onerom_usb_diagnostics.log")
         self.live_track = "--.-"
         self.live_density: int | None = None
         self.live_protected: bool | None = None
         self._hud_dirty = False
         self._confirmed_writable = False
+        self._wp_pending_state: bool | None = None
+        self._wp_after_id: str | None = None
+        self._reconnect_after: dict[str, str] = {}
+        self._reconnect_delay_ms = {"controller": 1000, "hud": 1000}
 
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -316,33 +322,6 @@ class TouchSimulator(tk.Tk):
             return
         details = "; ".join(f"{board.serial_number} on {board.port}" for board in boards)
         self.usb_status.set(f"Found {len(boards)} board(s): {details}")
-        self.restore_saved_connections()
-
-    def restore_saved_connections(self) -> None:
-        """Reconnect persisted roles when their stable USB serials return."""
-        try:
-            self.drive_binding.validate()
-            restored: list[str] = []
-            for role, serial_number in (
-                ("controller", self.drive_binding.controller_serial),
-                ("hud", self.drive_binding.hud_serial),
-            ):
-                if not serial_number or role in self.usb_links:
-                    continue
-                board = self.usb_boards.get(serial_number)
-                if board is None:
-                    continue
-                link = CdcBoardLink(board)
-                link.open()
-                self.usb_links[role] = link
-                self.after(150, link.assert_dtr)
-                restored.append(role.title())
-            self.ub3.set("controller" in self.usb_links)
-            self.ub4.set("hud" in self.usb_links)
-            if restored:
-                self.usb_status.set(f"Restored USB connection: {', '.join(restored)}.")
-        except Exception as exc:
-            self.usb_status.set(f"Saved USB binding could not reconnect: {exc}")
 
     def connect_assigned_boards(self, selected_role: str | None = None) -> None:
         """Persist serial-to-drive role bindings and open their CDC telemetry links."""
@@ -359,25 +338,30 @@ class TouchSimulator(tk.Tk):
             binding.validate()
             if not self.usb_boards:
                 self.refresh_usb_boards()
-            for role, serial_number in (("controller", binding.controller_serial), ("hud", binding.hud_serial)):
-                if serial_number and serial_number not in self.usb_boards:
+            roles = (selected_role,) if selected_role else ("controller", "hud")
+            for role in roles:
+                serial_number = binding.controller_serial if role == "controller" else binding.hud_serial
+                if not serial_number:
+                    raise ValueError(f"Select a {role.title()} serial first.")
+                board = self.usb_boards.get(serial_number)
+                if board is None:
                     raise ValueError(f"{role.title()} serial {serial_number} is not currently connected.")
-            for link in self.usb_links.values():
-                link.close()
-            self.usb_links = {}
-            for role, serial_number in (("controller", binding.controller_serial), ("hud", binding.hud_serial)):
-                if serial_number:
-                    link = CdcBoardLink(self.usb_boards[serial_number])
-                    link.open()
-                    self.usb_links[role] = link
-                    self.after(150, link.assert_dtr)
+                existing = self.usb_links.get(role)
+                if existing is not None and existing.board.serial_number == serial_number and existing.connected:
+                    continue
+                if existing is not None:
+                    existing.close()
+                link = CdcBoardLink(board)
+                link.open()
+                self.usb_links[role] = link
+                self.after(150, link.assert_dtr)
             self.drive_binding = binding
             save_binding(self.binding_path, binding)
             self.ub3.set("controller" in self.usb_links)
             self.ub4.set("hud" in self.usb_links)
-            controller_state = binding.controller_serial or "unassigned"
-            hud_state = binding.hud_serial or "unassigned"
-            self.usb_status.set(f"Saved binding — Controller: {controller_state}; DriveHUD: {hud_state}.")
+            controller_state = "connected" if "controller" in self.usb_links else "saved / offline"
+            hud_state = "connected" if "hud" in self.usb_links else "saved / offline"
+            self.usb_status.set(f"{selected_role.title() if selected_role else 'Role'} connected — Controller: {controller_state}; DriveHUD: {hud_state}.")
             self.apply_device_state()
         except Exception as exc:
             self.usb_status.set(f"USB connection failed: {exc}")
@@ -423,10 +407,12 @@ class TouchSimulator(tk.Tk):
                     self.motor_var.set("ON" if state.motor else "OFF")
                 if state.density is not None:
                     self.live_density = state.density
-                    self.density_var.set(f"D{state.density}")
+                    # Density is rendered directly on the fixed 7-inch HUD;
+                    # the desktop card layout has no matching Tk variable.
+                    if hasattr(self, "density_var"):
+                        self.density_var.set(f"D{state.density}")
                 if state.protected is not None:
-                    self.live_protected = state.protected
-                    self.wp_var.set("PROTECTED" if state.protected else "WRITABLE")
+                    self.schedule_write_protect_update(state.protected)
                 if state.head in ("IN", "OUT", "PARK"):
                     self.head_var.set(state.head)
                     if state.head in ("IN", "OUT"):
@@ -435,13 +421,16 @@ class TouchSimulator(tk.Tk):
             # Only existing live HUD items are updated in place.
             self._hud_dirty = self._hud_dirty or changed
             if changed:
+                self.serial_last_error.set("")
                 self.update_live_hud_fields()
         except Exception as exc:
+            self.record_serial_diagnostic("DriveHUD", link, exc)
             link.close()
             self.usb_links.pop("hud", None)
             self.ub4.set(False)
-            self.usb_status.set(f"DriveHUD link interrupted: {exc}. Use REFRESH USB DEVICES to reconnect.")
+            self.usb_status.set(f"DriveHUD link interrupted; reconnecting automatically: {exc}")
             self.apply_device_state()
+            self.schedule_role_reconnect("hud")
 
     def poll_controller_feedback(self) -> None:
         """Drain Controller CDC output so its USB log/reply FIFO cannot back up."""
@@ -458,11 +447,61 @@ class TouchSimulator(tk.Tk):
                     elif ",FAIL" in line or ",ERROR," in line:
                         self.control_status.set(f"Controller rejected request: {line}")
         except Exception as exc:
+            self.record_serial_diagnostic("Controller", link, exc)
             link.close()
             self.usb_links.pop("controller", None)
             self.ub3.set(False)
-            self.usb_status.set(f"Controller serial link interrupted: {exc}")
+            self.usb_status.set(f"Controller serial link interrupted; reconnecting automatically: {exc}")
             self.apply_device_state()
+            self.schedule_role_reconnect("controller")
+
+    def schedule_role_reconnect(self, role: str) -> None:
+        """Retry one role with backoff after a transient Windows CDC failure."""
+        if role in self._reconnect_after:
+            return
+        delay = self._reconnect_delay_ms[role]
+        self._reconnect_after[role] = self.after(delay, lambda current=role: self.attempt_role_reconnect(current))
+        self._reconnect_delay_ms[role] = min(delay * 2, 8000)
+
+    def attempt_role_reconnect(self, role: str) -> None:
+        self._reconnect_after.pop(role, None)
+        serial_number = self.drive_binding.controller_serial if role == "controller" else self.drive_binding.hud_serial
+        if not serial_number or role in self.usb_links:
+            return
+        boards = discover_cdc_boards()
+        self.usb_boards = {board.serial_number: board for board in boards}
+        board = self.usb_boards.get(serial_number)
+        if board is None:
+            self.usb_status.set(f"Waiting for {role.title()} serial {serial_number} to reappear.")
+            self.schedule_role_reconnect(role)
+            return
+        try:
+            link = CdcBoardLink(board)
+            link.open()
+            self.usb_links[role] = link
+            self.after(150, link.assert_dtr)
+            self._reconnect_delay_ms[role] = 1000
+            if role == "controller":
+                self.ub3.set(True)
+            else:
+                self.ub4.set(True)
+            self.serial_last_error.set("")
+            self.usb_status.set(f"{role.title()} {serial_number} automatically reconnected.")
+            self.apply_device_state()
+        except Exception as exc:
+            self.usb_status.set(f"{role.title()} reconnect retry failed: {exc}")
+            self.schedule_role_reconnect(role)
+
+    def record_serial_diagnostic(self, role: str, link: CdcBoardLink, exc: Exception) -> None:
+        """Preserve the raw Windows/pyserial failure for bench debugging."""
+        message = f"{role} {link.board.serial_number} on {link.board.port}: {type(exc).__name__}: {exc}"
+        self.serial_last_error.set(message)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with self.serial_diagnostic_path.open("a", encoding="utf-8") as log:
+                log.write(f"{timestamp} {message}\n")
+        except OSError:
+            pass
 
     def update_live_hud_fields(self) -> None:
         """Update existing HUD Canvas items without rebuilding the screen."""
@@ -482,6 +521,24 @@ class TouchSimulator(tk.Tk):
         except tk.TclError:
             # The screen may have changed between CDC receive and paint.
             pass
+
+    def schedule_write_protect_update(self, protected: bool) -> None:
+        """Apply the proven GUI-only 250 ms last-event-wins WP debounce."""
+        self._wp_pending_state = protected
+        if self._wp_after_id is not None:
+            try:
+                self.after_cancel(self._wp_after_id)
+            except tk.TclError:
+                pass
+        self._wp_after_id = self.after(250, self.commit_write_protect_update)
+
+    def commit_write_protect_update(self) -> None:
+        self._wp_after_id = None
+        if self._wp_pending_state is None:
+            return
+        self.live_protected = self._wp_pending_state
+        self.wp_var.set("PROTECTED" if self.live_protected else "WRITABLE")
+        self.update_live_hud_fields()
 
     def apply_device_state(self, initial=False) -> None:
         # A maintained override must never survive loss of the control board.
@@ -956,7 +1013,11 @@ class TouchSimulator(tk.Tk):
             footer_status = f"● Controller {controller_state} · DriveHUD {hud_state}"
         else:
             footer_status = "● No boards configured"
-        text(1240, 680, footer_status, 20, ACCENT if self.preview_page != "setup" else MUTED, True, "e")
+        diagnostic = self.serial_last_error.get()
+        if diagnostic:
+            text(1240, 680, f"USB ERROR: {diagnostic[:88]}", 14, OFFLINE, True, "e")
+        else:
+            text(1240, 680, footer_status, 20, ACCENT if self.preview_page != "setup" else MUTED, True, "e")
         if self.popup_menu is not None:
             if self.hex_entry is not None and self.hex_entry.winfo_exists():
                 self.hex_entry.destroy()
