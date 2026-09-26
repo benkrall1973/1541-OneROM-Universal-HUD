@@ -10,8 +10,11 @@ from __future__ import annotations
 import time
 import math
 import colorsys
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
+
+from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discover_cdc_boards, load_binding, save_binding
 
 
 WIDTH, HEIGHT = 1280, 720
@@ -41,8 +44,10 @@ class TouchSimulator(tk.Tk):
         self.minsize(980, 600)
         self.configure(bg=BG)
 
-        self.ub3 = tk.BooleanVar(value=True)
-        self.ub4 = tk.BooleanVar(value=True)
+        # A real drive starts disconnected.  The two role cards on Settings
+        # are the only way to attach physical OneROMs to this drive.
+        self.ub3 = tk.BooleanVar(value=False)
+        self.ub4 = tk.BooleanVar(value=False)
         # These mirror the optional controller capabilities selected in the
         # board's configuration JSON at compile time.  The touchscreen may
         # show only the controls the finished controller actually supports.
@@ -65,9 +70,9 @@ class TouchSimulator(tk.Tk):
         self.current_page = "hud"
         self.last_input = time.monotonic()
         self.screensaver = False
-        self.track = 18
+        self.track = 0
         self.sector = 6
-        self.motor = True
+        self.motor = False
         self.head_direction = "IN"
         self.write_protect_prompt: bool | None = None
         self.color_picker: str | None = None
@@ -75,6 +80,23 @@ class TouchSimulator(tk.Tk):
         self.appearance_target = "background"
         self.gradient_hue = 0.47
         self.hex_keyboard = False
+        self.binding_path = Path(__file__).with_name("onerom_drive_bindings.json")
+        self.drive_binding = load_binding(self.binding_path)
+        try:
+            self.drive_binding.validate()
+        except ValueError:
+            # Never carry a corrupt historical duplicate assignment forward.
+            self.drive_binding = DriveBinding(drive_id="1541 Drive")
+        self.controller_serial = tk.StringVar(value=self.drive_binding.controller_serial)
+        self.hud_serial = tk.StringVar(value=self.drive_binding.hud_serial)
+        self.usb_boards = {}
+        self.usb_links: dict[str, CdcBoardLink] = {}
+        self.telemetry_parser = DriveTelemetryParser()
+        self.usb_status = tk.StringVar(value="USB discovery has not run.")
+        self.live_track = "--.-"
+        self.live_density: int | None = None
+        self.live_protected: bool | None = None
+        self._hud_dirty = False
 
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -103,21 +125,24 @@ class TouchSimulator(tk.Tk):
         self.build_hud()
         self.build_control()
         self.build_settings()
+        self.build_connection_setup("controller")
+        self.build_connection_setup("hud")
         self.build_idle()
+        self.refresh_usb_boards()
         self.nav = ttk.Frame(self, padding=(22, 0, 22, 18))
         self.nav.pack(fill="x")
         self.hud_button = ttk.Button(self.nav, text="DRIVEHUD", style="Nav.TButton", command=lambda: self.show_page("hud"))
         self.control_button = ttk.Button(self.nav, text="ONEROM CONTROL", style="Nav.TButton", command=lambda: self.show_page("control"))
         self.hud_button.pack(side="left")
         self.control_button.pack(side="left", padx=12)
-        ttk.Label(self.nav, text="Touchscreen layout simulator — no real hardware is accessed", style="Sub.TLabel").pack(side="right", pady=12)
+        ttk.Label(self.nav, text="Touchscreen simulator — USB serial binding ready", style="Sub.TLabel").pack(side="right", pady=12)
 
         self.bind_all("<Button>", self.register_input, add=True)
         self.bind_all("<Key>", self.register_input, add=True)
         self.apply_device_state(initial=True)
         self.tick()
-        # The default view is the calibrated physical reference, because that
-        # is how the finished device will actually appear on the 7-inch panel.
+        # Start in the calibrated 7-inch interface; Windows is only the host
+        # during current bench testing.
         self.after_idle(self.launch_physical_preview)
 
     def page(self, name: str) -> ttk.Frame:
@@ -135,7 +160,7 @@ class TouchSimulator(tk.Tk):
     def build_hud(self) -> None:
         page = self.page("hud")
         ttk.Label(page, text="DriveHUD", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(page, text="Live 1541 mechanical telemetry — UB4 passive monitor", style="Sub.TLabel").pack(anchor="w", pady=(0, 14))
+        ttk.Label(page, text="Live 1541 mechanical telemetry — selected DriveHUD board", style="Sub.TLabel").pack(anchor="w", pady=(0, 14))
         grid = ttk.Frame(page); grid.pack(fill="both", expand=True)
         grid.columnconfigure((0, 1, 2), weight=1); grid.rowconfigure((0, 1), weight=1)
         self.track_card, self.track_var = self.card(grid, "Track", "18.0")
@@ -149,12 +174,12 @@ class TouchSimulator(tk.Tk):
         footer = ttk.Frame(page, style="Panel.TFrame", padding=14); footer.pack(fill="x", pady=(12, 0))
         self.hud_connection = tk.StringVar()
         ttk.Label(footer, textvariable=self.hud_connection, style="Panel.TLabel").pack(side="left")
-        ttk.Button(footer, text="SIMULATE MOTOR", command=self.toggle_motor).pack(side="right")
+        ttk.Button(footer, text="DRIVEHUD CONNECTION SETUP", command=lambda: self.show_connection_setup("hud")).pack(side="right")
 
     def build_control(self) -> None:
         page = self.page("control")
         ttk.Label(page, text="OneROM Control", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(page, text="Persistent ROM, IEC address, and write-protect configuration — UB3", style="Sub.TLabel").pack(anchor="w", pady=(0, 14))
+        ttk.Label(page, text="Persistent ROM, IEC address, and write-protect configuration — selected Controller board", style="Sub.TLabel").pack(anchor="w", pady=(0, 14))
         left = ttk.Frame(page); left.pack(side="left", fill="both", expand=True, padx=(0, 8))
         right = ttk.Frame(page); right.pack(side="left", fill="both", expand=True, padx=(8, 0))
         rom = ttk.Frame(left, style="Panel.TFrame", padding=18); rom.pack(fill="both", expand=True)
@@ -182,12 +207,20 @@ class TouchSimulator(tk.Tk):
         page = self.page("settings")
         ttk.Label(page, text="Settings", style="Title.TLabel").pack(anchor="w")
         ttk.Label(page, text="Prototype communications and startup behavior", style="Sub.TLabel").pack(anchor="w", pady=(0, 14))
-        devices = ttk.Frame(page, style="Panel.TFrame", padding=18); devices.pack(fill="x")
-        ttk.Label(devices, text="SIMULATED USB DEVICES", style="Section.TLabel").pack(anchor="w")
-        ttk.Checkbutton(devices, text="UB3 Active OneROM connected (COM4)", variable=self.ub3, command=self.apply_device_state).pack(anchor="w", pady=(12, 4))
-        ttk.Checkbutton(devices, text="UB4 DriveHUD connected (COM3)", variable=self.ub4, command=self.apply_device_state).pack(anchor="w", pady=4)
+        devices = ttk.Frame(page); devices.pack(fill="x")
+        devices.columnconfigure((0, 1), weight=1)
+        controller_card = ttk.Frame(devices, style="Panel.TFrame", padding=18)
+        controller_card.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        ttk.Label(controller_card, text="CONTROLLER ONE ROM", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(controller_card, text="Choose the OneROM that controls ROM, IEC, and write-protect.", style="Panel.TLabel", wraplength=500).pack(anchor="w", pady=(8, 12))
+        ttk.Button(controller_card, text="CONTROLLER CONNECTION SETUP", command=lambda: self.show_connection_setup("controller")).pack(anchor="e")
+        hud_card = ttk.Frame(devices, style="Panel.TFrame", padding=18)
+        hud_card.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        ttk.Label(hud_card, text="DRIVEHUD ONE ROM", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(hud_card, text="Choose the OneROM that supplies passive drive telemetry.", style="Panel.TLabel", wraplength=500).pack(anchor="w", pady=(8, 12))
+        ttk.Button(hud_card, text="DRIVEHUD CONNECTION SETUP", command=lambda: self.show_connection_setup("hud")).pack(anchor="e")
         self.device_summary = tk.StringVar()
-        ttk.Label(devices, textvariable=self.device_summary, style="Panel.TLabel", wraplength=1100).pack(anchor="w", pady=(14, 0))
+        ttk.Label(page, textvariable=self.device_summary, style="Sub.TLabel", wraplength=1100).pack(anchor="w", pady=(14, 0))
         startup = ttk.Frame(page, style="Panel.TFrame", padding=18); startup.pack(fill="x", pady=(14, 0))
         ttk.Label(startup, text="STARTUP AND IDLE BEHAVIOR", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(startup, text="Preferred startup screen:", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(12, 0))
@@ -202,6 +235,45 @@ class TouchSimulator(tk.Tk):
         ttk.Spinbox(startup, from_=50, to=200, textvariable=self.preview_scale, width=9, font=("Segoe UI", 11)).grid(row=4, column=1, sticky="w", padx=12, pady=(8, 0))
         ttk.Button(startup, text="OPEN / APPLY 7-INCH PREVIEW", command=self.open_size_preview).grid(row=4, column=2, padx=8, pady=(8, 0))
         ttk.Button(page, text="← RETURN", style="Nav.TButton", command=lambda: self.show_page(self.default_page())).pack(anchor="w", pady=16)
+
+    def build_connection_setup(self, role: str) -> None:
+        """Build one dedicated setup page per physical OneROM role."""
+        is_controller = role == "controller"
+        page = self.page(f"{role}_connection")
+        role_name = "Controller" if is_controller else "DriveHUD"
+        serial_var = self.controller_serial if is_controller else self.hud_serial
+        ttk.Label(page, text=f"{role_name} Connection Setup", style="Title.TLabel").pack(anchor="w")
+        description = (
+            "Assign the OneROM that performs ROM, IEC address, and write-protect control for this drive. "
+            "Either physical OneROM can fill this role."
+            if is_controller else
+            "Assign the OneROM that passively reads drive telemetry for this drive. "
+            "Either physical OneROM can fill this role."
+        )
+        ttk.Label(page, text=description, style="Sub.TLabel", wraplength=1080).pack(anchor="w", pady=(0, 16))
+        card = ttk.Frame(page, style="Panel.TFrame", padding=22); card.pack(fill="x")
+        ttk.Label(card, text=f"{role_name.upper()} ONE ROM", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(card, text="USB SERIAL NUMBER", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(16, 0))
+        serial_box = ttk.Combobox(card, textvariable=serial_var, state="readonly", width=44, font=("Segoe UI", 12))
+        serial_box.grid(row=1, column=1, sticky="w", padx=(18, 0), pady=(16, 0))
+        if is_controller:
+            self.controller_serial_box = serial_box
+        else:
+            self.hud_serial_box = serial_box
+        ttk.Button(card, text="REFRESH USB DEVICES", command=self.refresh_usb_boards).grid(row=2, column=1, sticky="w", padx=(18, 0), pady=(16, 0))
+        ttk.Label(card, textvariable=self.usb_status, style="Panel.TLabel", wraplength=1050).grid(row=3, column=0, columnspan=2, sticky="w", pady=(18, 0))
+        ttk.Button(page, text=f"SAVE {role_name.upper()} CONNECTION", command=self.connect_assigned_boards).pack(anchor="e", pady=(16, 0))
+        ttk.Button(page, text="← BACK TO SETTINGS", style="Nav.TButton", command=lambda: self.show_page("settings")).pack(anchor="w", pady=16)
+
+    def show_connection_setup(self, role: str) -> None:
+        self.refresh_usb_boards()
+        self.show_page(f"{role}_connection")
+
+    def open_desktop_connection_setup(self, role: str) -> None:
+        """Open the selected role's setup page on the calibrated 7-inch UI."""
+        self.refresh_usb_boards()
+        self.preview_page = f"{role}_connection"
+        self.open_size_preview()
 
     def build_idle(self) -> None:
         page = self.page("idle")
@@ -230,6 +302,144 @@ class TouchSimulator(tk.Tk):
         if self.ub3.get(): return "control"
         return "settings"
 
+    def refresh_usb_boards(self) -> None:
+        """Discover CDC boards and present their stable USB serials for binding."""
+        boards = discover_cdc_boards()
+        self.usb_boards = {board.serial_number: board for board in boards}
+        serials = [""] + [board.serial_number for board in boards]
+        self.controller_serial_box["values"] = serials
+        self.hud_serial_box["values"] = serials
+        if not boards:
+            self.usb_status.set("No OneROM CDC board with a USB serial is connected. Connect a OneROM, then refresh this list.")
+            return
+        details = "; ".join(f"{board.serial_number} on {board.port}" for board in boards)
+        self.usb_status.set(f"Found {len(boards)} board(s): {details}")
+        self.restore_saved_connections()
+
+    def restore_saved_connections(self) -> None:
+        """Reconnect persisted roles when their stable USB serials return."""
+        try:
+            self.drive_binding.validate()
+            restored: list[str] = []
+            for role, serial_number in (
+                ("controller", self.drive_binding.controller_serial),
+                ("hud", self.drive_binding.hud_serial),
+            ):
+                if not serial_number or role in self.usb_links:
+                    continue
+                board = self.usb_boards.get(serial_number)
+                if board is None:
+                    continue
+                link = CdcBoardLink(board)
+                link.open()
+                self.usb_links[role] = link
+                self.after(150, link.assert_dtr)
+                restored.append(role.title())
+            self.ub3.set("controller" in self.usb_links)
+            self.ub4.set("hud" in self.usb_links)
+            if restored:
+                self.usb_status.set(f"Restored USB connection: {', '.join(restored)}.")
+        except Exception as exc:
+            self.usb_status.set(f"Saved USB binding could not reconnect: {exc}")
+
+    def connect_assigned_boards(self, selected_role: str | None = None) -> None:
+        """Persist serial-to-drive role bindings and open their CDC telemetry links."""
+        binding = DriveBinding(
+            drive_id="1541 Drive",
+            controller_serial=self.controller_serial.get().strip(),
+            hud_serial=self.hud_serial.get().strip(),
+        )
+        try:
+            if selected_role == "controller" and binding.controller_serial and binding.controller_serial == binding.hud_serial:
+                raise ValueError("This OneROM is currently bound as DriveHUD. Release the DriveHUD binding before assigning it as Controller.")
+            if selected_role == "hud" and binding.hud_serial and binding.hud_serial == binding.controller_serial:
+                raise ValueError("This OneROM is currently bound as Controller. Release the Controller binding before assigning it as DriveHUD.")
+            binding.validate()
+            if not self.usb_boards:
+                self.refresh_usb_boards()
+            for role, serial_number in (("controller", binding.controller_serial), ("hud", binding.hud_serial)):
+                if serial_number and serial_number not in self.usb_boards:
+                    raise ValueError(f"{role.title()} serial {serial_number} is not currently connected.")
+            for link in self.usb_links.values():
+                link.close()
+            self.usb_links = {}
+            for role, serial_number in (("controller", binding.controller_serial), ("hud", binding.hud_serial)):
+                if serial_number:
+                    link = CdcBoardLink(self.usb_boards[serial_number])
+                    link.open()
+                    self.usb_links[role] = link
+                    self.after(150, link.assert_dtr)
+            self.drive_binding = binding
+            save_binding(self.binding_path, binding)
+            self.ub3.set("controller" in self.usb_links)
+            self.ub4.set("hud" in self.usb_links)
+            controller_state = binding.controller_serial or "unassigned"
+            hud_state = binding.hud_serial or "unassigned"
+            self.usb_status.set(f"Saved binding — Controller: {controller_state}; DriveHUD: {hud_state}.")
+            self.apply_device_state()
+        except Exception as exc:
+            self.usb_status.set(f"USB connection failed: {exc}")
+
+    def release_role_binding(self, role: str) -> None:
+        """Release one persisted role without touching the other OneROM."""
+        if role not in ("controller", "hud"):
+            raise ValueError(f"Unknown OneROM role: {role}")
+        link = self.usb_links.pop(role, None)
+        if link is not None:
+            link.close()
+        if role == "controller":
+            self.controller_serial.set("")
+        else:
+            self.hud_serial.set("")
+        self.drive_binding = DriveBinding(
+            drive_id="1541 Drive",
+            controller_serial=self.controller_serial.get().strip(),
+            hud_serial=self.hud_serial.get().strip(),
+        )
+        save_binding(self.binding_path, self.drive_binding)
+        self.ub3.set("controller" in self.usb_links)
+        self.ub4.set("hud" in self.usb_links)
+        self.usb_status.set(f"{role.title()} binding released. The other OneROM role was left unchanged.")
+        self.apply_device_state()
+
+    def poll_usb_telemetry(self) -> None:
+        """Apply passive DriveHUD CDC telemetry without emitting control commands."""
+        link = self.usb_links.get("hud")
+        if link is None:
+            return
+        try:
+            changed = False
+            # Keep the UI responsive even if firmware emits a burst of
+            # diagnostics.  The newest telemetry is what matters for HUD.
+            for line in link.read_lines()[-96:]:
+                state = self.telemetry_parser.process(line)
+                changed = True
+                self.live_track = state.track
+                self.track_var.set(state.track)
+                if state.motor is not None:
+                    self.motor = state.motor
+                    self.motor_var.set("ON" if state.motor else "OFF")
+                if state.density is not None:
+                    self.live_density = state.density
+                    self.density_var.set(f"D{state.density}")
+                if state.protected is not None:
+                    self.live_protected = state.protected
+                    self.wp_var.set("PROTECTED" if state.protected else "WRITABLE")
+                if state.head in ("IN", "OUT", "PARK"):
+                    self.head_var.set(state.head)
+                    if state.head in ("IN", "OUT"):
+                        self.head_direction = state.head
+            # Never rebuild the entire Canvas from the CDC receive loop.
+            # The next explicit screen navigation paints the latest state;
+            # targeted live HUD item updates will be added separately.
+            self._hud_dirty = self._hud_dirty or changed
+        except Exception as exc:
+            link.close()
+            self.usb_links.pop("hud", None)
+            self.ub4.set(False)
+            self.usb_status.set(f"DriveHUD serial link lost: {exc}")
+            self.apply_device_state()
+
     def apply_device_state(self, initial=False) -> None:
         # A maintained override must never survive loss of the control board.
         # This models the real application rule for a drive power-off / USB
@@ -238,13 +448,15 @@ class TouchSimulator(tk.Tk):
             self.writable.set(False)
         self.hud_button.configure(state="normal" if self.ub4.get() else "disabled")
         self.control_button.configure(state="normal" if self.ub3.get() else "disabled")
-        self.hud_connection.set("UB4 connected • Passive telemetry running" if self.ub4.get() else "UB4 not detected • DriveHUD unavailable")
-        self.control_status.set("UB3 connected • Changes are simulated only" if self.ub3.get() else "UB3 not detected • Control actions unavailable")
+        controller_id = self.drive_binding.controller_serial or "Not connected"
+        hud_id = self.drive_binding.hud_serial or "Not connected"
+        self.hud_connection.set(f"DriveHUD {hud_id} connected • Passive telemetry running" if self.ub4.get() else "DriveHUD not detected • HUD unavailable")
+        self.control_status.set(f"Controller {controller_id} connected • Ready for controller commands" if self.ub3.get() else "Controller not detected • Control actions unavailable")
         state = []
-        state.append("UB3: Connected (COM4)" if self.ub3.get() else "UB3: Not connected")
-        state.append("UB4: Connected (COM3)" if self.ub4.get() else "UB4: Not connected")
+        state.append(f"Controller: {controller_id}" if self.ub3.get() else "Controller: Not connected")
+        state.append(f"DriveHUD: {hud_id}" if self.ub4.get() else "DriveHUD: Not connected")
         self.status_var.set("   •   ".join(state))
-        self.device_summary.set("   •   ".join(state) + "\nIn the finished version, serial-number bindings—not these COM numbers—identify each board.")
+        self.device_summary.set("   •   ".join(state) + "\nBoard roles are assigned by USB serial number; COM ports may change without changing the drive binding.")
         if not initial and self.current_page not in ("settings", "idle"):
             self.show_page(self.default_page())
         elif initial:
@@ -255,11 +467,11 @@ class TouchSimulator(tk.Tk):
 
     def save_rom(self) -> None:
         self.rom_var.set(self.rom_choice.get())
-        self.control_status.set("Startup ROM saved in simulated NV0. A real drive applies it on reset/power-cycle.")
+        self.control_status.set("Startup ROM selection is staged. Controller command support will apply it to the connected board.")
 
     def save_iec(self) -> None:
         self.iec_var.set(self.iec_choice.get())
-        self.control_status.set("Boot IEC address saved in simulated NV2.")
+        self.control_status.set("IEC address selection is staged. Controller command support will apply it to the connected board.")
 
     def update_protection(self) -> None:
         self.control_status.set("Write-protect override ON — forces writable." if self.writable.get() else "Write-protect override OFF — normal protection.")
@@ -379,6 +591,8 @@ class TouchSimulator(tk.Tk):
 
     def normalize_preview_page(self) -> None:
         """Keep the compact UI on a screen supported by installed boards."""
+        if self.preview_page in ("settings", "controller_connection", "hud_connection"):
+            return
         if self.preview_page == "hud" and not self.ub4.get():
             self.preview_page = "control" if self.ub3.get() else "setup"
         elif self.preview_page == "control" and not self.ub3.get():
@@ -397,8 +611,10 @@ class TouchSimulator(tk.Tk):
         self.show_page("idle")
 
     def launch_physical_preview(self) -> None:
+        # The physical 7-inch screen is the primary user interface.  The
+        # hidden Tk root only owns this calibrated touch window.
         self.withdraw()
-        self.preview_page = "hud"
+        self.preview_page = "settings"
         self.open_size_preview()
 
     def open_size_preview(self, _restore_workspace: bool = False) -> None:
@@ -490,7 +706,7 @@ class TouchSimulator(tk.Tk):
             text(26, 66, "DriveHUD · passive monitor · Firmware V1.0.0", 16, MUTED)
             # Primary live telemetry in the first two rows; the remaining
             # available HUD tags and sector FIFO stay visible below them.
-            box(24, 82, 420, 220, "Track", "18.0", value_size=56, value_y=171)
+            box(24, 82, 420, 220, "Track", self.live_track, value_size=56, value_y=171)
             box(440, 82, 660, 220, "Motor", "")
             text(462, 160, "ON" if self.motor else "OFF", 28, TEXT, True)
             if self.motor:
@@ -498,7 +714,7 @@ class TouchSimulator(tk.Tk):
             box(680, 82, 900, 220, "Head", "")
             text(702, 160, self.head_direction, 28, TEXT, True)
             draw_head_motion(time.monotonic())
-            box(920, 82, 1256, 220, "Density", self.simulated_density())
+            box(920, 82, 1256, 220, "Density", f"D{self.live_density}" if self.live_density is not None else self.simulated_density())
             box(24, 232, 420, 370, "RPM", "300.7" if self.motor else "0.0")
             box(440, 232, 660, 370, "RPM State", "FRESH" if self.motor else "OFF")
             box(680, 232, 900, 370, "Sector", "06" if self.motor else "--")
@@ -506,7 +722,8 @@ class TouchSimulator(tk.Tk):
             text(946, 342, "raw SYNC / fresh RPM", 14, MUTED)
             if self.ub3.get() and self.controller_wp_enabled.get():
                 box(24, 382, 420, 520, "Sync / Rev Est", "33.90" if self.motor else "--.--")
-                box(440, 382, 1256, 520, "Write Protect", "WRITABLE" if self.writable.get() else "PROTECTED")
+                protected = self.live_protected if self.live_protected is not None else not self.writable.get()
+                box(440, 382, 1256, 520, "Write Protect", "PROTECTED" if protected else "WRITABLE")
                 hud_wp_action = "Disable override" if self.writable.get() else "Enable writable override"
                 canvas.create_rectangle(850*sx, 447*sy, 1228*sx, 499*sy, fill=OFFLINE if self.writable.get() else ACCENT, outline="")
                 text(1039, 473, hud_wp_action.upper(), 17, BG, True, "center")
@@ -549,19 +766,19 @@ class TouchSimulator(tk.Tk):
                 box(24, 344, 760, 566, "Write-Protect Override", "NOT ENABLED")
                 text(50, 486, "Enable in Settings / controller JSON build.", 15, MUTED)
             box(784, 344, 1256, 566, "Connection", "Controller online" if self.ub3.get() else "USB LOST")
-            text(1020, 530, "Tap to simulate connect / loss", 18, MUTED, False, "center")
+            text(1020, 530, "Tap to open Controller connection setup", 18, MUTED, False, "center")
             text(28, 594, self.control_status.get(), 16, ACCENT if self.ub3.get() else OFFLINE)
         elif self.preview_page == "settings":
             text(26, 66, "Settings", 16, MUTED)
             canvas.create_rectangle(24*sx, 96*sy, 620*sx, 214*sy, fill=PANEL, outline=PANEL_ALT, width=1)
             canvas.create_rectangle(660*sx, 96*sy, 1256*sx, 214*sy, fill=PANEL, outline=PANEL_ALT, width=1)
             text(50, 126, "CONTROLLER-ROLE ONEROM", 18, MUTED, True)
-            text(50, 172, "INSTALLED" if self.ub3.get() else "NOT INSTALLED", 26, ACCENT if self.ub3.get() else OFFLINE, True)
+            text(50, 172, "CONNECTED" if self.ub3.get() else "NOT CONNECTED", 26, ACCENT if self.ub3.get() else OFFLINE, True)
             text(686, 126, "HUD-ROLE ONEROM", 18, MUTED, True)
-            text(686, 172, "INSTALLED" if self.ub4.get() else "NOT INSTALLED", 26, ACCENT if self.ub4.get() else OFFLINE, True)
-            text(50, 202, "Tap to toggle simulated hardware", 13, MUTED)
-            text(686, 202, "Tap to toggle simulated hardware", 13, MUTED)
-            text(26, 246, "Either OneROM can be compiled as the Controller or the passive DriveHUD; the board JSON selects its role.", 14, MUTED)
+            text(686, 172, "CONNECTED" if self.ub4.get() else "NOT CONNECTED", 26, ACCENT if self.ub4.get() else OFFLINE, True)
+            text(50, 202, "Tap to open Controller connection setup", 13, MUTED)
+            text(686, 202, "Tap to open DriveHUD connection setup", 13, MUTED)
+            text(26, 246, "Either physical OneROM can be assigned as Controller or DriveHUD for this drive.", 14, MUTED)
             # Controller choices are a left-hand stack, exactly aligned with
             # the Controller-role status card. Appearance choices mirror it
             # on the right, aligned with the HUD-role status card.
@@ -600,10 +817,47 @@ class TouchSimulator(tk.Tk):
             canvas.create_rectangle(1080*sx, 556*sy, 1240*sx, 608*sy, fill=ACCENT, outline="")
             text(980, 582, "− 1%", 17, TEXT, True, "center")
             text(1160, 582, "+ 1%", 17, BG, True, "center")
+        elif self.preview_page in ("controller_connection", "hud_connection"):
+            role = "controller" if self.preview_page == "controller_connection" else "hud"
+            role_title = "CONTROLLER" if role == "controller" else "DRIVEHUD"
+            serial_var = self.controller_serial if role == "controller" else self.hud_serial
+            text(26, 66, f"{role_title.title()} OneROM Communication Setup", 16, MUTED)
+            box(24, 96, 1256, 188, f"{role_title} ROLE", serial_var.get() or "NO ONEROM SELECTED", value_size=23, value_y=158)
+            canvas.create_rectangle(24*sx, 210*sy, 342*sx, 262*sy, fill=PANEL_ALT, outline="")
+            text(183, 236, "REFRESH USB DEVICES", 17, TEXT, True, "center")
+            # Assigned serials remain visible in the role card above, but are
+            # intentionally removed from every picker list.  Releasing the
+            # role makes the physical board available again.
+            # Use the saved drive binding, not the currently highlighted row.
+            # A touch selection is only a pending choice until CONNECT saves
+            # it; otherwise the board vanishes before it can be connected.
+            assigned_serials = {
+                serial for serial in (self.drive_binding.controller_serial, self.drive_binding.hud_serial) if serial
+            }
+            boards = [board for board in self.usb_boards.values() if board.serial_number not in assigned_serials]
+            if boards:
+                text(24, 290, "UNASSIGNED ONEROM USB DEVICES", 16, MUTED, True)
+                for index, board in enumerate(boards[:4]):
+                    y = 310 + index * 62
+                    selected = board.serial_number == serial_var.get()
+                    canvas.create_rectangle(24*sx, y*sy, 1256*sx, (y+52)*sy,
+                                            fill=ACCENT if selected else PANEL, outline=PANEL_ALT)
+                    text(48, y+26, board.serial_number, 18, BG if selected else TEXT, True)
+                    text(1228, y+26, board.port, 16, BG if selected else MUTED, False, "e")
+            else:
+                box(24, 290, 1256, 434, "USB DEVICES", "NO UNASSIGNED ONEROM FOUND", value_size=24)
+                text(50, 394, "Connect a new board, or release an existing binding.", 16, MUTED)
+            canvas.create_rectangle(24*sx, 548*sy, 350*sx, 600*sy, fill=PANEL_ALT, outline="")
+            text(187, 574, "← BACK TO SETTINGS", 17, TEXT, True, "center")
+            canvas.create_rectangle(386*sx, 548*sy, 812*sx, 600*sy, fill=OFFLINE, outline="")
+            text(599, 574, f"RELEASE {role_title} BINDING", 17, BG, True, "center")
+            canvas.create_rectangle(900*sx, 548*sy, 1228*sx, 600*sy, fill=ACCENT, outline="")
+            text(1064, 574, f"CONNECT {role_title}", 17, BG, True, "center")
+            text(24, 470, self.usb_status.get(), 18, ACCENT if boards else MUTED)
         else:
             text(26, 66, "OneROM Setup", 16, MUTED)
             box(24, 120, 1256, 410, "No OneROM role configured", "OPEN SETTINGS")
-            text(50, 330, "Use the settings gear to simulate Controller and DriveHUD hardware.", 18, MUTED)
+            text(50, 330, "Open Settings to connect the Controller and DriveHUD OneROMs for this drive.", 18, MUTED)
         canvas.create_rectangle(24*sx, 632*sy, 1256*sx, 710*sy, fill=PANEL_ALT, outline="")
         # Deliberately large touch targets.  Only offer a destination that is
         # actually installed: the compact UI should never expose a dead tab.
@@ -629,6 +883,10 @@ class TouchSimulator(tk.Tk):
             footer_status = "● Controller connected"
         elif self.preview_page == "settings":
             footer_status = "● Hardware setup"
+        elif self.preview_page in ("controller_connection", "hud_connection"):
+            controller_state = "connected" if self.ub3.get() else "unassigned"
+            hud_state = "connected" if self.ub4.get() else "unassigned"
+            footer_status = f"● Controller {controller_state} · DriveHUD {hud_state}"
         else:
             footer_status = "● No boards configured"
         text(1240, 680, footer_status, 20, ACCENT if self.preview_page != "setup" else MUTED, True, "e")
@@ -821,15 +1079,39 @@ class TouchSimulator(tk.Tk):
                 return
             if y < 76 and x > 1120:
                 self.preview_page = "settings"
+            elif self.preview_page in ("controller_connection", "hud_connection"):
+                role = "controller" if self.preview_page == "controller_connection" else "hud"
+                serial_var = self.controller_serial if role == "controller" else self.hud_serial
+                if 24 <= x <= 342 and 210 <= y <= 262:
+                    self.refresh_usb_boards()
+                elif 12 <= x <= 370 and 520 <= y <= 620:
+                    # This screen is a fixed physical 7-inch workflow.  Do
+                    # not carry an accidental preview-scale adjustment back
+                    # into the main settings layout.
+                    self.preview_scale.set(100)
+                    self.preview_page = "settings"
+                elif 370 <= x <= 830 and 520 <= y <= 620:
+                    self.release_role_binding(role)
+                elif 880 <= x <= 1248 and 520 <= y <= 620:
+                    self.connect_assigned_boards(role)
+                elif 24 <= x <= 1256 and 310 <= y <= 548:
+                    index = int((y - 310) // 62)
+                    assigned_serials = {
+                        serial for serial in (self.drive_binding.controller_serial, self.drive_binding.hud_serial) if serial
+                    }
+                    boards = [board for board in self.usb_boards.values() if board.serial_number not in assigned_serials]
+                    if 0 <= index < len(boards) and y <= 310 + index * 62 + 52:
+                        serial_var.set(boards[index].serial_number)
+                        self.usb_status.set(f"Selected {boards[index].serial_number}. Tap CONNECT {role.upper()} to save and open the link.")
+                self.open_size_preview()
+                return
             elif self.preview_page == "setup" and 24 <= x <= 1256 and 120 <= y <= 410:
                 self.preview_page = "settings"
             elif self.preview_page == "settings" and 24 <= x <= 620 and 96 <= y <= 214:
-                self.toggle_simulated_board("ub3")
-                self.open_size_preview()
+                self.open_desktop_connection_setup("controller")
                 return
             elif self.preview_page == "settings" and 660 <= x <= 1256 and 96 <= y <= 214:
-                self.toggle_simulated_board("ub4")
-                self.open_size_preview()
+                self.open_desktop_connection_setup("hud")
                 return
             elif self.preview_page == "settings" and 1000 <= x <= 1228 and 415 <= y <= 467:
                 self.color_picker = f"gradient:{self.appearance_target}"
@@ -865,16 +1147,17 @@ class TouchSimulator(tk.Tk):
                 self.save_preview_iec()
                 return
             elif self.preview_page == "control" and self.controller_rom_enabled.get() and 24 <= x <= 760 and 96 <= y <= 318:
-                self.choose_from_menu(event, self.rom_choices, self.rom_choice, "Startup ROM selected: {value}. Save is simulated.")
+                self.choose_from_menu(event, self.rom_choices, self.rom_choice, "Startup ROM selected: {value}. Save applies it to the connected controller.")
                 return
             elif self.preview_page == "control" and self.controller_iec_enabled.get() and 784 <= x <= 1256 and 96 <= y <= 318:
-                self.choose_from_menu(event, self.iec_choices, self.iec_choice, "Boot IEC address selected: {value}. Save is simulated.")
+                self.choose_from_menu(event, self.iec_choices, self.iec_choice, "Boot IEC address selected: {value}. Save applies it to the connected controller.")
                 return
             elif self.preview_page == "control" and self.controller_wp_enabled.get() and 342 <= x <= 732 and 499 <= y <= 551:
                 self.confirm_write_protect_toggle()
                 return
             elif self.preview_page == "control" and 784 <= x <= 1256 and 344 <= y <= 566:
-                self.toggle_simulated_board("ub3")
+                self.open_desktop_connection_setup("controller")
+                return
             elif self.preview_page == "settings" and 200 <= x <= 860 and 578 <= y <= 610:
                 self.preview_scale.set(max(50, min(200, round(50 + ((x - 200) / 660) * 150))))
                 self.open_size_preview()
@@ -894,7 +1177,9 @@ class TouchSimulator(tk.Tk):
                 if not self.controller_wp_enabled.get():
                     self.writable.set(False)
             self.open_size_preview()
-        preview.bind("<Button-1>", clicked)
+        # Bind directly to the drawing surface.  On some Windows/Tk builds a
+        # Canvas does not reliably forward touch/mouse events to its Toplevel.
+        canvas.bind("<Button-1>", clicked)
         preview.bind("<Escape>", lambda _event: self.destroy())
         preview.protocol("WM_DELETE_WINDOW", self.destroy)
         previous_animation = getattr(self, "_preview_animation_id", None)
@@ -924,12 +1209,14 @@ class TouchSimulator(tk.Tk):
         self.last_input = time.monotonic()
 
     def tick(self) -> None:
+        self.poll_usb_telemetry()
         if self.ub4.get() and self.motor:
             self.sector = self.sector % 17 + 1
             self.sector_var.set(f"{self.sector:02d}")
         if not self.screensaver and self.current_page != "settings" and time.monotonic() - self.last_input >= self.idle_seconds.get():
             self.show_idle()
-        self.after(550, self.tick)
+        # Slow, bounded CDC polling keeps Windows touch input responsive.
+        self.after(1000, self.tick)
 
 
 if __name__ == "__main__":
