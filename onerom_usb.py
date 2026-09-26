@@ -163,6 +163,16 @@ class CdcBoardLink:
                 lines.append(line)
         return lines
 
+    def write_command(self, command: str) -> None:
+        """Send one documented OneROM USB Selector CDC command line."""
+        if not self.connected:
+            raise RuntimeError("OneROM USB serial link is not connected")
+        line = command.strip()
+        if not line:
+            raise ValueError("OneROM command cannot be empty")
+        self.device.write((line + "\r\n").encode("ascii"))
+        self.device.flush()
+
     def close(self) -> None:
         if self.device is not None:
             try:

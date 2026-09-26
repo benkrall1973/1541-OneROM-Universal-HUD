@@ -97,6 +97,7 @@ class TouchSimulator(tk.Tk):
         self.live_density: int | None = None
         self.live_protected: bool | None = None
         self._hud_dirty = False
+        self._confirmed_writable = False
 
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -141,6 +142,7 @@ class TouchSimulator(tk.Tk):
         self.bind_all("<Key>", self.register_input, add=True)
         self.apply_device_state(initial=True)
         self.tick()
+        self.after(20, self.poll_serial_loop)
         # Start in the calibrated 7-inch interface; Windows is only the host
         # during current bench testing.
         self.after_idle(self.launch_physical_preview)
@@ -430,15 +432,56 @@ class TouchSimulator(tk.Tk):
                     if state.head in ("IN", "OUT"):
                         self.head_direction = state.head
             # Never rebuild the entire Canvas from the CDC receive loop.
-            # The next explicit screen navigation paints the latest state;
-            # targeted live HUD item updates will be added separately.
+            # Only existing live HUD items are updated in place.
             self._hud_dirty = self._hud_dirty or changed
+            if changed:
+                self.update_live_hud_fields()
         except Exception as exc:
             link.close()
             self.usb_links.pop("hud", None)
             self.ub4.set(False)
-            self.usb_status.set(f"DriveHUD serial link lost: {exc}")
+            self.usb_status.set(f"DriveHUD link interrupted: {exc}. Use REFRESH USB DEVICES to reconnect.")
             self.apply_device_state()
+
+    def poll_controller_feedback(self) -> None:
+        """Drain Controller CDC output so its USB log/reply FIFO cannot back up."""
+        link = self.usb_links.get("controller")
+        if link is None:
+            return
+        try:
+            for line in link.read_lines()[-96:]:
+                # Selector replies are the only controller lines surfaced to
+                # the operator. Other CDC log lines are still drained.
+                if line.startswith("$ROMTEST,"):
+                    if ",OK," in line or line.endswith(",OK"):
+                        self.control_status.set(f"Controller verified: {line}")
+                    elif ",FAIL" in line or ",ERROR," in line:
+                        self.control_status.set(f"Controller rejected request: {line}")
+        except Exception as exc:
+            link.close()
+            self.usb_links.pop("controller", None)
+            self.ub3.set(False)
+            self.usb_status.set(f"Controller serial link interrupted: {exc}")
+            self.apply_device_state()
+
+    def update_live_hud_fields(self) -> None:
+        """Update existing HUD Canvas items without rebuilding the screen."""
+        if self.preview_page != "hud":
+            return
+        preview = getattr(self, "preview", None)
+        canvas = getattr(self, "preview_canvas", None)
+        if preview is None or canvas is None or not preview.winfo_exists():
+            return
+        try:
+            canvas.itemconfigure("hud_track", text=self.live_track)
+            canvas.itemconfigure("hud_motor", text="ON" if self.motor else "OFF")
+            canvas.itemconfigure("hud_head", text=self.head_direction)
+            canvas.itemconfigure("hud_density", text=f"D{self.live_density}" if self.live_density is not None else "--")
+            if self.live_protected is not None:
+                canvas.itemconfigure("hud_wp", text="PROTECTED" if self.live_protected else "WRITABLE")
+        except tk.TclError:
+            # The screen may have changed between CDC receive and paint.
+            pass
 
     def apply_device_state(self, initial=False) -> None:
         # A maintained override must never survive loss of the control board.
@@ -466,15 +509,41 @@ class TouchSimulator(tk.Tk):
         self.show_page(self.default_page())
 
     def save_rom(self) -> None:
-        self.rom_var.set(self.rom_choice.get())
-        self.control_status.set("Startup ROM selection is staged. Controller command support will apply it to the connected board.")
+        choice = self.rom_choice.get()
+        try:
+            slot = int(choice.split()[1])
+            self.send_controller_command(f"ROMSET={slot}")
+            self.rom_var.set(choice)
+            self.control_status.set(f"Startup ROM slot {slot} sent to the connected Controller.")
+        except Exception as exc:
+            self.control_status.set(f"Startup ROM was not changed: {exc}")
 
     def save_iec(self) -> None:
-        self.iec_var.set(self.iec_choice.get())
-        self.control_status.set("IEC address selection is staged. Controller command support will apply it to the connected board.")
+        choice = self.iec_choice.get()
+        try:
+            address = int(choice.split()[-1])
+            self.send_controller_command(f"ROMIEC={address}")
+            self.iec_var.set(choice)
+            self.control_status.set(f"Boot IEC address {address} sent to the connected Controller.")
+        except Exception as exc:
+            self.control_status.set(f"IEC address was not changed: {exc}")
 
     def update_protection(self) -> None:
-        self.control_status.set("Write-protect override ON — forces writable." if self.writable.get() else "Write-protect override OFF — normal protection.")
+        desired = self.writable.get()
+        try:
+            self.send_controller_command("ROMWP=ON" if desired else "ROMWP=OFF")
+            self._confirmed_writable = desired
+            self.control_status.set("Write-protect override ON — forces writable." if desired else "Write-protect override OFF — normal protection.")
+        except Exception as exc:
+            self.writable.set(self._confirmed_writable)
+            self.control_status.set(f"Write-protect override was not changed: {exc}")
+
+    def send_controller_command(self, command: str) -> None:
+        """Send only the documented USB Selector commands to Controller."""
+        link = self.usb_links.get("controller")
+        if link is None or not link.connected:
+            raise RuntimeError("Controller is not connected")
+        link.write_command(command)
 
     def confirm_write_protect_toggle(self) -> None:
         """Show an in-display confirmation before changing it through UB3."""
@@ -495,8 +564,7 @@ class TouchSimulator(tk.Tk):
         elif not self.controller_rom_enabled.get():
             self.control_status.set("Save failed: Startup ROM control is disabled in this build.")
         else:
-            self.rom_var.set(self.rom_choice.get())
-            self.control_status.set(f"✓ ROM saved and read-back verified: {self.rom_var.get()}")
+            self.save_rom()
         self.open_size_preview()
 
     def save_preview_iec(self) -> None:
@@ -505,8 +573,7 @@ class TouchSimulator(tk.Tk):
         elif not self.controller_iec_enabled.get():
             self.control_status.set("Save failed: IEC address control is disabled in this build.")
         else:
-            self.iec_var.set(self.iec_choice.get())
-            self.control_status.set(f"✓ IEC address saved and read-back verified: {self.iec_var.get()}")
+            self.save_iec()
         self.open_size_preview()
 
     def choose_from_menu(self, event, choices: tuple[str, ...], variable: tk.StringVar, message: str) -> None:
@@ -653,16 +720,16 @@ class TouchSimulator(tk.Tk):
             canvas.delete("all")
         preview.geometry(geometry)
         sx, sy = width / 1280, height / 720
-        def text(x, y, value, size=16, fill=TEXT, bold=False, anchor="w"):
+        def text(x, y, value, size=16, fill=TEXT, bold=False, anchor="w", tag=None):
             canvas.create_text(x*sx, y*sy, text=value, fill=fill, anchor=anchor,
-                               font=("Segoe UI Semibold" if bold else "Segoe UI", max(4, round(size*sy)), "normal"))
-        def box(x1, y1, x2, y2, label, value="", value_size=28, value_y=None):
+                               font=("Segoe UI Semibold" if bold else "Segoe UI", max(4, round(size*sy)), "normal"), tags=tag)
+        def box(x1, y1, x2, y2, label, value="", value_size=28, value_y=None, value_tag=None):
             canvas.create_rectangle(x1*sx, y1*sy, x2*sx, y2*sy, fill=PANEL, outline=PANEL_ALT, width=1)
             # 26 virtual pixels equals roughly 13 physical pixels at the
             # calibrated 7-inch scale: enough breathing room for touch UI.
             text(x1+26, y1+30, label.upper(), 18, MUTED, True)
             if value:
-                canvas.create_text((x1+26)*sx, (value_y if value_y is not None else y1+78)*sy, text=value, fill=TEXT, anchor="w", font=("Cascadia Mono", max(7, round(value_size*sy)), "normal"))
+                canvas.create_text((x1+26)*sx, (value_y if value_y is not None else y1+78)*sy, text=value, fill=TEXT, anchor="w", font=("Cascadia Mono", max(7, round(value_size*sy)), "normal"), tags=value_tag)
         def draw_spinning_disk(phase: float) -> None:
             """A tiny 5.25-inch floppy with deliberately subtle motion marks."""
             canvas.delete("disk")
@@ -706,15 +773,15 @@ class TouchSimulator(tk.Tk):
             text(26, 66, "DriveHUD · passive monitor · Firmware V1.0.0", 16, MUTED)
             # Primary live telemetry in the first two rows; the remaining
             # available HUD tags and sector FIFO stay visible below them.
-            box(24, 82, 420, 220, "Track", self.live_track, value_size=56, value_y=171)
+            box(24, 82, 420, 220, "Track", self.live_track, value_size=56, value_y=171, value_tag="hud_track")
             box(440, 82, 660, 220, "Motor", "")
-            text(462, 160, "ON" if self.motor else "OFF", 28, TEXT, True)
+            text(462, 160, "ON" if self.motor else "OFF", 28, TEXT, True, tag="hud_motor")
             if self.motor:
                 draw_spinning_disk(time.monotonic())
             box(680, 82, 900, 220, "Head", "")
-            text(702, 160, self.head_direction, 28, TEXT, True)
+            text(702, 160, self.head_direction, 28, TEXT, True, tag="hud_head")
             draw_head_motion(time.monotonic())
-            box(920, 82, 1256, 220, "Density", f"D{self.live_density}" if self.live_density is not None else self.simulated_density())
+            box(920, 82, 1256, 220, "Density", f"D{self.live_density}" if self.live_density is not None else "--", value_tag="hud_density")
             box(24, 232, 420, 370, "RPM", "300.7" if self.motor else "0.0")
             box(440, 232, 660, 370, "RPM State", "FRESH" if self.motor else "OFF")
             box(680, 232, 900, 370, "Sector", "06" if self.motor else "--")
@@ -723,7 +790,7 @@ class TouchSimulator(tk.Tk):
             if self.ub3.get() and self.controller_wp_enabled.get():
                 box(24, 382, 420, 520, "Sync / Rev Est", "33.90" if self.motor else "--.--")
                 protected = self.live_protected if self.live_protected is not None else not self.writable.get()
-                box(440, 382, 1256, 520, "Write Protect", "PROTECTED" if protected else "WRITABLE")
+                box(440, 382, 1256, 520, "Write Protect", "PROTECTED" if protected else "WRITABLE", value_tag="hud_wp")
                 hud_wp_action = "Disable override" if self.writable.get() else "Enable writable override"
                 canvas.create_rectangle(850*sx, 447*sy, 1228*sx, 499*sy, fill=OFFLINE if self.writable.get() else ACCENT, outline="")
                 text(1039, 473, hud_wp_action.upper(), 17, BG, True, "center")
@@ -1209,14 +1276,18 @@ class TouchSimulator(tk.Tk):
         self.last_input = time.monotonic()
 
     def tick(self) -> None:
-        self.poll_usb_telemetry()
         if self.ub4.get() and self.motor:
             self.sector = self.sector % 17 + 1
             self.sector_var.set(f"{self.sector:02d}")
         if not self.screensaver and self.current_page != "settings" and time.monotonic() - self.last_input >= self.idle_seconds.get():
             self.show_idle()
-        # Slow, bounded CDC polling keeps Windows touch input responsive.
-        self.after(1000, self.tick)
+        self.after(100, self.tick)
+
+    def poll_serial_loop(self) -> None:
+        """Drain the HUD CDC FIFO at the proven desktop-GUI cadence."""
+        self.poll_usb_telemetry()
+        self.poll_controller_feedback()
+        self.after(20, self.poll_serial_loop)
 
 
 if __name__ == "__main__":
