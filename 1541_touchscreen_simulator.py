@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 import math
+import colorsys
 import tkinter as tk
 from tkinter import ttk
 
@@ -23,6 +24,14 @@ ACCENT = "#33c3a5"
 WARNING = "#f6c85f"
 OFFLINE = "#ef6b73"
 
+COLOR_PALETTES = {
+    "background": ("Background", ("#101820", "#07121d", "#1b1b1f", "#24303a", "#3b2b1e", "#142331", "#222b38", "#2d2638", "#f1e8d5", "#0c2227", "#15261a", "#2a1e26", "#303030", "#22314c", "#3c3322", "#132b3a", "#241d35", "#e7edf0")),
+    "group": ("Group / Card Boxes", ("#182632", "#203442", "#263945", "#2d3645", "#382f45", "#2e3c34", "#252525", "#3a3025", "#e6e6e6", "#24404a", "#2f4a37", "#4a3542", "#3b3b3b", "#34445b", "#4b4231", "#25495a", "#3e324f", "#f4f4f4")),
+    "button": ("Button Color", ("#33c3a5", "#ef6b73", "#4ea1ff", "#f6c85f", "#af7bff", "#59c36a", "#e77cb4", "#f08a4b", "#e9eef3", "#00a8a8", "#ff8c42", "#61dafb", "#ffcc4d", "#9370db", "#2ecc71", "#ff6b9a", "#ff7043", "#ffffff")),
+    "text1": ("Text 1 - Descriptions", ("#a9bbc4", "#d5e2e8", "#91b8d6", "#d4bc86", "#8acfc3", "#d4a8bf", "#b8c0ce", "#d8af82", "#f0f4f7", "#9fd3d6", "#c3d9bc", "#deb4cf", "#c8c8c8", "#b5c7e0", "#e1c59d", "#9ed1e6", "#cfb5e8", "#ffffff")),
+    "text2": ("Text 2 - Values", ("#eef6fa", "#ffffff", "#c9e4ff", "#ffdf8a", "#5eead4", "#f0b4da", "#d0d9e5", "#f1cfa5", "#dff8f4", "#bffff4", "#e5ffd7", "#ffd0e5", "#e4e4e4", "#d6e5ff", "#ffe1b8", "#c9efff", "#e7d3ff", "#ffffff")),
+}
+
 
 class TouchSimulator(tk.Tk):
     def __init__(self) -> None:
@@ -34,6 +43,12 @@ class TouchSimulator(tk.Tk):
 
         self.ub3 = tk.BooleanVar(value=True)
         self.ub4 = tk.BooleanVar(value=True)
+        # These mirror the optional controller capabilities selected in the
+        # board's configuration JSON at compile time.  The touchscreen may
+        # show only the controls the finished controller actually supports.
+        self.controller_rom_enabled = tk.BooleanVar(value=True)
+        self.controller_iec_enabled = tk.BooleanVar(value=True)
+        self.controller_wp_enabled = tk.BooleanVar(value=True)
         self.startup = tk.StringVar(value="Automatic")
         self.idle_seconds = tk.IntVar(value=300)
         self.preview_ppi = tk.DoubleVar(value=102.4)
@@ -55,6 +70,11 @@ class TouchSimulator(tk.Tk):
         self.motor = True
         self.head_direction = "IN"
         self.write_protect_prompt: bool | None = None
+        self.color_picker: str | None = None
+        self.popup_menu: dict | None = None
+        self.appearance_target = "background"
+        self.gradient_hue = 0.47
+        self.hex_keyboard = False
 
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -247,7 +267,11 @@ class TouchSimulator(tk.Tk):
     def confirm_write_protect_toggle(self) -> None:
         """Show an in-display confirmation before changing it through UB3."""
         if not self.ub3.get():
-            self.control_status.set("Write-protect control unavailable: UB3 is disconnected.")
+            self.control_status.set("Write-protect control unavailable: controller is disconnected.")
+            self.open_size_preview()
+            return
+        if not self.controller_wp_enabled.get():
+            self.control_status.set("Write-protect control is disabled in this controller build.")
             self.open_size_preview()
             return
         self.write_protect_prompt = not self.writable.get()
@@ -255,7 +279,9 @@ class TouchSimulator(tk.Tk):
 
     def save_preview_rom(self) -> None:
         if not self.ub3.get():
-            self.control_status.set("Save failed: UB3 connection is unavailable.")
+            self.control_status.set("Save failed: controller connection is unavailable.")
+        elif not self.controller_rom_enabled.get():
+            self.control_status.set("Save failed: Startup ROM control is disabled in this build.")
         else:
             self.rom_var.set(self.rom_choice.get())
             self.control_status.set(f"✓ ROM saved and read-back verified: {self.rom_var.get()}")
@@ -263,25 +289,78 @@ class TouchSimulator(tk.Tk):
 
     def save_preview_iec(self) -> None:
         if not self.ub3.get():
-            self.control_status.set("Save failed: UB3 connection is unavailable.")
+            self.control_status.set("Save failed: controller connection is unavailable.")
+        elif not self.controller_iec_enabled.get():
+            self.control_status.set("Save failed: IEC address control is disabled in this build.")
         else:
             self.iec_var.set(self.iec_choice.get())
             self.control_status.set(f"✓ IEC address saved and read-back verified: {self.iec_var.get()}")
         self.open_size_preview()
 
     def choose_from_menu(self, event, choices: tuple[str, ...], variable: tk.StringVar, message: str) -> None:
-        menu = tk.Menu(self.preview, tearoff=False, font=("Segoe UI", 11))
-        def select(value: str) -> None:
-            variable.set(value)
-            self.control_status.set(message.format(value=value))
-            self.open_size_preview()
-        for item in choices:
-            menu.add_command(label=item, command=lambda choice=item: select(choice))
-        menu.tk_popup(event.x_root, event.y_root)
+        self.popup_menu = {
+            "kind": "choice",
+            "title": "Choose value",
+            "choices": choices,
+            "variable": variable,
+            "message": message,
+        }
+        self.open_size_preview()
+
+    def choose_appearance_menu(self, event) -> None:
+        """Choose which visual color family to edit from one touch menu."""
+        self.popup_menu = {
+            "kind": "appearance",
+            "title": "Appearance",
+            "choices": (
+                ("Background Color", "background"),
+                ("Group / Card Boxes", "group"),
+                ("Button Color", "button"),
+                ("Text 1 - Descriptions", "text1"),
+                ("Text 2 - Values", "text2"),
+            ),
+        }
+        self.open_size_preview()
+
+    def popup_menu_layout(self) -> tuple[int, int, int, int, int]:
+        """Virtual coordinates for a touch menu that always fits the display."""
+        option_count = len(self.popup_menu["choices"]) if self.popup_menu else 0
+        row_height = 58
+        height = 92 + option_count * row_height
+        x1, x2 = 236, 1044
+        y1 = (720 - height) // 2
+        return x1, y1, x2, y1 + 92, row_height
 
     def change_preview_scale(self, delta: int) -> None:
         self.preview_scale.set(max(50, min(200, self.preview_scale.get() + delta)))
         self.open_size_preview()
+
+    def set_preview_color(self, target: str, color: str) -> None:
+        """Apply one visual preference to the touchscreen preview."""
+        global BG, PANEL, ACCENT, MUTED, TEXT
+        if target == "background":
+            BG = color
+        elif target == "group":
+            PANEL = color
+        elif target == "button":
+            ACCENT = color
+        elif target == "text1":
+            MUTED = color
+        elif target == "text2":
+            TEXT = color
+        self.color_picker = None
+        self.hex_keyboard = False
+        self.open_size_preview()
+
+    def preview_color(self, target: str) -> str:
+        """Return the currently active color for one appearance area."""
+        return {
+            "background": BG,
+            "group": PANEL,
+            "button": ACCENT,
+            "text1": MUTED,
+            "text2": TEXT,
+        }[target]
 
     def toggle_motor(self) -> None:
         self.motor = not self.motor
@@ -298,6 +377,22 @@ class TouchSimulator(tk.Tk):
             return "D1"
         return "D0"
 
+    def normalize_preview_page(self) -> None:
+        """Keep the compact UI on a screen supported by installed boards."""
+        if self.preview_page == "hud" and not self.ub4.get():
+            self.preview_page = "control" if self.ub3.get() else "setup"
+        elif self.preview_page == "control" and not self.ub3.get():
+            self.preview_page = "hud" if self.ub4.get() else "setup"
+        elif self.preview_page == "setup" and (self.ub3.get() or self.ub4.get()):
+            self.preview_page = "hud" if self.ub4.get() else "control"
+
+    def toggle_simulated_board(self, board: str) -> None:
+        variable = self.ub3 if board == "ub3" else self.ub4
+        variable.set(not variable.get())
+        if board == "ub3" and not variable.get():
+            self.writable.set(False)
+        self.apply_device_state()
+
     def show_idle(self) -> None:
         self.show_page("idle")
 
@@ -307,27 +402,40 @@ class TouchSimulator(tk.Tk):
         self.open_size_preview()
 
     def open_size_preview(self, _restore_workspace: bool = False) -> None:
-        """Run the simulator itself as a scaled, movable 7-inch display."""
-        old = getattr(self, "preview", None)
+        """Render the simulator without replacing its on-screen window."""
+        self.normalize_preview_page()
+        old_hex_entry = getattr(self, "hex_entry", None)
+        if old_hex_entry is not None and old_hex_entry.winfo_exists():
+            old_hex_entry.destroy()
+        self.hex_entry = None
+        preview = getattr(self, "preview", None)
         position: tuple[int, int] | None = None
-        if old and old.winfo_exists():
-            position = (old.winfo_x(), old.winfo_y())
-            old.destroy()
+        reusing_preview = bool(preview and preview.winfo_exists())
+        if reusing_preview:
+            position = (preview.winfo_x(), preview.winfo_y())
         # A VM commonly reports a generic logical DPI rather than the physical
         # monitor DPI.  The Settings values therefore take precedence.  At
         # 102.4 PPI and 100%, this is calibrated for the V226HQL.
         ppi = float(self.preview_ppi.get()) * (float(self.preview_scale.get()) / 100.0)
         width, height = round((155 / 25.4) * ppi), round((88 / 25.4) * ppi)
-        preview = tk.Toplevel(self)
-        preview.title("1541 OneROM — 7-inch Touchscreen Simulator")
         geometry = f"{width}x{height}"
         if position:
             geometry += f"+{position[0]}+{position[1]}"
+        if not reusing_preview:
+            preview = tk.Toplevel(self)
+            preview.title("1541 OneROM - 7-inch Touchscreen Simulator")
+            preview.resizable(False, False)
+            self.preview = preview
+            canvas = tk.Canvas(preview, width=width, height=height, bg=BG, highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+            self.preview_canvas = canvas
+        else:
+            canvas = self.preview_canvas
+            # Keep the existing native surface alive. Repainting this canvas
+            # is instant and avoids the white flash from window destruction.
+            canvas.configure(width=width, height=height, bg=BG)
+            canvas.delete("all")
         preview.geometry(geometry)
-        preview.resizable(False, False)
-        self.preview = preview
-        canvas = tk.Canvas(preview, width=width, height=height, bg=BG, highlightthickness=0)
-        canvas.pack(fill="both", expand=True)
         sx, sy = width / 1280, height / 720
         def text(x, y, value, size=16, fill=TEXT, bold=False, anchor="w"):
             canvas.create_text(x*sx, y*sy, text=value, fill=fill, anchor=anchor,
@@ -379,7 +487,7 @@ class TouchSimulator(tk.Tk):
         text(26, 34, "1541 OneROM", 22, TEXT, True)
         text(1254, 34, "⚙", 25, ACCENT, True, "e")
         if self.preview_page == "hud":
-            text(26, 66, "DriveHUD · UB4 passive monitor · Firmware V1.0.0", 16, MUTED)
+            text(26, 66, "DriveHUD · passive monitor · Firmware V1.0.0", 16, MUTED)
             # Primary live telemetry in the first two rows; the remaining
             # available HUD tags and sector FIFO stay visible below them.
             box(24, 82, 420, 220, "Track", "18.0")
@@ -396,66 +504,231 @@ class TouchSimulator(tk.Tk):
             box(680, 232, 900, 370, "Sector", "06" if self.motor else "--")
             box(920, 232, 1256, 370, "Sync / Sec", "170" if self.motor else "0")
             text(946, 342, "raw SYNC / fresh RPM", 14, MUTED)
-            box(24, 382, 420, 520, "Sync / Rev Est", "33.90" if self.motor else "--.--")
-            box(440, 382, 1256, 520, "Write Protect", "WRITABLE" if self.writable.get() else "PROTECTED")
-            hud_wp_action = "Disable override" if self.writable.get() else "Enable writable override"
-            canvas.create_rectangle(850*sx, 446*sy, 1228*sx, 500*sy, fill=WARNING if self.writable.get() else ACCENT, outline="")
-            text(1039, 473, hud_wp_action, 17, BG, True, "center")
+            if self.ub3.get() and self.controller_wp_enabled.get():
+                box(24, 382, 420, 520, "Sync / Rev Est", "33.90" if self.motor else "--.--")
+                box(440, 382, 1256, 520, "Write Protect", "WRITABLE" if self.writable.get() else "PROTECTED")
+                hud_wp_action = "Disable override" if self.writable.get() else "Enable writable override"
+                canvas.create_rectangle(850*sx, 446*sy, 1228*sx, 500*sy, fill=OFFLINE if self.writable.get() else ACCENT, outline="")
+                text(1039, 473, hud_wp_action, 17, BG, True, "center")
+            else:
+                # HUD-only installations remain purely passive: no
+                # write-protect state or control is presented.
+                box(24, 382, 1256, 520, "Sync / Rev Est", "33.90" if self.motor else "--.--")
             text(28, 548, "HOME: anchored at Track 1.0", 20, MUTED)
             canvas.create_rectangle(24*sx, 570*sy, 1256*sx, 616*sy, fill=PANEL, outline=PANEL_ALT, width=1)
             text(42, 594, "RECENT SECTORS", 15, MUTED, True)
             text(270, 594, "12   02   04   06   08   10   12   02   04   06" if self.motor else "— FIFO empty —", 18, TEXT, True)
         elif self.preview_page == "control":
-            text(26, 66, "OneROM Control • UB3", 16, MUTED)
-            box(24, 96, 760, 318, "Startup ROM", self.rom_choice.get())
-            text(720, 275, "▼", 24, ACCENT, True, "e")
-            text(50, 232, f"Saved: {self.rom_var.get()}", 15, MUTED)
-            canvas.create_rectangle(440*sx, 252*sy, 718*sx, 302*sy, fill=ACCENT, outline="")
-            text(579, 277, "Save ROM", 17, BG, True, "center")
-            box(784, 96, 1256, 318, "Boot IEC Address", self.iec_choice.get())
-            text(1220, 275, "▼", 24, ACCENT, True, "e")
-            text(810, 232, f"Saved: {self.iec_var.get()}", 15, MUTED)
-            canvas.create_rectangle(1010*sx, 252*sy, 1228*sx, 302*sy, fill=ACCENT, outline="")
-            text(1119, 277, "Save IEC", 17, BG, True, "center")
-            box(24, 344, 760, 566, "Write-Protect Override", "FORCES WRITABLE" if self.writable.get() else "NORMAL PROTECTION")
-            action = "Disable override" if self.writable.get() else "Enable writable override"
-            canvas.create_rectangle(330*sx, 486*sy, 720*sx, 540*sy, fill=WARNING if self.writable.get() else ACCENT, outline="")
-            text(525, 513, action, 17, BG, True, "center")
-            box(784, 344, 1256, 566, "Connection", "UB3 online" if self.ub3.get() else "USB LOST")
-            text(1020, 530, "Tap to simulate connect / loss", 13, MUTED, False, "center")
+            text(26, 66, "OneROM Controller", 16, MUTED)
+            if self.controller_rom_enabled.get():
+                box(24, 96, 760, 318, "Startup ROM", self.rom_choice.get())
+                text(720, 275, "▼", 24, ACCENT, True, "e")
+                text(50, 232, f"Saved: {self.rom_var.get()}", 15, MUTED)
+                canvas.create_rectangle(440*sx, 252*sy, 718*sx, 302*sy, fill=ACCENT, outline="")
+                text(579, 277, "Save ROM", 17, BG, True, "center")
+                text(50, 292, "MENU", 14, MUTED, True)
+            else:
+                box(24, 96, 760, 318, "Startup ROM", "NOT ENABLED")
+                text(50, 232, "Enable in Settings / controller JSON build.", 15, MUTED)
+            if self.controller_iec_enabled.get():
+                box(784, 96, 1256, 318, "Boot IEC Address", self.iec_choice.get())
+                text(1220, 275, "▼", 24, ACCENT, True, "e")
+                text(810, 232, f"Saved: {self.iec_var.get()}", 15, MUTED)
+                canvas.create_rectangle(1010*sx, 252*sy, 1228*sx, 302*sy, fill=ACCENT, outline="")
+                text(1119, 277, "Save IEC", 17, BG, True, "center")
+                text(810, 292, "MENU", 14, MUTED, True)
+            else:
+                box(784, 96, 1256, 318, "Boot IEC Address", "NOT ENABLED")
+                text(810, 232, "Enable in Settings / controller JSON build.", 15, MUTED)
+            if self.controller_wp_enabled.get():
+                box(24, 344, 760, 566, "Write-Protect Override", "FORCES WRITABLE" if self.writable.get() else "NORMAL PROTECTION")
+                action = "Disable override" if self.writable.get() else "Enable writable override"
+                canvas.create_rectangle(330*sx, 486*sy, 720*sx, 540*sy, fill=OFFLINE if self.writable.get() else ACCENT, outline="")
+                text(525, 513, action, 17, BG, True, "center")
+            else:
+                box(24, 344, 760, 566, "Write-Protect Override", "NOT ENABLED")
+                text(50, 486, "Enable in Settings / controller JSON build.", 15, MUTED)
+            box(784, 344, 1256, 566, "Connection", "Controller online" if self.ub3.get() else "USB LOST")
+            text(1020, 530, "Tap to simulate connect / loss", 18, MUTED, False, "center")
             text(28, 594, self.control_status.get(), 16, ACCENT if self.ub3.get() else OFFLINE)
-        else:
+        elif self.preview_page == "settings":
             text(26, 66, "Settings", 16, MUTED)
-            box(24, 96, 1256, 214, "Simulated devices", "UB3 connected   •   UB4 connected")
-            box(24, 236, 1256, 430, "Display scale", f"{self.preview_scale.get()}%")
-            text(50, 344, "50%", 16, MUTED)
-            text(1230, 344, "200%", 16, MUTED, False, "e")
-            canvas.create_line(70*sx, 376*sy, 1210*sx, 376*sy, fill=MUTED, width=max(1, round(7*sy)))
-            knob_x = 70 + (self.preview_scale.get() - 50) / 150 * 1140
-            canvas.create_oval((knob_x-14)*sx, 362*sy, (knob_x+14)*sx, 390*sy, fill=ACCENT, outline="")
-            text(50, 466, "Tap the scale bar to resize this simulated display.", 17, MUTED)
-            text(50, 505, f"Monitor calibration: {self.preview_ppi.get():.1f} PPI", 17, MUTED)
-            canvas.create_rectangle(840*sx, 394*sy, 1000*sx, 442*sy, fill=PANEL_ALT, outline="")
-            canvas.create_rectangle(1020*sx, 394*sy, 1200*sx, 442*sy, fill=ACCENT, outline="")
-            text(920, 418, "− 1%", 17, TEXT, True, "center")
-            text(1110, 418, "+ 1%", 17, BG, True, "center")
-        canvas.create_rectangle(24*sx, 632*sy, 1256*sx, 710*sy, fill=PANEL_ALT, outline="")
-        # Always-visible, deliberately large navigation buttons.  These are
-        # touch targets, not a desktop-tab imitation.
-        if self.preview_page == "hud":
-            canvas.create_rectangle(34*sx, 654*sy, 360*sx, 706*sy, fill=PANEL, outline="")
-            text(197, 680, "ONE ROM", 22, TEXT, True, "center")
-        elif self.preview_page == "control":
-            canvas.create_rectangle(34*sx, 654*sy, 300*sx, 706*sy, fill=PANEL, outline="")
-            text(167, 680, "HUD", 22, TEXT, True, "center")
+            canvas.create_rectangle(24*sx, 96*sy, 620*sx, 214*sy, fill=PANEL, outline=PANEL_ALT, width=1)
+            canvas.create_rectangle(660*sx, 96*sy, 1256*sx, 214*sy, fill=PANEL, outline=PANEL_ALT, width=1)
+            text(50, 126, "CONTROLLER-ROLE ONEROM", 18, MUTED, True)
+            text(50, 172, "INSTALLED" if self.ub3.get() else "NOT INSTALLED", 26, ACCENT if self.ub3.get() else OFFLINE, True)
+            text(686, 126, "HUD-ROLE ONEROM", 18, MUTED, True)
+            text(686, 172, "INSTALLED" if self.ub4.get() else "NOT INSTALLED", 26, ACCENT if self.ub4.get() else OFFLINE, True)
+            text(50, 202, "Tap to toggle simulated hardware", 13, MUTED)
+            text(686, 202, "Tap to toggle simulated hardware", 13, MUTED)
+            text(26, 246, "Either OneROM can be compiled as the Controller or the passive DriveHUD; the board JSON selects its role.", 14, MUTED)
+            # Controller choices are a left-hand stack, exactly aligned with
+            # the Controller-role status card. Appearance choices mirror it
+            # on the right, aligned with the HUD-role status card.
+            text(24, 274, "Controller options", 16, MUTED, True)
+            text(660, 274, "Appearance", 16, MUTED, True)
+            for y1, label, variable in (
+                (294, "Startup ROM", self.controller_rom_enabled),
+                (360, "IEC address", self.controller_iec_enabled),
+                (426, "Write-protect", self.controller_wp_enabled),
+            ):
+                canvas.create_rectangle(24*sx, y1*sy, 620*sx, (y1+56)*sy, fill=PANEL, outline=PANEL_ALT)
+                canvas.create_rectangle(46*sx, (y1+12)*sy, 78*sx, (y1+44)*sy,
+                                        fill=ACCENT if variable.get() else PANEL_ALT, outline=ACCENT)
+                if variable.get():
+                    text(62, y1+28, "✓", 19, BG, True, "center")
+                text(96, y1+28, label, 18, TEXT, True)
+            appearance_name = COLOR_PALETTES[self.appearance_target][0]
+            box(660, 294, 1256, 482, "Appearance", appearance_name)
+            text(686, 456, "MENU", 14, MUTED, True)
+            canvas.create_rectangle(1000*sx, 432*sy, 1228*sx, 472*sy, fill=ACCENT, outline="")
+            text(1114, 452, "CUSTOM COLOR", 14, BG, True, "center")
+            text(24, 514, "Controller feature availability mirrors the configuration JSON used when the board is compiled.", 13, MUTED)
+            # Kept available for the Windows simulator, but tucked below the
+            # configuration grid so it will not dominate the fixed 7-inch UI.
+            canvas.create_rectangle(24*sx, 540*sy, 1256*sx, 624*sy, fill=PANEL, outline=PANEL_ALT)
+            text(44, 562, "DISPLAY SCALE", 14, MUTED, True)
+            text(44, 590, f"{self.preview_scale.get()}%", 20, TEXT, True)
+            # Keep the scale control in the open space between its label and
+            # the adjustment buttons, rather than low against the footer.
+            text(200, 574, "50%", 14, MUTED, False, "center")
+            text(860, 574, "200%", 14, MUTED, False, "center")
+            canvas.create_line(200*sx, 594*sy, 860*sx, 594*sy, fill=MUTED, width=max(1, round(5*sy)))
+            knob_x = 200 + (self.preview_scale.get() - 50) / 150 * 660
+            canvas.create_oval((knob_x-12)*sx, 582*sy, (knob_x+12)*sx, 606*sy, fill=ACCENT, outline="")
+            canvas.create_rectangle(900*sx, 556*sy, 1060*sx, 608*sy, fill=PANEL_ALT, outline="")
+            canvas.create_rectangle(1080*sx, 556*sy, 1240*sx, 608*sy, fill=ACCENT, outline="")
+            text(980, 582, "− 1%", 17, TEXT, True, "center")
+            text(1160, 582, "+ 1%", 17, BG, True, "center")
         else:
-            canvas.create_rectangle(34*sx, 662*sy, 216*sx, 706*sy, fill=PANEL, outline="")
-            canvas.create_rectangle(228*sx, 662*sy, 510*sx, 706*sy, fill=PANEL, outline="")
-            text(125, 684, "HUD", 20, TEXT, True, "center")
-            text(369, 684, "ONE ROM", 20, TEXT, True, "center")
+            text(26, 66, "OneROM Setup", 16, MUTED)
+            box(24, 120, 1256, 410, "No OneROM role configured", "OPEN SETTINGS")
+            text(50, 330, "Use the settings gear to simulate Controller and DriveHUD hardware.", 18, MUTED)
+        canvas.create_rectangle(24*sx, 632*sy, 1256*sx, 710*sy, fill=PANEL_ALT, outline="")
+        # Deliberately large touch targets.  Only offer a destination that is
+        # actually installed: the compact UI should never expose a dead tab.
+        if self.preview_page == "hud" and self.ub3.get():
+            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
+            text(184, 671, "CONTROL", 22, TEXT, True, "center")
+        elif self.preview_page == "control" and self.ub4.get():
+            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
+            text(184, 671, "HUD", 22, TEXT, True, "center")
+        elif self.preview_page == "settings":
+            if self.ub4.get():
+                canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
+                text(184, 671, "HUD", 22, TEXT, True, "center")
+            if self.ub3.get():
+                x1, x2 = (346, 646) if self.ub4.get() else (34, 334)
+                canvas.create_rectangle(x1*sx, 645*sy, x2*sx, 697*sy, fill=PANEL, outline="")
+                text((x1+x2)/2, 671, "CONTROL", 22, TEXT, True, "center")
         if self.preview_page == "hud":
-            text(545, 680, "Values update while disk is spinning.", 20, MUTED)
-        text(1240, 680, "● Connected", 17, ACCENT, True, "e")
+            text(680, 680, "Values update while disk is spinning.", 20, MUTED, False, "center")
+        if self.preview_page == "hud":
+            footer_status = "● DriveHUD connected"
+        elif self.preview_page == "control":
+            footer_status = "● Controller connected"
+        elif self.preview_page == "settings":
+            footer_status = "● Hardware setup"
+        else:
+            footer_status = "● No boards configured"
+        text(1240, 680, footer_status, 20, ACCENT if self.preview_page != "setup" else MUTED, True, "e")
+        if self.popup_menu is not None:
+            if self.hex_entry is not None and self.hex_entry.winfo_exists():
+                self.hex_entry.destroy()
+                self.hex_entry = None
+            x1, y1, x2, rows_y, row_height = self.popup_menu_layout()
+            choices = self.popup_menu["choices"]
+            canvas.create_rectangle(0, 0, width, height, fill="#081017", outline="")
+            canvas.create_rectangle(x1*sx, y1*sy, x2*sx, (rows_y + len(choices) * row_height)*sy,
+                                    fill=PANEL, outline=ACCENT, width=max(1, round(2*sy)))
+            text(x1+28, y1+32, self.popup_menu["title"], 24, TEXT, True)
+            text(x1+28, y1+62, "Tap a choice to apply it.", 16, MUTED)
+            for index, choice in enumerate(choices):
+                label = choice[0] if self.popup_menu["kind"] == "appearance" else choice
+                row_y = rows_y + index * row_height
+                canvas.create_rectangle((x1+16)*sx, (row_y+4)*sy, (x2-16)*sx, (row_y+row_height-4)*sy,
+                                        fill=PANEL_ALT, outline="")
+                text(x1+42, row_y + row_height / 2, label, 18, TEXT, True)
+            canvas.create_rectangle((x2-182)*sx, (y1+24)*sy, (x2-24)*sx, (y1+68)*sy, fill=BG, outline="")
+            text(x2-103, y1+46, "Cancel", 17, TEXT, True, "center")
+        if self.color_picker is not None:
+            if self.hex_entry is not None and self.hex_entry.winfo_exists():
+                self.hex_entry.destroy()
+                self.hex_entry = None
+            picker_target = self.color_picker.removeprefix("gradient:")
+            picker_title, _colors = COLOR_PALETTES[picker_target]
+            canvas.create_rectangle(0, 0, width, height, fill="#081017", outline="")
+            text(32, 40, f"Custom Color - {picker_title.title()}", 28, TEXT, True)
+            text(32, 70, "Tap a color to apply it immediately.", 17, MUTED)
+            canvas.create_rectangle(1050*sx, 30*sy, 1248*sx, 82*sy, fill=PANEL_ALT, outline="")
+            text(1149, 56, "Cancel", 18, TEXT, True, "center")
+            text(770, 56, "HEX", 13, MUTED, True, "e")
+
+            def apply_hex_color(_event=None) -> None:
+                value = self.hex_entry.get().strip().upper()
+                if not value.startswith("#"):
+                    value = f"#{value}"
+                if len(value) == 7 and all(character in "0123456789ABCDEF" for character in value[1:]):
+                    self.set_preview_color(picker_target, value)
+                else:
+                    self.hex_entry.configure(highlightbackground=OFFLINE, highlightcolor=OFFLINE)
+                    self.hex_entry.selection_range(0, "end")
+
+            def open_hex_keyboard(_event=None):
+                self.hex_keyboard = True
+                self.open_size_preview()
+                return "break"
+
+            def validate_hex_entry(proposed: str) -> bool:
+                digits = proposed[1:] if proposed.startswith("#") else proposed
+                return len(digits) <= 6 and all(character in "0123456789abcdefABCDEF" for character in digits)
+
+            self.hex_entry = tk.Entry(
+                canvas, font=("Cascadia Mono", max(6, round(16*sy))), justify="center",
+                bg=PANEL_ALT, fg=TEXT, insertbackground=TEXT, relief="flat",
+                highlightthickness=max(1, round(2*sy)), highlightbackground=ACCENT, highlightcolor=ACCENT,
+                validate="key", validatecommand=(self.register(validate_hex_entry), "%P"),
+            )
+            self.hex_entry.insert(0, self.preview_color(picker_target).upper())
+            self.hex_entry.bind("<Return>", apply_hex_color)
+            self.hex_entry.bind("<Button-1>", open_hex_keyboard)
+            canvas.create_window(910*sx, 56*sy, window=self.hex_entry, width=240*sx, height=52*sy)
+            text(32, 100, "Custom gradient", 18, MUTED, True)
+            text(1030, 100, "Hue", 18, MUTED, True)
+            # Saturation runs left-to-right and brightness runs top-to-bottom,
+            # matching the familiar Windows custom-color control.
+            for y1 in range(120, 680, 16):
+                value = 1 - (y1 - 120) / 560
+                for x1 in range(24, 1000, 16):
+                    saturation = (x1 - 24) / 976
+                    red, green, blue = colorsys.hsv_to_rgb(self.gradient_hue, saturation, value)
+                    color = f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}"
+                    canvas.create_rectangle(x1*sx, y1*sy, (x1+16)*sx, (y1+16)*sy, fill=color, outline="")
+            canvas.create_rectangle(24*sx, 120*sy, 1000*sx, 680*sy, outline=TEXT, width=max(1, round(2*sy)))
+            for y1 in range(120, 680, 10):
+                hue = (y1 - 120) / 560
+                red, green, blue = colorsys.hsv_to_rgb(hue, 1, 1)
+                color = f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}"
+                canvas.create_rectangle(1030*sx, y1*sy, 1256*sx, (y1+10)*sy, fill=color, outline="")
+            hue_y = 120 + self.gradient_hue * 560
+            canvas.create_rectangle(1024*sx, (hue_y-6)*sy, 1262*sx, (hue_y+6)*sy, outline=TEXT, width=max(1, round(3*sy)))
+            if self.hex_keyboard:
+                canvas.create_rectangle(180*sx, 130*sy, 1100*sx, 584*sy, fill=BG, outline=ACCENT, width=max(1, round(2*sy)))
+                text(220, 170, "HEX KEYPAD", 22, TEXT, True)
+                key_rows = (
+                    ("0", "1", "2", "3"),
+                    ("4", "5", "6", "7"),
+                    ("8", "9", "A", "B"),
+                    ("C", "D", "E", "F"),
+                    ("CLEAR", "⌫", "CANCEL", "APPLY"),
+                )
+                for row_index, row in enumerate(key_rows):
+                    y1 = 198 + row_index * 70
+                    for column, key in enumerate(row):
+                        x1, key_width = 220 + column * 210, 190
+                        fill = ACCENT if key == "APPLY" else PANEL_ALT
+                        canvas.create_rectangle(x1*sx, y1*sy, (x1+key_width)*sx, (y1+58)*sy, fill=fill, outline="")
+                        text(x1+key_width/2, y1+29, key, 20, BG if key == "APPLY" else TEXT, True, "center")
         if self.write_protect_prompt is not None:
             enabling = self.write_protect_prompt
             # Opaque modal backdrop: no HUD control or graphic can visually
@@ -473,6 +746,70 @@ class TouchSimulator(tk.Tk):
             text(810, 440, "Confirm", 21, BG, True, "center")
         def clicked(event):
             x, y = event.x / sx, event.y / sy
+            if self.popup_menu is not None:
+                x1, y1, x2, rows_y, row_height = self.popup_menu_layout()
+                choices = self.popup_menu["choices"]
+                if x2-182 <= x <= x2-24 and y1+24 <= y <= y1+68:
+                    self.popup_menu = None
+                    self.open_size_preview()
+                    return
+                for index, choice in enumerate(choices):
+                    row_y = rows_y + index * row_height
+                    if x1+16 <= x <= x2-16 and row_y+4 <= y <= row_y+row_height-4:
+                        if self.popup_menu["kind"] == "appearance":
+                            self.appearance_target = choice[1]
+                        else:
+                            self.popup_menu["variable"].set(choice)
+                            self.control_status.set(self.popup_menu["message"].format(value=choice))
+                        self.popup_menu = None
+                        self.open_size_preview()
+                        return
+                return
+            if self.color_picker is not None:
+                if 1050 <= x <= 1248 and 30 <= y <= 82:
+                    self.color_picker = None
+                    self.hex_keyboard = False
+                    self.open_size_preview()
+                    return
+                if self.hex_keyboard:
+                    key_rows = (
+                        ("0", "1", "2", "3"),
+                        ("4", "5", "6", "7"),
+                        ("8", "9", "A", "B"),
+                        ("C", "D", "E", "F"),
+                        ("CLEAR", "⌫", "CANCEL", "APPLY"),
+                    )
+                    for row_index, row in enumerate(key_rows):
+                        y1 = 198 + row_index * 70
+                        for column, key in enumerate(row):
+                            x1, key_width = 220 + column * 210, 190
+                            if x1 <= x <= x1 + key_width and y1 <= y <= y1 + 58:
+                                value = self.hex_entry.get().upper()
+                                if key == "⌫":
+                                    self.hex_entry.delete(max(0, len(value) - 1), "end")
+                                elif key == "CLEAR":
+                                    self.hex_entry.delete(0, "end")
+                                    self.hex_entry.insert(0, "#")
+                                elif key == "CANCEL":
+                                    self.hex_keyboard = False
+                                    self.open_size_preview()
+                                elif key == "APPLY":
+                                    apply_hex_color()
+                                elif len(value) < 7:
+                                    self.hex_entry.insert("end", key)
+                                return
+                    return
+                if 1030 <= x <= 1256 and 120 <= y <= 680:
+                    self.gradient_hue = max(0.0, min(1.0, (y - 120) / 560))
+                    self.open_size_preview()
+                    return
+                if 24 <= x <= 1000 and 120 <= y <= 680:
+                    saturation = (x - 24) / 976
+                    value = 1 - (y - 120) / 560
+                    red, green, blue = colorsys.hsv_to_rgb(self.gradient_hue, saturation, value)
+                    self.set_preview_color(picker_target, f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}")
+                    return
+                return
             if self.write_protect_prompt is not None:
                 if 680 <= x <= 940 and 410 <= y <= 470:
                     self.writable.set(self.write_protect_prompt)
@@ -484,6 +821,24 @@ class TouchSimulator(tk.Tk):
                 return
             if y < 76 and x > 1120:
                 self.preview_page = "settings"
+            elif self.preview_page == "setup" and 24 <= x <= 1256 and 120 <= y <= 410:
+                self.preview_page = "settings"
+            elif self.preview_page == "settings" and 24 <= x <= 620 and 96 <= y <= 214:
+                self.toggle_simulated_board("ub3")
+                self.open_size_preview()
+                return
+            elif self.preview_page == "settings" and 660 <= x <= 1256 and 96 <= y <= 214:
+                self.toggle_simulated_board("ub4")
+                self.open_size_preview()
+                return
+            elif self.preview_page == "settings" and 1000 <= x <= 1228 and 432 <= y <= 472:
+                self.color_picker = f"gradient:{self.appearance_target}"
+                self.hex_keyboard = False
+                self.open_size_preview()
+                return
+            elif self.preview_page == "settings" and 660 <= x <= 1256 and 294 <= y <= 482:
+                self.choose_appearance_menu(event)
+                return
             elif self.preview_page == "hud" and 440 <= x <= 660 and 82 <= y <= 220:
                 self.motor = not self.motor
                 self.open_size_preview()
@@ -492,49 +847,63 @@ class TouchSimulator(tk.Tk):
                 self.head_direction = "OUT" if self.head_direction == "IN" else "IN"
                 self.open_size_preview()
                 return
-            elif self.preview_page == "hud" and 850 <= x <= 1228 and 446 <= y <= 500:
+            elif self.preview_page == "hud" and self.ub3.get() and self.controller_wp_enabled.get() and 850 <= x <= 1228 and 446 <= y <= 500:
                 self.confirm_write_protect_toggle()
                 return
-            elif self.preview_page == "hud" and 654 <= y <= 706 and 34 <= x <= 360:
+            elif self.preview_page == "hud" and self.ub3.get() and 645 <= y <= 697 and 34 <= x <= 334:
                 self.preview_page = "control"
-            elif self.preview_page == "control" and 654 <= y <= 706 and 34 <= x <= 300:
+            elif self.preview_page == "control" and self.ub4.get() and 645 <= y <= 697 and 34 <= x <= 334:
                 self.preview_page = "hud"
-            elif self.preview_page == "settings" and y >= 658 and 34 <= x <= 216:
+            elif self.preview_page == "settings" and self.ub4.get() and 645 <= y <= 697 and 34 <= x <= 334:
                 self.preview_page = "hud"
-            elif self.preview_page == "settings" and y >= 658 and 228 <= x <= 510:
+            elif self.preview_page == "settings" and self.ub3.get() and 645 <= y <= 697 and ((self.ub4.get() and 346 <= x <= 646) or (not self.ub4.get() and 34 <= x <= 334)):
                 self.preview_page = "control"
-            elif self.preview_page == "control" and 440 <= x <= 718 and 252 <= y <= 302:
+            elif self.preview_page == "control" and self.controller_rom_enabled.get() and 440 <= x <= 718 and 252 <= y <= 302:
                 self.save_preview_rom()
                 return
-            elif self.preview_page == "control" and 1010 <= x <= 1228 and 252 <= y <= 302:
+            elif self.preview_page == "control" and self.controller_iec_enabled.get() and 1010 <= x <= 1228 and 252 <= y <= 302:
                 self.save_preview_iec()
                 return
-            elif self.preview_page == "control" and 24 <= x <= 760 and 96 <= y <= 318:
+            elif self.preview_page == "control" and self.controller_rom_enabled.get() and 24 <= x <= 760 and 96 <= y <= 318:
                 self.choose_from_menu(event, self.rom_choices, self.rom_choice, "Startup ROM selected: {value}. Save is simulated.")
                 return
-            elif self.preview_page == "control" and 784 <= x <= 1256 and 96 <= y <= 318:
+            elif self.preview_page == "control" and self.controller_iec_enabled.get() and 784 <= x <= 1256 and 96 <= y <= 318:
                 self.choose_from_menu(event, self.iec_choices, self.iec_choice, "Boot IEC address selected: {value}. Save is simulated.")
                 return
-            elif self.preview_page == "control" and 330 <= x <= 720 and 486 <= y <= 540:
+            elif self.preview_page == "control" and self.controller_wp_enabled.get() and 330 <= x <= 720 and 486 <= y <= 540:
                 self.confirm_write_protect_toggle()
                 return
             elif self.preview_page == "control" and 784 <= x <= 1256 and 344 <= y <= 566:
-                self.ub3.set(not self.ub3.get())
-                self.apply_device_state()
-            elif self.preview_page == "settings" and 340 <= y <= 385:
-                self.preview_scale.set(max(50, min(200, round(50 + ((x - 70) / 1140) * 150))))
+                self.toggle_simulated_board("ub3")
+            elif self.preview_page == "settings" and 200 <= x <= 860 and 578 <= y <= 610:
+                self.preview_scale.set(max(50, min(200, round(50 + ((x - 200) / 660) * 150))))
                 self.open_size_preview()
                 return
-            elif self.preview_page == "settings" and 840 <= x <= 1000 and 394 <= y <= 442:
+            elif self.preview_page == "settings" and 900 <= x <= 1060 and 556 <= y <= 608:
                 self.change_preview_scale(-1)
                 return
-            elif self.preview_page == "settings" and 1020 <= x <= 1200 and 394 <= y <= 442:
+            elif self.preview_page == "settings" and 1080 <= x <= 1240 and 556 <= y <= 608:
                 self.change_preview_scale(1)
                 return
+            elif self.preview_page == "settings" and 24 <= x <= 620 and 294 <= y <= 350:
+                self.controller_rom_enabled.set(not self.controller_rom_enabled.get())
+            elif self.preview_page == "settings" and 24 <= x <= 620 and 360 <= y <= 416:
+                self.controller_iec_enabled.set(not self.controller_iec_enabled.get())
+            elif self.preview_page == "settings" and 24 <= x <= 620 and 426 <= y <= 482:
+                self.controller_wp_enabled.set(not self.controller_wp_enabled.get())
+                if not self.controller_wp_enabled.get():
+                    self.writable.set(False)
             self.open_size_preview()
         preview.bind("<Button-1>", clicked)
         preview.bind("<Escape>", lambda _event: self.destroy())
         preview.protocol("WM_DELETE_WINDOW", self.destroy)
+        previous_animation = getattr(self, "_preview_animation_id", None)
+        if previous_animation is not None:
+            try:
+                preview.after_cancel(previous_animation)
+            except tk.TclError:
+                pass
+            self._preview_animation_id = None
         if self.preview_page == "hud":
             def animate_disk() -> None:
                 if self.preview is preview and preview.winfo_exists() and self.preview_page == "hud":
@@ -546,8 +915,8 @@ class TouchSimulator(tk.Tk):
                         else:
                             canvas.delete("disk")
                         draw_head_motion(time.monotonic())
-                    preview.after(180, animate_disk)
-            preview.after(180, animate_disk)
+                    self._preview_animation_id = preview.after(180, animate_disk)
+            self._preview_animation_id = preview.after(180, animate_disk)
 
     def register_input(self, _event=None) -> None:
         if self.screensaver:
