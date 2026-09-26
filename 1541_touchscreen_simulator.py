@@ -18,6 +18,10 @@ from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discove
 
 
 WIDTH, HEIGHT = 1280, 720
+APP_VERSION = "V0.0.1"
+# Bench calibration: the prior preview needed 147% to match the real 7-inch
+# panel.  That physical size is now the user-facing 100% baseline.
+SEVEN_INCH_BASE_SCALE = 1.47
 BG = "#101820"
 PANEL = "#182632"
 PANEL_ALT = "#203442"
@@ -39,7 +43,7 @@ COLOR_PALETTES = {
 class TouchSimulator(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("1541 OneROM — 7-inch Touchscreen Simulator")
+        self.title(f"1541 OneROM {APP_VERSION} — 7-inch Touchscreen Simulator")
         self.geometry(f"{WIDTH}x{HEIGHT}")
         self.minsize(980, 600)
         self.configure(bg=BG)
@@ -104,6 +108,9 @@ class TouchSimulator(tk.Tk):
         self._wp_after_id: str | None = None
         self._reconnect_after: dict[str, str] = {}
         self._reconnect_delay_ms = {"controller": 1000, "hud": 1000}
+        self.usb_log_lines: list[str] = []
+        self.log_scroll = 0
+        self.log_return_page = "settings"
 
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -149,6 +156,7 @@ class TouchSimulator(tk.Tk):
         self.apply_device_state(initial=True)
         self.tick()
         self.after(20, self.poll_serial_loop)
+        self.after(250, self.restore_saved_role_connections)
         # Start in the calibrated 7-inch interface; Windows is only the host
         # during current bench testing.
         self.after_idle(self.launch_physical_preview)
@@ -319,9 +327,32 @@ class TouchSimulator(tk.Tk):
         self.hud_serial_box["values"] = serials
         if not boards:
             self.usb_status.set("No OneROM CDC board with a USB serial is connected. Connect a OneROM, then refresh this list.")
+            self.append_usb_log("SYSTEM", self.usb_status.get())
             return
         details = "; ".join(f"{board.serial_number} on {board.port}" for board in boards)
         self.usb_status.set(f"Found {len(boards)} board(s): {details}")
+        self.append_usb_log("SYSTEM", self.usb_status.get())
+
+    def append_usb_log(self, role: str, message: str) -> None:
+        """Keep a bounded, timestamped communications history for the UI."""
+        timestamp = time.strftime("%H:%M:%S")
+        self.usb_log_lines.append(f"{timestamp} [{role}] {message}")
+        del self.usb_log_lines[:-500]
+
+    def open_usb_log(self) -> None:
+        self.log_return_page = self.preview_page
+        self.preview_page = "log"
+        self.log_scroll = 0
+        self.open_size_preview()
+
+    def copy_usb_log(self) -> None:
+        payload = "\n".join(self.usb_log_lines) or "No USB communications recorded."
+        self.clipboard_clear()
+        self.clipboard_append(payload)
+        self.update()
+        self.usb_status.set("USB log copied to the Windows clipboard.")
+        self.append_usb_log("SYSTEM", self.usb_status.get())
+        self.open_size_preview()
 
     def connect_assigned_boards(self, selected_role: str | None = None) -> None:
         """Persist serial-to-drive role bindings and open their CDC telemetry links."""
@@ -362,9 +393,11 @@ class TouchSimulator(tk.Tk):
             controller_state = "connected" if "controller" in self.usb_links else "saved / offline"
             hud_state = "connected" if "hud" in self.usb_links else "saved / offline"
             self.usb_status.set(f"{selected_role.title() if selected_role else 'Role'} connected — Controller: {controller_state}; DriveHUD: {hud_state}.")
+            self.append_usb_log("SYSTEM", self.usb_status.get())
             self.apply_device_state()
         except Exception as exc:
             self.usb_status.set(f"USB connection failed: {exc}")
+            self.append_usb_log("SYSTEM", self.usb_status.get())
 
     def release_role_binding(self, role: str) -> None:
         """Release one persisted role without touching the other OneROM."""
@@ -386,6 +419,7 @@ class TouchSimulator(tk.Tk):
         self.ub3.set("controller" in self.usb_links)
         self.ub4.set("hud" in self.usb_links)
         self.usb_status.set(f"{role.title()} binding released. The other OneROM role was left unchanged.")
+        self.append_usb_log("SYSTEM", self.usb_status.get())
         self.apply_device_state()
 
     def poll_usb_telemetry(self) -> None:
@@ -398,6 +432,7 @@ class TouchSimulator(tk.Tk):
             # Keep the UI responsive even if firmware emits a burst of
             # diagnostics.  The newest telemetry is what matters for HUD.
             for line in link.read_lines()[-96:]:
+                self.append_usb_log("HUD", line)
                 state = self.telemetry_parser.process(line)
                 changed = True
                 self.live_track = state.track
@@ -429,6 +464,7 @@ class TouchSimulator(tk.Tk):
             self.usb_links.pop("hud", None)
             self.ub4.set(False)
             self.usb_status.set(f"DriveHUD link interrupted; reconnecting automatically: {exc}")
+            self.append_usb_log("HUD", self.usb_status.get())
             self.apply_device_state()
             self.schedule_role_reconnect("hud")
 
@@ -439,6 +475,7 @@ class TouchSimulator(tk.Tk):
             return
         try:
             for line in link.read_lines()[-96:]:
+                self.append_usb_log("CONTROLLER", line)
                 # Selector replies are the only controller lines surfaced to
                 # the operator. Other CDC log lines are still drained.
                 if line.startswith("$ROMTEST,"):
@@ -452,6 +489,7 @@ class TouchSimulator(tk.Tk):
             self.usb_links.pop("controller", None)
             self.ub3.set(False)
             self.usb_status.set(f"Controller serial link interrupted; reconnecting automatically: {exc}")
+            self.append_usb_log("CONTROLLER", self.usb_status.get())
             self.apply_device_state()
             self.schedule_role_reconnect("controller")
 
@@ -462,6 +500,16 @@ class TouchSimulator(tk.Tk):
         delay = self._reconnect_delay_ms[role]
         self._reconnect_after[role] = self.after(delay, lambda current=role: self.attempt_role_reconnect(current))
         self._reconnect_delay_ms[role] = min(delay * 2, 8000)
+
+    def restore_saved_role_connections(self) -> None:
+        """Reconnect every present saved role after program startup."""
+        for role, serial_number in (
+            ("controller", self.drive_binding.controller_serial),
+            ("hud", self.drive_binding.hud_serial),
+        ):
+            if serial_number:
+                self.append_usb_log("SYSTEM", f"Startup reconnect queued for {role.title()} {serial_number}.")
+                self.schedule_role_reconnect(role)
 
     def attempt_role_reconnect(self, role: str) -> None:
         self._reconnect_after.pop(role, None)
@@ -487,6 +535,7 @@ class TouchSimulator(tk.Tk):
                 self.ub4.set(True)
             self.serial_last_error.set("")
             self.usb_status.set(f"{role.title()} {serial_number} automatically reconnected.")
+            self.append_usb_log("SYSTEM", self.usb_status.get())
             self.apply_device_state()
         except Exception as exc:
             self.usb_status.set(f"{role.title()} reconnect retry failed: {exc}")
@@ -715,7 +764,7 @@ class TouchSimulator(tk.Tk):
 
     def normalize_preview_page(self) -> None:
         """Keep the compact UI on a screen supported by installed boards."""
-        if self.preview_page in ("settings", "controller_connection", "hud_connection"):
+        if self.preview_page in ("settings", "controller_connection", "hud_connection", "log"):
             return
         if self.preview_page == "hud" and not self.ub4.get():
             self.preview_page = "control" if self.ub3.get() else "setup"
@@ -756,7 +805,7 @@ class TouchSimulator(tk.Tk):
         # A VM commonly reports a generic logical DPI rather than the physical
         # monitor DPI.  The Settings values therefore take precedence.  At
         # 102.4 PPI and 100%, this is calibrated for the V226HQL.
-        ppi = float(self.preview_ppi.get()) * (float(self.preview_scale.get()) / 100.0)
+        ppi = float(self.preview_ppi.get()) * SEVEN_INCH_BASE_SCALE * (float(self.preview_scale.get()) / 100.0)
         width, height = round((155 / 25.4) * ppi), round((88 / 25.4) * ppi)
         geometry = f"{width}x{height}"
         if position:
@@ -824,7 +873,7 @@ class TouchSimulator(tk.Tk):
                     points = ((center_x - 20, y - 11), (center_x, y + 9), (center_x + 20, y - 11))
                 canvas.create_line(*(coordinate * (sx if pos % 2 == 0 else sy) for pos, coordinate in enumerate(sum((list(point) for point in points), []))),
                                    fill=ACCENT, width=max(1, round(5*sy)), joinstyle="round", tags="head")
-        text(26, 34, "1541 OneROM", 22, TEXT, True)
+        text(26, 34, f"1541 OneROM {APP_VERSION}", 22, TEXT, True)
         text(1254, 34, "⚙", 25, ACCENT, True, "e")
         if self.preview_page == "hud":
             text(26, 66, "DriveHUD · passive monitor · Firmware V1.0.0", 16, MUTED)
@@ -978,6 +1027,29 @@ class TouchSimulator(tk.Tk):
             canvas.create_rectangle(900*sx, 548*sy, 1228*sx, 600*sy, fill=ACCENT, outline="")
             text(1064, 574, f"CONNECT {role_title}", 17, BG, True, "center")
             text(24, 470, self.usb_status.get(), 18, ACCENT if boards else MUTED)
+        elif self.preview_page == "log":
+            text(26, 66, "USB Communications Log", 16, MUTED)
+            canvas.create_rectangle(24*sx, 82*sy, 1256*sx, 616*sy, fill=PANEL, outline=PANEL_ALT)
+            text(48, 112, "LIVE CDC / CONNECTION HISTORY", 16, MUTED, True)
+            canvas.create_rectangle(1018*sx, 96*sy, 1232*sx, 148*sy, fill=ACCENT, outline="")
+            text(1125, 122, "CUT N PASTE", 17, BG, True, "center")
+            visible_lines = 20
+            max_scroll = max(0, len(self.usb_log_lines) - visible_lines)
+            self.log_scroll = max(0, min(self.log_scroll, max_scroll))
+            start = max(0, len(self.usb_log_lines) - visible_lines - self.log_scroll)
+            end = start + visible_lines
+            lines = self.usb_log_lines[start:end]
+            if not lines:
+                text(48, 350, "No USB communications recorded yet.", 20, MUTED)
+            else:
+                for index, line in enumerate(lines):
+                    color = OFFLINE if "interrupted" in line or "failed" in line or "ERROR" in line else TEXT
+                    text(48, 150 + index * 22, line[:136], 15, color)
+            canvas.create_rectangle(778*sx, 548*sy, 900*sx, 600*sy, fill=PANEL_ALT, outline="")
+            canvas.create_rectangle(918*sx, 548*sy, 1040*sx, 600*sy, fill=PANEL_ALT, outline="")
+            text(839, 574, "▲ OLDER", 15, TEXT, True, "center")
+            text(979, 574, "▼ NEWER", 15, TEXT, True, "center")
+            text(48, 590, f"{len(self.usb_log_lines)} entries · scroll {self.log_scroll}/{max_scroll}", 14, MUTED)
         else:
             text(26, 66, "OneROM Setup", 16, MUTED)
             box(24, 120, 1256, 410, "No OneROM role configured", "OPEN SETTINGS")
@@ -999,8 +1071,16 @@ class TouchSimulator(tk.Tk):
                 x1, x2 = (346, 646) if self.ub4.get() else (34, 334)
                 canvas.create_rectangle(x1*sx, 645*sy, x2*sx, 697*sy, fill=PANEL, outline="")
                 text((x1+x2)/2, 671, "CONTROL", 17, TEXT, True, "center")
+        # USB diagnostics belong on Hardware Setup, not on the normal HUD or
+        # Controller operator screens.
+        if self.preview_page == "settings":
+            canvas.create_rectangle(658*sx, 645*sy, 958*sx, 697*sy, fill=PANEL, outline="")
+            text(808, 671, "LOG", 17, TEXT, True, "center")
+        elif self.preview_page == "log":
+            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
+            text(184, 671, "← BACK", 17, TEXT, True, "center")
         if self.preview_page == "hud":
-            text(680, 680, "Values update while disk is spinning.", 20, MUTED, False, "center")
+            text(660, 680, "Values update while disk is spinning.", 20, MUTED, False, "center")
         if self.preview_page == "hud":
             footer_status = "● DriveHUD connected"
         elif self.preview_page == "control":
@@ -1011,6 +1091,8 @@ class TouchSimulator(tk.Tk):
             controller_state = "connected" if self.ub3.get() else "unassigned"
             hud_state = "connected" if self.ub4.get() else "unassigned"
             footer_status = f"● Controller {controller_state} · DriveHUD {hud_state}"
+        elif self.preview_page == "log":
+            footer_status = "● USB communications"
         else:
             footer_status = "● No boards configured"
         diagnostic = self.serial_last_error.get()
@@ -1207,6 +1289,21 @@ class TouchSimulator(tk.Tk):
                 return
             if y < 76 and x > 1120:
                 self.preview_page = "settings"
+            elif self.preview_page == "log":
+                if 1018 <= x <= 1232 and 96 <= y <= 148:
+                    self.copy_usb_log()
+                    return
+                if 778 <= x <= 900 and 548 <= y <= 600:
+                    self.log_scroll = min(max(0, len(self.usb_log_lines) - 20), self.log_scroll + 10)
+                elif 918 <= x <= 1040 and 548 <= y <= 600:
+                    self.log_scroll = max(0, self.log_scroll - 10)
+                elif 12 <= x <= 370 and 630 <= y <= 710:
+                    self.preview_page = self.log_return_page
+                self.open_size_preview()
+                return
+            elif self.preview_page == "settings" and 640 <= x <= 976 and 630 <= y <= 710:
+                self.open_usb_log()
+                return
             elif self.preview_page in ("controller_connection", "hud_connection"):
                 role = "controller" if self.preview_page == "controller_connection" else "hud"
                 serial_var = self.controller_serial if role == "controller" else self.hud_serial
