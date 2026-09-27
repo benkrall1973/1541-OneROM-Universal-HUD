@@ -39,6 +39,7 @@ STATUS_WRITE_GATE_RE = re.compile(r"\bWGV=(\d+)\s+WG=(\d+)")
 STATUS_CAPTURE_RE = re.compile(
     r"\bCAP=(\d+)\s+PROD=(\d+)\s+CONS=(\d+)\s+ROV=(\d+)\s+QOV=(\d+)"
 )
+STATUS_CAPTURE_COMPACT_RE = re.compile(r"\bC=(\d+)\s+R=(\d+)\s+Q=(\d+)")
 HDRPHY_RE = re.compile(r"\bHDRPHY\b.*?\bT=(\d+)\s+S=(\d+)")
 HDRMETA_RE = re.compile(
     r"\bHDRMETA\b.*?\bID1=\$([0-9A-Fa-f]{2})\s+ID2=\$([0-9A-Fa-f]{2})"
@@ -295,6 +296,14 @@ class DriveTelemetryParser:
             self.state.consumed_total = int(match.group(3))
             self.state.ring_overrun = int(match.group(4))
             self.state.queue_overflow = int(match.group(5))
+        else:
+            # Compact health records are deliberately capped below the
+            # 64-byte TinyUSB TX FIFO; only these three values are rendered.
+            match = STATUS_CAPTURE_COMPACT_RE.search(line)
+            if match:
+                self.state.capture_count = int(match.group(1))
+                self.state.ring_overrun = int(match.group(2))
+                self.state.queue_overflow = int(match.group(3))
         match = STATUS_POSITION_RE.search(line)
         if match and int(match.group(1)):
             self.state.position_half_tracks = max(2, int(match.group(2)))

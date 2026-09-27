@@ -18,7 +18,7 @@ from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discove
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.4"
+APP_VERSION = "V0.0.5"
 # The FIFO has 1,026 virtual pixels from x=230 to the card's right edge.
 # 31 "88" entries plus their 30 separators are 92 fixed-width glyphs; at
 # the 18px Cascadia Mono HUD font that leaves a safe right-hand margin.
@@ -122,6 +122,11 @@ class TouchSimulator(tk.Tk):
         self.capture_count: int | None = None
         self.ring_overrun: int | None = None
         self.queue_overflow: int | None = None
+        # The firmware counters are lifetime counters.  These baselines make
+        # the Health card a resettable diagnostic window without resetting or
+        # disturbing the passive capture firmware.
+        self.health_ring_overrun_baseline = 0
+        self.health_queue_overflow_baseline = 0
         self.disk_id_votes: dict[tuple[int, int], int] = {}
         self.confirmed_disk_id: tuple[int, int] | None = None
         self.disk_id_mismatch = False
@@ -466,8 +471,16 @@ class TouchSimulator(tk.Tk):
         try:
             changed = False
             # Keep the UI responsive even if firmware emits a burst of
-            # diagnostics.  The newest telemetry is what matters for HUD.
-            for line in link.read_lines()[-96:]:
+            # diagnostics. Preserve STATUS/STATE records before trimming
+            # high-rate headers: firmware sends status first, and otherwise a
+            # read burst can push the health record out of the newest 96.
+            received_lines = link.read_lines()
+            tail_lines = received_lines[-96:]
+            retained_control_lines = [
+                line for line in received_lines[:-96]
+                if line.startswith(("STATUS ", "STATE "))
+            ]
+            for line in retained_control_lines + tail_lines:
                 self.append_usb_log("HUD", line)
                 state = self.telemetry_parser.process(line)
                 changed = True
@@ -736,23 +749,27 @@ class TouchSimulator(tk.Tk):
         """Keep a compact, evidence-only activity history for Diagnostics."""
         if not self.activity_history or self.activity_history[-1] != event:
             self.activity_history.append(event)
-            del self.activity_history[:-5]
+            del self.activity_history[:-10]
 
-    def diagnostic_history_text(self) -> str:
-        """Return the newest evidence that fits inside its fixed HUD card."""
+    def diagnostic_history_lines(self) -> tuple[str, str]:
+        """Return two evidence rows that fit the fixed Diagnostics card."""
         if not self.activity_history:
-            return "WAITING FOR DRIVE ACTIVITY"
+            return "WAITING FOR DRIVE ACTIVITY", ""
         compact: list[str] = []
-        # Five compact read events fit within the 816-pixel evidence card at
-        # the fixed 7-inch layout width, while leaving a right-hand margin.
-        for event in self.activity_history[-5:]:
+        # Five compact entries fit per 816-pixel row while preserving a
+        # right-hand margin.  A second row doubles useful recent evidence.
+        for event in self.activity_history[-10:]:
             if event.startswith("READ "):
                 compact.append(f"R {event[5:]}")
             elif event == "WRITE GATE":
                 compact.append("WRITE")
             else:
                 compact.append(event)
-        return "  ·  ".join(compact)
+        return "  ·  ".join(compact[:5]), "  ·  ".join(compact[5:])
+
+    def diagnostic_history_text(self) -> str:
+        """Compatibility helper for callers that only need the newest row."""
+        return self.diagnostic_history_lines()[1] or self.diagnostic_history_lines()[0]
 
     def push_recent_sector(self, track: int, sector: int) -> None:
         """Keep a full-width FIFO of recent physical header sectors."""
@@ -802,8 +819,31 @@ class TouchSimulator(tk.Tk):
     def capture_health_detail(self) -> tuple[str, str]:
         if self.capture_count is None:
             return "WAITING FOR STATUS", MUTED
-        dropped = (self.ring_overrun or 0) + (self.queue_overflow or 0)
+        ring_overrun, queue_overflow = self.diagnostic_drop_counts()
+        dropped = ring_overrun + queue_overflow
         return ("CAPTURE OK" if dropped == 0 else f"DROPS {dropped}", ACCENT if dropped == 0 else WARNING)
+
+    def diagnostic_drop_counts(self) -> tuple[int, int]:
+        """Return capture-drop counters relative to the last Clear action."""
+        ring_overrun = self.ring_overrun or 0
+        queue_overflow = self.queue_overflow or 0
+        # A HUD reboot resets firmware counters; treat that as a new window.
+        if ring_overrun < self.health_ring_overrun_baseline:
+            self.health_ring_overrun_baseline = 0
+        if queue_overflow < self.health_queue_overflow_baseline:
+            self.health_queue_overflow_baseline = 0
+        return (
+            ring_overrun - self.health_ring_overrun_baseline,
+            queue_overflow - self.health_queue_overflow_baseline,
+        )
+
+    def clear_diagnostic_drops(self) -> None:
+        """Start a new Health-card diagnostic window without altering capture."""
+        self.health_ring_overrun_baseline = self.ring_overrun or 0
+        self.health_queue_overflow_baseline = self.queue_overflow or 0
+        self.append_usb_log("SYSTEM", "Cleared HUD Health drop counters (new diagnostic window).")
+        self._hud_dirty = True
+        self.update_live_hud_fields()
 
     def effective_rpm(self) -> float | None:
         """Return qualified RPM from SYNC/sec, rejecting partial windows."""
@@ -873,7 +913,7 @@ class TouchSimulator(tk.Tk):
             if self.last_header_track is not None and self.live_sector is not None else "WAITING"
         )
         expected = self.expected_sector_count()
-        coverage = f"{len(set(self.recent_sectors))}/{expected} SEEN" if expected else "WAITING"
+        coverage = f"SEEN {len(set(self.recent_sectors))}/{expected}" if expected else "WAITING"
         rpm = self.effective_rpm()
         capture, capture_color = self.capture_health_detail()
         canvas.itemconfigure("diag_position", text=self.live_track)
@@ -893,8 +933,11 @@ class TouchSimulator(tk.Tk):
         canvas.itemconfigure("diag_media", text=self.disk_identity_label())
         canvas.itemconfigure("diag_media_detail", text=self.disk_identity_detail())
         canvas.itemconfigure("diag_capture", text=capture, fill=capture_color)
-        canvas.itemconfigure("diag_capture_detail", text=(f"CAP {self.capture_count} · ROV {self.ring_overrun or 0} · QOV {self.queue_overflow or 0}" if self.capture_count is not None else "STATUS PENDING"))
-        canvas.itemconfigure("diag_history", text=self.diagnostic_history_text())
+        ring_overrun, queue_overflow = self.diagnostic_drop_counts()
+        canvas.itemconfigure("diag_capture_detail", text=(f"CAP {self.capture_count} · ROV {ring_overrun} · QOV {queue_overflow}" if self.capture_count is not None else "STATUS PENDING"))
+        history_first, history_second = self.diagnostic_history_lines()
+        canvas.itemconfigure("diag_history", text=history_first)
+        canvas.itemconfigure("diag_history_2", text=history_second)
 
     def schedule_write_protect_update(self, protected: bool) -> None:
         """Apply the proven GUI-only 250 ms last-event-wins WP debounce."""
@@ -1395,38 +1438,47 @@ class TouchSimulator(tk.Tk):
         elif self.preview_page == "diagnostics":
             text(26, 76, "Drive Diagnostics · passive measurements", 16, MUTED)
             box(24, 96, 420, 244, "Mechanical Position")
-            canvas.create_text(396*sx, 172*sy, text=self.live_track, fill=TEXT, anchor="e",
-                               font=("Cascadia Mono", max(7, round(50*sy)), "normal"), tags="diag_position")
+            canvas.create_text(50*sx, 172*sy, text=self.live_track, fill=TEXT, anchor="w",
+                               font=("Cascadia Mono", max(7, round(35*sy)), "normal"), tags="diag_position")
             offset = self.header_offset()
             text(50, 220, f"HEADER Δ {offset:+.1f}" if offset is not None else "HEADER WAITING", 15, MUTED, True, tag="diag_offset")
             box(440, 96, 820, 244, "Physical Header")
             header = f"T{self.last_header_track:02d} S{self.live_sector:02d}" if self.last_header_track is not None and self.live_sector is not None else "WAITING"
-            text(466, 172, header, 35, TEXT, True, tag="diag_header")
+            canvas.create_text(466*sx, 172*sy, text=header, fill=TEXT, anchor="w",
+                               font=("Cascadia Mono", max(7, round(35*sy)), "normal"), tags="diag_header")
             text(466, 220, "PHYSICAL HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER", 15, MUTED, True, tag="diag_header_detail")
             box(840, 96, 1256, 244, "Rotation")
             displayed_rpm = self.effective_rpm()
-            canvas.create_text(1232*sx, 172*sy, text=f"{displayed_rpm:.2f}" if displayed_rpm is not None else "--.--", fill=TEXT, anchor="e",
-                               font=("Cascadia Mono", max(7, round(50*sy)), "normal"), tags="diag_rpm")
+            canvas.create_text(866*sx, 172*sy, text=f"{displayed_rpm:.2f}" if displayed_rpm is not None else "--.--", fill=TEXT, anchor="w",
+                               font=("Cascadia Mono", max(7, round(35*sy)), "normal"), tags="diag_rpm")
             text(866, 220, self.rpm_quality_detail(), 15, MUTED, True, tag="diag_rpm_detail")
             box(24, 260, 420, 408, "Sector Coverage")
             expected = self.expected_sector_count()
-            coverage = f"{len(set(self.recent_sectors))}/{expected} SEEN" if expected else "WAITING"
+            coverage = f"SEEN {len(set(self.recent_sectors))}/{expected}" if expected else "WAITING"
             text(50, 336, coverage, 31, TEXT, True, tag="diag_coverage")
             text(50, 384, f"D{self.live_density} ZONE" if self.live_density is not None else "DENSITY UNKNOWN", 15, MUTED, True, tag="diag_coverage_detail")
             box(440, 260, 820, 408, "Activity")
             text(466, 336, self.disk_activity_label(), 31, TEXT, True, tag="diag_activity")
             text(466, 384, f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", 15, MUTED, True, tag="diag_activity_detail")
             box(840, 260, 1256, 408, "Disk Identity")
-            text(866, 336, self.disk_identity_label(), 27, TEXT, True, tag="diag_media")
+            text(866, 336, self.disk_identity_label(), 35, TEXT, True, tag="diag_media")
             text(866, 384, self.disk_identity_detail(), 14, MUTED, True, tag="diag_media_detail")
             box(24, 424, 420, 572, "HUD Health")
             capture, capture_color = self.capture_health_detail()
             text(50, 500, capture, 27, capture_color, True, tag="diag_capture")
-            capture_detail = f"CAP {self.capture_count} · ROV {self.ring_overrun or 0} · QOV {self.queue_overflow or 0}" if self.capture_count is not None else "STATUS PENDING"
+            canvas.create_rectangle(284*sx, 476*sy, 396*sx, 520*sy, fill=PANEL_ALT, outline=ACCENT)
+            text(340, 498, "CLEAR", 14, TEXT, True, "center")
+            ring_overrun, queue_overflow = self.diagnostic_drop_counts()
+            capture_detail = f"CAP {self.capture_count} · ROV {ring_overrun} · QOV {queue_overflow}" if self.capture_count is not None else "STATUS PENDING"
             text(50, 548, capture_detail, 14, MUTED, True, tag="diag_capture_detail")
             box(440, 424, 1256, 572, "Recent Evidence")
-            text(466, 480, self.diagnostic_history_text(), 17, TEXT, True, tag="diag_history")
-            text(466, 536, "DOS ERROR / RETRIES: NOT AVAILABLE", 15, MUTED, True)
+            history_first, history_second = self.diagnostic_history_lines()
+            text(466, 486, history_first, 17, TEXT, True, tag="diag_history")
+            text(466, 516, history_second, 17, TEXT, True, tag="diag_history_2")
+            # Match every other card's lower-detail baseline: 24 virtual
+            # pixels above the lower edge of this 148-pixel-high card.
+            # This is a capability note, not an active fault; keep it quiet.
+            text(466, 548, "DOS ERROR / RETRY DATA UNAVAILABLE", 13, MUTED)
             text(28, 612, self.hud_connection.get(), 16, ACCENT if self.ub4.get() else OFFLINE)
         elif self.preview_page == "control":
             text(26, 76, "OneROM Controller", 16, MUTED)
@@ -1633,7 +1685,9 @@ class TouchSimulator(tk.Tk):
         elif self.preview_page == "diagnostics":
             # The status at the far right needs its own stable space.  Keep
             # this deliberately short so it never encroaches on navigation.
-            text(810, 680, "PASSIVE LIVE DATA", 15, MUTED, True, "center")
+            # Left-align the footer descriptor with the available content
+            # lane immediately after Control, instead of floating mid-lane.
+            text(668, 680, "PASSIVE LIVE DATA", 15, MUTED, True)
         if self.preview_page == "hud":
             footer_status = "● DriveHUD connected"
         elif self.preview_page == "control":
@@ -1913,6 +1967,9 @@ class TouchSimulator(tk.Tk):
             elif self.preview_page == "hud" and 440 <= x <= 820 and 396 <= y <= 534:
                 self.preview_page = "diagnostics"
                 self.open_size_preview()
+                return
+            elif self.preview_page == "diagnostics" and 284 <= x <= 396 and 476 <= y <= 520:
+                self.clear_diagnostic_drops()
                 return
             elif self.preview_page == "hud" and self.ub3.get() and 645 <= y <= 697 and 34 <= x <= 334:
                 self.preview_page = "control"
