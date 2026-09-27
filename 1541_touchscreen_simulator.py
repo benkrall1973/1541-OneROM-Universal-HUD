@@ -19,6 +19,10 @@ from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discove
 
 WIDTH, HEIGHT = 1280, 720
 APP_VERSION = "V0.0.2"
+# The FIFO has 1,026 virtual pixels from x=230 to the card's right edge.
+# 31 "88" entries plus their 30 separators are 92 fixed-width glyphs; at
+# the 18px Cascadia Mono HUD font that leaves a safe right-hand margin.
+RECENT_SECTOR_FIFO_SIZE = 31
 # Bench calibration: 94% on the prior baseline measured as a real 7 inches.
 # That physical size is now the user-facing 100% baseline.
 SEVEN_INCH_BASE_SCALE = 1.3818
@@ -102,8 +106,16 @@ class TouchSimulator(tk.Tk):
         self.live_track = "--.-"
         self.live_density: int | None = None
         self.live_protected: bool | None = None
+        self.live_rpm: float | None = None
+        self.live_sector: int | None = None
+        self.live_sync_count: int | None = None
+        self.last_stable_rpm: float | None = None
+        self.recent_sectors: list[int] = []
+        self._fifo_track: int | None = None
         self._hud_dirty = False
         self._confirmed_writable = False
+        self.controller_wp_available: bool | None = None
+        self._pending_wp_override: bool | None = None
         self._wp_pending_state: bool | None = None
         self._wp_after_id: str | None = None
         self._reconnect_after: dict[str, str] = {}
@@ -182,7 +194,7 @@ class TouchSimulator(tk.Tk):
         self.track_card, self.track_var = self.card(grid, "Track", "18.0")
         self.motor_card, self.motor_var = self.card(grid, "Motor", "ON")
         self.rpm_card, self.rpm_var = self.card(grid, "RPM", "300.7")
-        self.head_card, self.head_var = self.card(grid, "Head", "IN")
+        self.head_card, self.head_var = self.card(grid, "Head", "PARK")
         self.sector_card, self.sector_var = self.card(grid, "Sector", "06")
         self.wp_card, self.wp_var = self.card(grid, "Write Protect", "PROTECTED", small=True)
         for index, card in enumerate((self.track_card, self.motor_card, self.rpm_card, self.head_card, self.sector_card, self.wp_card)):
@@ -386,6 +398,8 @@ class TouchSimulator(tk.Tk):
                 link.open()
                 self.usb_links[role] = link
                 self.after(150, link.assert_dtr)
+                if role == "controller":
+                    self.after(300, self.request_controller_wp_state)
             self.drive_binding = binding
             save_binding(self.binding_path, binding)
             self.ub3.set("controller" in self.usb_links)
@@ -446,14 +460,34 @@ class TouchSimulator(tk.Tk):
                     # the desktop card layout has no matching Tk variable.
                     if hasattr(self, "density_var"):
                         self.density_var.set(f"D{state.density}")
+                if state.rpm is not None:
+                    self.live_rpm = state.rpm
+                    self.rpm_var.set(f"{state.rpm:.2f}")
+                if state.sector is not None:
+                    self.live_sector = state.sector
+                    self.sector_var.set(f"{state.sector:02d}")
+                if state.sync_count is not None:
+                    self.live_sync_count = state.sync_count
+                if state.motor is False:
+                    self.last_stable_rpm = None
+                    self.clear_recent_sectors()
+                elif line.startswith("PHASE "):
+                    # A physical head step makes earlier sectors unrelated to
+                    # the current position, just as in the proven HUD GUI.
+                    self.clear_recent_sectors()
+                elif line.startswith("HDRPHY ") and state.header_track is not None and state.sector is not None:
+                    self.push_recent_sector(state.header_track, state.sector)
                 if state.protected is not None:
                     self.schedule_write_protect_update(state.protected)
-                if state.head in ("IN", "OUT", "PARK"):
+                if state.head in ("IN", "OUT", "STALL", "PARK"):
                     self.head_var.set(state.head)
                     if state.head in ("IN", "OUT"):
                         self.head_direction = state.head
             # Never rebuild the entire Canvas from the CDC receive loop.
             # Only existing live HUD items are updated in place.
+            displayed_rpm = self.effective_rpm()
+            if displayed_rpm is not None:
+                self.rpm_var.set(f"{displayed_rpm:.2f}")
             self._hud_dirty = self._hud_dirty or changed
             if changed:
                 self.serial_last_error.set("")
@@ -479,7 +513,9 @@ class TouchSimulator(tk.Tk):
                 # Selector replies are the only controller lines surfaced to
                 # the operator. Other CDC log lines are still drained.
                 if line.startswith("$ROMTEST,"):
-                    if ",OK," in line or line.endswith(",OK"):
+                    if line.startswith("$ROMTEST,WP,"):
+                        self.handle_controller_wp_reply(line)
+                    elif ",OK," in line or line.endswith(",OK"):
                         self.control_status.set(f"Controller verified: {line}")
                     elif ",FAIL" in line or ",ERROR," in line:
                         self.control_status.set(f"Controller rejected request: {line}")
@@ -531,6 +567,8 @@ class TouchSimulator(tk.Tk):
             link.open()
             self.usb_links[role] = link
             self.after(150, link.assert_dtr)
+            if role == "controller":
+                self.after(300, self.request_controller_wp_state)
             self._reconnect_delay_ms[role] = 1000
             if role == "controller":
                 self.ub3.set(True)
@@ -561,6 +599,55 @@ class TouchSimulator(tk.Tk):
         except OSError:
             pass
 
+    def clear_recent_sectors(self) -> None:
+        """Clear the decoded-sector history after motor-off or a seek."""
+        if not self.recent_sectors and self._fifo_track is None:
+            return
+        self.recent_sectors.clear()
+        self._fifo_track = None
+
+    def push_recent_sector(self, track: int, sector: int) -> None:
+        """Keep a full-width FIFO of recent physical header sectors."""
+        if self._fifo_track is None:
+            self._fifo_track = track
+        elif track != self._fifo_track:
+            self.recent_sectors.clear()
+            self._fifo_track = track
+        self.recent_sectors.append(sector)
+        del self.recent_sectors[:-RECENT_SECTOR_FIFO_SIZE]
+
+    def sync_revolution_reading(self) -> tuple[float | None, int | None, int | None]:
+        """Return the measured ratio, its physical-count display, and zone target."""
+        expected_by_density = {3: 42, 2: 38, 1: 36, 0: 34}
+        expected = expected_by_density.get(self.live_density)
+        if (
+            not self.motor
+            or self.live_sync_count is None
+            or self.live_rpm is None
+            or self.live_rpm <= 0
+        ):
+            return None, None, expected
+        estimate = self.live_sync_count * 60 / self.live_rpm
+        # Individual SYNC pulses are discrete.  The fraction belongs to the
+        # one-second-window/RPM diagnostic, while the primary HUD value is
+        # the nearest physical count per revolution.
+        return estimate, round(estimate), expected
+
+    def effective_rpm(self) -> float | None:
+        """Return qualified RPM from SYNC/sec, rejecting partial windows."""
+        expected_by_density = {3: 42, 2: 38, 1: 36, 0: 34}
+        expected = expected_by_density.get(self.live_density)
+        if self.motor and expected and self.live_sync_count is not None and self.live_sync_count > 0:
+            # live_sync_count is SYNC pulses per second. Convert it to RPM
+            # using the density's physical SYNCs-per-revolution target.
+            derived_rpm = self.live_sync_count * 60.0 / expected
+            # Short seek/format windows can report a handful of pulses or a
+            # mixed count. Accept only a physically plausible 1541 spindle
+            # range, otherwise hold the last qualified reading.
+            if 240.0 <= derived_rpm <= 360.0:
+                self.last_stable_rpm = derived_rpm
+        return self.last_stable_rpm
+
     def update_live_hud_fields(self) -> None:
         """Update existing HUD Canvas items without rebuilding the screen."""
         if self.preview_page != "hud":
@@ -572,10 +659,26 @@ class TouchSimulator(tk.Tk):
         try:
             canvas.itemconfigure("hud_track", text=self.live_track)
             canvas.itemconfigure("hud_motor", text="ON" if self.motor else "OFF")
-            canvas.itemconfigure("hud_head", text=self.head_direction)
+            canvas.itemconfigure("hud_head", text=self.head_var.get())
             canvas.itemconfigure("hud_density", text=f"D{self.live_density}" if self.live_density is not None else "--")
-            if self.live_protected is not None:
-                canvas.itemconfigure("hud_wp", text="PROTECTED" if self.live_protected else "WRITABLE")
+            displayed_rpm = self.effective_rpm()
+            canvas.itemconfigure("hud_rpm", text=f"{displayed_rpm:.2f}" if displayed_rpm is not None else "0.00")
+            canvas.itemconfigure("hud_rpm_state", text="FRESH" if self.motor and self.live_rpm is not None else "OFF")
+            canvas.itemconfigure("hud_sector", text=f"{self.live_sector:02d}" if self.live_sector is not None else "--")
+            canvas.itemconfigure("hud_sync", text=str(self.live_sync_count) if self.live_sync_count is not None else "0")
+            canvas.itemconfigure(
+                "hud_fifo",
+                text=" ".join(f"{sector:02d}" for sector in self.recent_sectors) if self.recent_sectors else "— FIFO empty —",
+            )
+            sync_estimate, sync_count_per_rev, sync_expected = self.sync_revolution_reading()
+            canvas.itemconfigure("hud_sync_rev", text=str(sync_count_per_rev) if sync_count_per_rev is not None else "--")
+            estimate_detail = f"EST {sync_estimate:.2f}" if sync_estimate is not None else ""
+            expected_detail = (
+                f"EXPECTED {sync_expected}" if sync_expected is not None else "WAITING FOR SYNC"
+            )
+            canvas.itemconfigure("hud_sync_rev_estimate", text=estimate_detail)
+            canvas.itemconfigure("hud_sync_rev_detail", text=expected_detail)
+            canvas.itemconfigure("hud_wp", text=self.hud_write_protect_label())
         except tk.TclError:
             # The screen may have changed between CDC receive and paint.
             pass
@@ -596,6 +699,17 @@ class TouchSimulator(tk.Tk):
             return
         self.live_protected = self._wp_pending_state
         self.wp_var.set("PROTECTED" if self.live_protected else "WRITABLE")
+
+    def hud_write_protect_label(self) -> str:
+        """Return effective write permission, not only the passive sensor bit."""
+        # X2 overrides the physical sensor.  The HUD continues to read that
+        # sensor passively, but the operator needs the state the drive will
+        # actually obey when the Controller has confirmed X2 ON.
+        if self._confirmed_writable:
+            return "FORCES WRITABLE"
+        if self.live_protected is None:
+            return "WAITING FOR SENSOR"
+        return "PROTECTED" if self.live_protected else "WRITABLE"
         self.update_live_hud_fields()
 
     def apply_device_state(self, initial=False) -> None:
@@ -647,11 +761,58 @@ class TouchSimulator(tk.Tk):
         desired = self.writable.get()
         try:
             self.send_controller_command("ROMWP=ON" if desired else "ROMWP=OFF")
-            self._confirmed_writable = desired
-            self.control_status.set("Write-protect override ON — forces writable." if desired else "Write-protect override OFF — normal protection.")
+            self._pending_wp_override = desired
+            self.control_status.set("Verifying X2 write-protect override…")
         except Exception as exc:
             self.writable.set(self._confirmed_writable)
             self.control_status.set(f"Write-protect override was not changed: {exc}")
+
+    def request_controller_wp_state(self) -> None:
+        """Ask the Controller to report whether its X2 override is usable."""
+        try:
+            self.send_controller_command("ROMWP?")
+            self.append_usb_log("SYSTEM", "Queried Controller X2 write-protect override state.")
+        except Exception as exc:
+            self.append_usb_log("SYSTEM", f"Controller X2 write-protect query was not sent: {exc}")
+
+    def handle_controller_wp_reply(self, line: str) -> None:
+        """Accept only the prior selector's explicit X2 verification reply."""
+        fields: dict[str, str] = {}
+        for part in line.split(",")[2:]:
+            if "=" in part:
+                key, value = part.split("=", 1)
+                fields[key] = value
+            elif part:
+                fields.setdefault("STATUS", part)
+        available = fields.get("AVAILABLE") == "1"
+        reported_on = fields.get("STATE") == "ON"
+        self.controller_wp_available = available
+        if self._pending_wp_override is None:
+            if available:
+                self._confirmed_writable = reported_on
+                self.writable.set(reported_on)
+                self.control_status.set(
+                    "Controller X2 override is ON — forces writable."
+                    if reported_on else "Controller X2 override is OFF — normal protection."
+                )
+            else:
+                self.control_status.set(fields.get("ERROR", "Controller reports X2 write-protect override unavailable."))
+            self.update_live_hud_fields()
+            return
+        wanted = self._pending_wp_override
+        verified = fields.get("VERIFY") == ("ON" if wanted else "OFF")
+        if fields.get("STATUS") == "OK" and available and reported_on == wanted and verified:
+            self._confirmed_writable = wanted
+            self.writable.set(wanted)
+            self.control_status.set(
+                "Controller verified X2 override ON — drive forced writable."
+                if wanted else "Controller verified X2 override OFF — normal protection restored."
+            )
+        else:
+            self.writable.set(self._confirmed_writable)
+            self.control_status.set(f"Controller did not verify X2 override: {line}")
+        self._pending_wp_override = None
+        self.update_live_hud_fields()
 
     def send_controller_command(self, command: str) -> None:
         """Send only the documented USB Selector commands to Controller."""
@@ -776,6 +937,7 @@ class TouchSimulator(tk.Tk):
     def toggle_motor(self) -> None:
         self.motor = not self.motor
         self.motor_var.set("ON" if self.motor else "OFF")
+        self.head_var.set("IN" if self.motor else "PARK")
         self.rpm_var.set("300.7" if self.motor else "---.-")
 
     def simulated_density(self) -> str:
@@ -948,34 +1110,73 @@ class TouchSimulator(tk.Tk):
             # available HUD tags and sector FIFO stay visible below them.
             # Align the entire HUD metric grid with the Controller screen.
             # This makes the two views feel like the same physical display.
-            box(24, 96, 420, 234, "Track", self.live_track, value_size=56, value_y=185, value_tag="hud_track")
+            box(24, 96, 420, 234, "Track")
+            canvas.create_text(396*sx, 185*sy, text=self.live_track, fill=TEXT, anchor="e",
+                               font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_track")
             box(440, 96, 660, 234, "Motor", "")
             text(462, 174, "ON" if self.motor else "OFF", 28, TEXT, True, tag="hud_motor")
             if self.motor:
                 draw_spinning_disk(time.monotonic())
             box(680, 96, 900, 234, "Head", "")
-            text(702, 174, self.head_direction, 28, TEXT, True, tag="hud_head")
+            text(702, 174, self.head_var.get(), 28, TEXT, True, tag="hud_head")
             draw_head_motion(time.monotonic())
-            box(920, 96, 1256, 234, "Density", f"D{self.live_density}" if self.live_density is not None else "--", value_tag="hud_density")
-            box(24, 246, 420, 384, "RPM", "300.7" if self.motor else "0.0")
-            box(440, 246, 660, 384, "RPM State", "FRESH" if self.motor else "OFF")
-            box(680, 246, 900, 384, "Sector", "06" if self.motor else "--")
-            box(920, 246, 1256, 384, "Sync / Sec", "170" if self.motor else "0")
-            text(946, 356, "raw SYNC / fresh RPM", 14, MUTED)
+            box(920, 96, 1256, 234, "Density")
+            canvas.create_text(1232*sx, 174*sy,
+                               text=f"D{self.live_density}" if self.live_density is not None else "--",
+                               fill=TEXT, anchor="e",
+                               font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_density")
+            box(24, 246, 420, 384, "RPM")
+            displayed_rpm = self.effective_rpm()
+            canvas.create_text(396*sx, 324*sy,
+                               text=f"{displayed_rpm:.2f}" if displayed_rpm is not None else "0.00",
+                               fill=TEXT, anchor="e",
+                               font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_rpm")
+            box(440, 246, 660, 384, "RPM State", "FRESH" if self.motor and self.live_rpm is not None else "OFF", value_tag="hud_rpm_state")
+            box(680, 246, 900, 384, "Sector")
+            canvas.create_text(876*sx, 324*sy,
+                               text=f"{self.live_sector:02d}" if self.live_sector is not None else "--",
+                               fill=TEXT, anchor="e",
+                               font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_sector")
+            box(920, 246, 1256, 384, "Sync / Sec")
+            canvas.create_text(1232*sx, 324*sy,
+                               text=str(self.live_sync_count) if self.live_sync_count is not None else "0",
+                               fill=TEXT, anchor="e",
+                               font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_sync")
+            # Keep the diagnostic caption against the lower card margin so
+            # the enlarged live count above it has clear breathing room.
+            text(946, 368, "raw SYNC / fresh RPM", 14, MUTED)
             if self.ub3.get() and self.controller_wp_enabled.get():
-                box(24, 396, 420, 534, "Sync / Rev Est", "33.90" if self.motor else "--.--")
-                protected = self.live_protected if self.live_protected is not None else not self.writable.get()
-                box(440, 396, 1256, 534, "Write Protect", "PROTECTED" if protected else "WRITABLE", value_tag="hud_wp")
+                sync_estimate, sync_count_per_rev, sync_expected = self.sync_revolution_reading()
+                box(24, 396, 420, 534, "Sync / Rev")
+                canvas.create_text(396*sx, 474*sy, text=str(sync_count_per_rev) if sync_count_per_rev is not None else "--",
+                                   fill=TEXT, anchor="e", font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_sync_rev")
+                estimate_detail = f"EST {sync_estimate:.2f}" if sync_estimate is not None else ""
+                expected_detail = f"EXPECTED {sync_expected}" if sync_expected is not None else "WAITING FOR SYNC"
+                text(50, 518, estimate_detail, 16, TEXT, True, tag="hud_sync_rev_estimate")
+                text(160, 518, expected_detail, 14, MUTED, True, tag="hud_sync_rev_detail")
+                box(440, 396, 1256, 534, "Write-Protect Override", self.hud_write_protect_label(), value_tag="hud_wp")
                 hud_wp_action = "Disable override" if self.writable.get() else "Enable writable override"
                 canvas.create_rectangle(850*sx, 467*sy, 1228*sx, 519*sy, fill=OFFLINE if self.writable.get() else ACCENT, outline="")
                 text(1039, 493, hud_wp_action.upper(), 17, BG, True, "center")
             else:
                 # HUD-only installations remain purely passive: no
                 # write-protect state or control is presented.
-                box(24, 396, 1256, 534, "Sync / Rev Est", "33.90" if self.motor else "--.--")
+                sync_estimate, sync_count_per_rev, sync_expected = self.sync_revolution_reading()
+                box(24, 396, 1256, 534, "Sync / Rev")
+                canvas.create_text(1232*sx, 474*sy, text=str(sync_count_per_rev) if sync_count_per_rev is not None else "--",
+                                   fill=TEXT, anchor="e", font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_sync_rev")
+                estimate_detail = f"EST {sync_estimate:.2f}" if sync_estimate is not None else ""
+                expected_detail = f"EXPECTED {sync_expected}" if sync_expected is not None else "WAITING FOR SYNC"
+                text(50, 518, estimate_detail, 16, TEXT, True, tag="hud_sync_rev_estimate")
+                text(160, 518, expected_detail, 14, MUTED, True, tag="hud_sync_rev_detail")
             canvas.create_rectangle(24*sx, 546*sy, 1256*sx, 592*sy, fill=PANEL, outline=PANEL_ALT, width=1)
             text(42, 570, "RECENT SECTORS", 15, MUTED, True)
-            text(270, 570, "12   02   04   06   08   10   12   02   04   06" if self.motor else "— FIFO empty —", 18, TEXT, True)
+            canvas.create_text(
+                230*sx, 570*sy,
+                text=" ".join(f"{sector:02d}" for sector in self.recent_sectors) if self.recent_sectors else "— FIFO empty —",
+                fill=TEXT, anchor="w",
+                font=("Cascadia Mono", max(7, round(18*sy)), "normal"), tags="hud_fifo",
+            )
             # Match the Controller screen's serial/status line so the
             # operator can identify the physical monitor board at a glance.
             text(28, 612, self.hud_connection.get(), 16, ACCENT if self.ub4.get() else OFFLINE)

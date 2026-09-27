@@ -22,8 +22,8 @@ except ImportError:  # Keep the simulator usable before pyserial is installed.
 
 
 BAUD_RATE = 115200
-STATE_RE = re.compile(r"STATE\s+(V[0-9.]+)")
-STATUS_RE = re.compile(r"STATUS\s+(V[0-9.]+)")
+STATE_RE = re.compile(r"STATE\s+([A-Za-z][0-9.]+)")
+STATUS_RE = re.compile(r"STATUS\s+([A-Za-z][0-9.]+)")
 MOTOR_RE = re.compile(r"MOTOR\s+state=(\d+)")
 PHASE_RE = re.compile(r"PHASE\s+old=(\d+)\s+new=(\d+)\s+delta=(\d+)\s+motor=(\d+)")
 TRACK_RE = re.compile(r"TRACK_WRITE\s+addr=\$0022\s+data=\$[0-9A-Fa-f]+\s+\((\d+)\)")
@@ -34,6 +34,10 @@ STATUS_TRACK_RE = re.compile(r"\bTV=(\d+)\s+T=(\d+)")
 STATUS_POSITION_RE = re.compile(r"\bTPV=(\d+)\s+TP2=(\d+)")
 STATUS_DENSITY_RE = re.compile(r"\bDV=(\d+)\s+D=(\d+)")
 STATUS_MOTOR_RE = re.compile(r"\bM=(\d+)")
+HDRPHY_RE = re.compile(r"\bHDRPHY\b.*?\bT=(\d+)\s+S=(\d+)")
+RPM_RE = re.compile(r"\bRPM\b.*?\bRPM=([0-9]+(?:\.[0-9]+)?)")
+SYNC_RE = re.compile(r"\bSYNC\b.*?\bCOUNT=(\d+)\s+LEVEL=(\d+)")
+HEAD_STALL_TIMEOUT = 0.75
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,11 @@ class TelemetryState:
     density: int | None = None
     position_half_tracks: int | None = None
     head: str = "PARK"
+    rpm: float | None = None
+    sector: int | None = None
+    sync_count: int | None = None
+    sync_level: int | None = None
+    header_track: int | None = None
 
     @property
     def track(self) -> str:
@@ -191,6 +200,7 @@ class DriveTelemetryParser:
         self._last_motion = 0.0
 
     def process(self, line: str) -> TelemetryState:
+        self._refresh_head_state()
         state_match = STATE_RE.search(line) or STATUS_RE.search(line)
         if state_match:
             self.state.firmware = state_match.group(1)
@@ -203,7 +213,10 @@ class DriveTelemetryParser:
             return self.state
         match = WRITE_PROTECT_RE.search(line)
         if match:
-            self.state.protected = bool(int(match.group(1)))
+            # Physical write testing establishes the installed sensor
+            # polarity: state=0 is the asserted no-notch/protected condition;
+            # state=1 permits writing.
+            self.state.protected = not bool(int(match.group(1)))
             return self.state
         match = MOTOR_RE.search(line)
         if match:
@@ -216,12 +229,26 @@ class DriveTelemetryParser:
         match = PHASE_RE.search(line)
         if match:
             self._phase(int(match.group(3)))
+            return self.state
+        match = HDRPHY_RE.search(line)
+        if match:
+            self.state.header_track = int(match.group(1))
+            self.state.sector = int(match.group(2))
+            return self.state
+        match = RPM_RE.search(line)
+        if match:
+            self.state.rpm = float(match.group(1))
+            return self.state
+        match = SYNC_RE.search(line)
+        if match:
+            self.state.sync_count = int(match.group(1))
+            self.state.sync_level = int(match.group(2))
         return self.state
 
     def _state_snapshot(self, line: str) -> None:
         match = STATUS_WP_RE.search(line)
         if match and int(match.group(1)):
-            self.state.protected = bool(int(match.group(2)))
+            self.state.protected = not bool(int(match.group(2)))
         match = STATUS_DENSITY_RE.search(line)
         if match and int(match.group(1)):
             self.state.density = int(match.group(2)) & 3
@@ -240,6 +267,16 @@ class DriveTelemetryParser:
         self.state.motor = motor
         if not motor:
             self.state.head = "PARK"
+            self.state.rpm = 0.0
+        elif self._last_motion <= 0:
+            self._last_motion = time.monotonic()
+
+    def _refresh_head_state(self) -> None:
+        """Report stalled motion when the motor runs without a fresh phase step."""
+        if not self.state.motor:
+            self.state.head = "PARK"
+        elif self._last_motion and time.monotonic() - self._last_motion >= HEAD_STALL_TIMEOUT:
+            self.state.head = "STALL"
 
     def _set_track(self, track: int) -> None:
         # $0022 is a DOS destination-track hint, not a continuously reliable
@@ -251,12 +288,14 @@ class DriveTelemetryParser:
             self.state.position_half_tracks = max(2, track * 2)
 
     def _phase(self, delta: int) -> None:
-        if delta == 1 and self.state.position_half_tracks is not None:
-            self.state.position_half_tracks += 1
+        if delta == 1:
+            if self.state.position_half_tracks is not None:
+                self.state.position_half_tracks += 1
             self.state.head = "IN" if self.state.motor else "PARK"
             self._last_motion = time.monotonic()
-        elif delta == 3 and self.state.position_half_tracks is not None:
-            self.state.position_half_tracks = max(2, self.state.position_half_tracks - 1)
+        elif delta == 3:
+            if self.state.position_half_tracks is not None:
+                self.state.position_half_tracks = max(2, self.state.position_half_tracks - 1)
             self.state.head = "OUT" if self.state.motor else "PARK"
             self._last_motion = time.monotonic()
 
