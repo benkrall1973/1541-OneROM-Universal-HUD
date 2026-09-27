@@ -106,6 +106,8 @@ class TouchSimulator(tk.Tk):
         self.live_track = "--.-"
         self.live_density: int | None = None
         self.live_protected: bool | None = None
+        self.live_writing: bool | None = None
+        self._writing_display_until = 0.0
         self.live_rpm: float | None = None
         self.live_sector: int | None = None
         self.live_sync_count: int | None = None
@@ -366,6 +368,13 @@ class TouchSimulator(tk.Tk):
         self.append_usb_log("SYSTEM", self.usb_status.get())
         self.open_size_preview()
 
+    def clear_usb_log(self) -> None:
+        """Clear the visible USB log without adding a replacement entry."""
+        self.usb_log_lines.clear()
+        self.log_scroll = 0
+        self.usb_status.set("USB log cleared.")
+        self.open_size_preview()
+
     def connect_assigned_boards(self, selected_role: str | None = None) -> None:
         """Persist serial-to-drive role bindings and open their CDC telemetry links."""
         binding = DriveBinding(
@@ -470,6 +479,7 @@ class TouchSimulator(tk.Tk):
                     self.live_sync_count = state.sync_count
                 if state.motor is False:
                     self.last_stable_rpm = None
+                    self._writing_display_until = 0.0
                     self.clear_recent_sectors()
                 elif line.startswith("PHASE "):
                     # A physical head step makes earlier sectors unrelated to
@@ -479,6 +489,14 @@ class TouchSimulator(tk.Tk):
                     self.push_recent_sector(state.header_track, state.sector)
                 if state.protected is not None:
                     self.schedule_write_protect_update(state.protected)
+                if state.writing is not None:
+                    self.live_writing = state.writing
+                    if state.writing:
+                        # The physical CB2 write-gate pulse can be shorter
+                        # than one CDC receive batch. Hold it briefly so the
+                        # operator can actually see a confirmed write.
+                        self._writing_display_until = time.monotonic() + 1.0
+                        self.after(1010, self.update_live_hud_fields)
                 if state.head in ("IN", "OUT", "STALL", "PARK"):
                     self.head_var.set(state.head)
                     if state.head in ("IN", "OUT"):
@@ -648,6 +666,12 @@ class TouchSimulator(tk.Tk):
                 self.last_stable_rpm = derived_rpm
         return self.last_stable_rpm
 
+    def disk_activity_label(self) -> str:
+        """Render the disk write-gate state without mistaking CPU R/W for I/O."""
+        if not self.motor:
+            return "OFF"
+        return "WRITING" if time.monotonic() < self._writing_display_until else "READING"
+
     def update_live_hud_fields(self) -> None:
         """Update existing HUD Canvas items without rebuilding the screen."""
         if self.preview_page != "hud":
@@ -663,7 +687,7 @@ class TouchSimulator(tk.Tk):
             canvas.itemconfigure("hud_density", text=f"D{self.live_density}" if self.live_density is not None else "--")
             displayed_rpm = self.effective_rpm()
             canvas.itemconfigure("hud_rpm", text=f"{displayed_rpm:.2f}" if displayed_rpm is not None else "0.00")
-            canvas.itemconfigure("hud_rpm_state", text="FRESH" if self.motor and self.live_rpm is not None else "OFF")
+            canvas.itemconfigure("hud_rpm_state", text=self.disk_activity_label())
             canvas.itemconfigure("hud_sector", text=f"{self.live_sector:02d}" if self.live_sector is not None else "--")
             canvas.itemconfigure("hud_sync", text=str(self.live_sync_count) if self.live_sync_count is not None else "0")
             canvas.itemconfigure(
@@ -1131,7 +1155,7 @@ class TouchSimulator(tk.Tk):
                                text=f"{displayed_rpm:.2f}" if displayed_rpm is not None else "0.00",
                                fill=TEXT, anchor="e",
                                font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_rpm")
-            box(440, 246, 660, 384, "RPM State", "FRESH" if self.motor and self.live_rpm is not None else "OFF", value_tag="hud_rpm_state")
+            box(440, 246, 660, 384, "Activity", self.disk_activity_label(), value_tag="hud_rpm_state")
             box(680, 246, 900, 384, "Sector")
             canvas.create_text(876*sx, 324*sy,
                                text=f"{self.live_sector:02d}" if self.live_sector is not None else "--",
@@ -1324,8 +1348,10 @@ class TouchSimulator(tk.Tk):
             # Use the same 300 x 52 touch-button standard as the footer and
             # Controller actions, with all right-side actions aligned.
             # The copy action lives in the right-aligned header band.
+            canvas.create_rectangle(636*sx, 22*sy, 936*sx, 74*sy, fill=OFFLINE, outline="")
+            text(786, 48, "CLEAR LOG", 17, BG, True, "center")
             canvas.create_rectangle(956*sx, 22*sy, 1256*sx, 74*sy, fill=ACCENT, outline="")
-            text(1106, 48, "CUT N PASTE", 17, BG, True, "center")
+            text(1106, 48, "COPY LOG", 17, BG, True, "center")
             visible_lines = 20
             max_scroll = max(0, len(self.usb_log_lines) - visible_lines)
             self.log_scroll = max(0, min(self.log_scroll, max_scroll))
@@ -1586,6 +1612,9 @@ class TouchSimulator(tk.Tk):
             if self.preview_page not in ("setup", "settings", "log") and y < 76 and x > 1120:
                 self.preview_page = "settings"
             elif self.preview_page == "log":
+                if 636 <= x <= 936 and 22 <= y <= 74:
+                    self.clear_usb_log()
+                    return
                 if 956 <= x <= 1256 and 22 <= y <= 74:
                     self.copy_usb_log()
                     return

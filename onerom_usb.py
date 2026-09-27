@@ -29,11 +29,13 @@ PHASE_RE = re.compile(r"PHASE\s+old=(\d+)\s+new=(\d+)\s+delta=(\d+)\s+motor=(\d+
 TRACK_RE = re.compile(r"TRACK_WRITE\s+addr=\$0022\s+data=\$[0-9A-Fa-f]+\s+\((\d+)\)")
 DENSITY_RE = re.compile(r"DENSITY\s+state=(\d+)")
 WRITE_PROTECT_RE = re.compile(r"WRITE_PROTECT\s+state=(\d+)")
+WRITE_GATE_RE = re.compile(r"WRITE_GATE\s+state=(\d+)")
 STATUS_WP_RE = re.compile(r"\bWPV=(\d+)\s+WP=(\d+)")
 STATUS_TRACK_RE = re.compile(r"\bTV=(\d+)\s+T=(\d+)")
 STATUS_POSITION_RE = re.compile(r"\bTPV=(\d+)\s+TP2=(\d+)")
 STATUS_DENSITY_RE = re.compile(r"\bDV=(\d+)\s+D=(\d+)")
 STATUS_MOTOR_RE = re.compile(r"\bM=(\d+)")
+STATUS_WRITE_GATE_RE = re.compile(r"\bWGV=(\d+)\s+WG=(\d+)")
 HDRPHY_RE = re.compile(r"\bHDRPHY\b.*?\bT=(\d+)\s+S=(\d+)")
 RPM_RE = re.compile(r"\bRPM\b.*?\bRPM=([0-9]+(?:\.[0-9]+)?)")
 SYNC_RE = re.compile(r"\bSYNC\b.*?\bCOUNT=(\d+)\s+LEVEL=(\d+)")
@@ -73,6 +75,7 @@ class TelemetryState:
     firmware: str = ""
     motor: bool | None = None
     protected: bool | None = None
+    writing: bool | None = None
     density: int | None = None
     position_half_tracks: int | None = None
     head: str = "PARK"
@@ -218,6 +221,10 @@ class DriveTelemetryParser:
             # state=1 permits writing.
             self.state.protected = not bool(int(match.group(1)))
             return self.state
+        match = WRITE_GATE_RE.search(line)
+        if match:
+            self.state.writing = bool(int(match.group(1)))
+            return self.state
         match = MOTOR_RE.search(line)
         if match:
             self._set_motor(bool(int(match.group(1))))
@@ -255,6 +262,9 @@ class DriveTelemetryParser:
         match = STATUS_MOTOR_RE.search(line)
         if match:
             self._set_motor(bool(int(match.group(1))))
+        match = STATUS_WRITE_GATE_RE.search(line)
+        if match and int(match.group(1)):
+            self.state.writing = bool(int(match.group(2)))
         match = STATUS_POSITION_RE.search(line)
         if match and int(match.group(1)):
             self.state.position_half_tracks = max(2, int(match.group(2)))
