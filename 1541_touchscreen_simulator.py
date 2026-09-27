@@ -18,10 +18,10 @@ from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discove
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.1"
-# Bench calibration: the prior preview needed 147% to match the real 7-inch
-# panel.  That physical size is now the user-facing 100% baseline.
-SEVEN_INCH_BASE_SCALE = 1.47
+APP_VERSION = "V0.0.2"
+# Bench calibration: 94% on the prior baseline measured as a real 7 inches.
+# That physical size is now the user-facing 100% baseline.
+SEVEN_INCH_BASE_SCALE = 1.3818
 BG = "#101820"
 PANEL = "#182632"
 PANEL_ALT = "#203442"
@@ -248,7 +248,7 @@ class TouchSimulator(tk.Tk):
         ttk.Label(startup, text="Monitor PPI (V226HQL is 102.4):", style="Panel.TLabel").grid(row=3, column=0, sticky="w", pady=(16, 0))
         ttk.Spinbox(startup, from_=70, to=240, increment=0.1, textvariable=self.preview_ppi, width=9, font=("Segoe UI", 11)).grid(row=3, column=1, sticky="w", padx=12, pady=(16, 0))
         ttk.Label(startup, text="Preview scale (%):", style="Panel.TLabel").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Spinbox(startup, from_=50, to=200, textvariable=self.preview_scale, width=9, font=("Segoe UI", 11)).grid(row=4, column=1, sticky="w", padx=12, pady=(8, 0))
+        ttk.Spinbox(startup, from_=25, to=200, textvariable=self.preview_scale, width=9, font=("Segoe UI", 11)).grid(row=4, column=1, sticky="w", padx=12, pady=(8, 0))
         ttk.Button(startup, text="OPEN / APPLY 7-INCH PREVIEW", command=self.open_size_preview).grid(row=4, column=2, padx=8, pady=(8, 0))
         ttk.Button(page, text="← RETURN", style="Nav.TButton", command=lambda: self.show_page(self.default_page())).pack(anchor="w", pady=16)
 
@@ -502,28 +502,31 @@ class TouchSimulator(tk.Tk):
         self._reconnect_delay_ms[role] = min(delay * 2, 8000)
 
     def restore_saved_role_connections(self) -> None:
-        """Reconnect every present saved role after program startup."""
-        for role, serial_number in (
+        """Immediately reconnect every saved role after program startup."""
+        for index, (role, serial_number) in enumerate((
             ("controller", self.drive_binding.controller_serial),
             ("hud", self.drive_binding.hud_serial),
-        ):
+        )):
             if serial_number:
-                self.append_usb_log("SYSTEM", f"Startup reconnect queued for {role.title()} {serial_number}.")
-                self.schedule_role_reconnect(role)
+                self.append_usb_log("SYSTEM", f"Startup reconnecting {role.title()} {serial_number}.")
+                # Do not make the operator open a setup screen or wait for
+                # the normal failure-backoff interval.  Stagger the two CDC
+                # opens slightly so Windows can settle each COM port.
+                self.after(index * 150, lambda current=role: self.attempt_role_reconnect(current))
 
     def attempt_role_reconnect(self, role: str) -> None:
         self._reconnect_after.pop(role, None)
         serial_number = self.drive_binding.controller_serial if role == "controller" else self.drive_binding.hud_serial
         if not serial_number or role in self.usb_links:
             return
-        boards = discover_cdc_boards()
-        self.usb_boards = {board.serial_number: board for board in boards}
-        board = self.usb_boards.get(serial_number)
-        if board is None:
-            self.usb_status.set(f"Waiting for {role.title()} serial {serial_number} to reappear.")
-            self.schedule_role_reconnect(role)
-            return
         try:
+            boards = discover_cdc_boards()
+            self.usb_boards = {board.serial_number: board for board in boards}
+            board = self.usb_boards.get(serial_number)
+            if board is None:
+                self.usb_status.set(f"Waiting for {role.title()} serial {serial_number} to reappear.")
+                self.schedule_role_reconnect(role)
+                return
             link = CdcBoardLink(board)
             link.open()
             self.usb_links[role] = link
@@ -537,6 +540,12 @@ class TouchSimulator(tk.Tk):
             self.usb_status.set(f"{role.title()} {serial_number} automatically reconnected.")
             self.append_usb_log("SYSTEM", self.usb_status.get())
             self.apply_device_state()
+            # Settings is a Canvas screen, so its connection cards do not
+            # automatically reflect changed Tk variables.  Repaint it once
+            # after a successful background reconnect.
+            preview = getattr(self, "preview", None)
+            if preview is not None and preview.winfo_exists():
+                self.open_size_preview()
         except Exception as exc:
             self.usb_status.set(f"{role.title()} reconnect retry failed: {exc}")
             self.schedule_role_reconnect(role)
@@ -698,11 +707,28 @@ class TouchSimulator(tk.Tk):
             "kind": "appearance",
             "title": "Appearance",
             "choices": (
-                ("Background Color", "background"),
+                ("Background", "background"),
                 ("Group / Card Boxes", "group"),
-                ("Button Color", "button"),
-                ("Text 1 - Descriptions", "text1"),
-                ("Text 2 - Values", "text2"),
+                ("Button", "button"),
+                ("Descriptions", "text1"),
+                ("Values", "text2"),
+            ),
+        }
+        self.open_size_preview()
+
+    def return_to_appearance_menu(self) -> None:
+        """Close Custom Color and restore its parent Appearance menu."""
+        self.color_picker = None
+        self.hex_keyboard = False
+        self.popup_menu = {
+            "kind": "appearance",
+            "title": "Appearance",
+            "choices": (
+                ("Background", "background"),
+                ("Group / Card Boxes", "group"),
+                ("Button", "button"),
+                ("Descriptions", "text1"),
+                ("Values", "text2"),
             ),
         }
         self.open_size_preview()
@@ -717,7 +743,7 @@ class TouchSimulator(tk.Tk):
         return x1, y1, x2, y1 + 92, row_height
 
     def change_preview_scale(self, delta: int) -> None:
-        self.preview_scale.set(max(50, min(200, self.preview_scale.get() + delta)))
+        self.preview_scale.set(max(25, min(200, self.preview_scale.get() + delta)))
         self.open_size_preview()
 
     def set_preview_color(self, target: str, color: str) -> None:
@@ -839,80 +865,131 @@ class TouchSimulator(tk.Tk):
         def draw_spinning_disk(phase: float) -> None:
             """A tiny 5.25-inch floppy with deliberately subtle motion marks."""
             canvas.delete("disk")
-            cx, cy, radius = 606, 154, 43
+            cx, cy, radius = 606, 168, 35
             canvas.create_oval((cx-radius)*sx, (cy-radius)*sy, (cx+radius)*sx, (cy+radius)*sy,
                                fill="#28343b", outline="#82959b", width=max(1, round(2*sy)), tags="disk")
-            canvas.create_oval((cx-18)*sx, (cy-18)*sy, (cx+18)*sx, (cy+18)*sy,
+            canvas.create_oval((cx-15)*sx, (cy-15)*sy, (cx+15)*sx, (cy+15)*sy,
                                fill="#101820", outline="#a9bbc4", width=max(1, round(sy)), tags="disk")
-            canvas.create_oval((cx-5)*sx, (cy-5)*sy, (cx+5)*sx, (cy+5)*sy,
+            canvas.create_oval((cx-4)*sx, (cy-4)*sy, (cx+4)*sx, (cy+4)*sy,
                                fill="#d5e5e9", outline="", tags="disk")
-            # Three short highlights shift around the disk and blink, giving
-            # a readable "spinning" cue without a distracting animation.
+            # Three curved arrow strokes orbit just outside the disk rim.
+            # They are 120 degrees apart and use a 15-pixel radial margin so
+            # the spin direction is clear without touching the disk itself.
             active = ACCENT if int(phase * 5) % 2 == 0 else "#76ded0"
-            for offset in (0, 2.1, 4.2):
-                angle = phase * 5 + offset
-                x1, y1 = cx + math.cos(angle) * 49, cy + math.sin(angle) * 49
-                x2, y2 = cx + math.cos(angle) * 62, cy + math.sin(angle) * 62
-                canvas.create_line(x1*sx, y1*sy, x2*sx, y2*sy, fill=active,
-                                   width=max(1, round(3*sy)), tags="disk")
+            arrow_radius = 47
+            arrow_sweep = math.radians(52)
+            for offset in (0, 2 * math.pi / 3, 4 * math.pi / 3):
+                start_angle = phase * 2.2 + offset
+                end_angle = start_angle + arrow_sweep
+                arc_points = []
+                for step in range(9):
+                    angle = start_angle + arrow_sweep * step / 8
+                    arc_points.extend(((cx + math.cos(angle) * arrow_radius) * sx,
+                                       (cy + math.sin(angle) * arrow_radius) * sy))
+                canvas.create_line(*arc_points, fill=active,
+                                   width=max(1, round(3*sy)), smooth=True,
+                                   capstyle="round", tags="disk")
+                # The tangential arrowhead makes the clockwise motion
+                # readable even when only one arrow is visible at a glance.
+                tip_x = cx + math.cos(end_angle) * arrow_radius
+                tip_y = cy + math.sin(end_angle) * arrow_radius
+                tangent_x, tangent_y = -math.sin(end_angle), math.cos(end_angle)
+                normal_x, normal_y = -tangent_y, tangent_x
+                base_x, base_y = tip_x - tangent_x * 10, tip_y - tangent_y * 10
+                canvas.create_polygon(
+                    tip_x*sx, tip_y*sy,
+                    (base_x + normal_x * 5)*sx, (base_y + normal_y * 5)*sy,
+                    (base_x - normal_x * 5)*sx, (base_y - normal_y * 5)*sy,
+                    fill=active, outline="", tags="disk",
+                )
         def draw_head_motion(phase: float) -> None:
-            """Sequential chevrons make the simulated head direction obvious."""
+            """Use foreshortened chevrons to show head motion in depth."""
             canvas.delete("head")
-            # 2.67 Hz is 50% slower than the original 4 Hz prototype rate.
-            count = int(phase * (4 / 1.5)) % 3 + 1
+            # Add one chevron per beat.  Four downward-pointing marks make
+            # depth visible without changing the physical direction glyph.
+            count = int(phase * (4 / 1.5)) % 4 + 1
             center_x = 855
             for index in range(count):
-                # IN starts at the bottom (#1), then adds #2 and #3 upward.
-                # OUT starts at the top (#1), then adds downward.
-                # Both full three-chevron states are centered on y=147.
-                # IN grows bottom-to-top; OUT grows top-to-bottom.
-                y = 171 - index * 24 if self.head_direction == "IN" else 123 + index * 24
                 if self.head_direction == "IN":
-                    points = ((center_x - 20, y + 11), (center_x, y - 9), (center_x + 20, y + 11))
+                    y = 126 + index * 22
+                    # IN approaches: small at the top, large at the bottom.
+                    scale = (0.45, 0.63, 0.81, 1.0)[index]
+                    points = (
+                        (center_x - 20 * scale, y - 11 * scale),
+                        (center_x, y + 9 * scale),
+                        (center_x + 20 * scale, y - 11 * scale),
+                    )
                 else:
-                    points = ((center_x - 20, y - 11), (center_x, y + 9), (center_x + 20, y - 11))
+                    # OUT leaves: a large upward chevron begins at the
+                    # bottom and shrinks as it moves upward into distance.
+                    y = 192 - index * 22
+                    scale = (1.0, 0.81, 0.63, 0.45)[index]
+                    points = (
+                        (center_x - 20 * scale, y + 11 * scale),
+                        (center_x, y - 9 * scale),
+                        (center_x + 20 * scale, y + 11 * scale),
+                    )
                 canvas.create_line(*(coordinate * (sx if pos % 2 == 0 else sy) for pos, coordinate in enumerate(sum((list(point) for point in points), []))),
-                                   fill=ACCENT, width=max(1, round(5*sy)), joinstyle="round", tags="head")
+                                   fill=ACCENT, width=max(1, round((2 + 3 * scale)*sy)), joinstyle="round", tags="head")
         text(26, 34, f"1541 OneROM {APP_VERSION}", 22, TEXT, True)
-        text(1254, 34, "⚙", 25, ACCENT, True, "e")
+        # Setup and Hardware Setup both provide explicit navigation.  Keep
+        # the header gear only on the operational/status screens.
+        if self.preview_page not in ("setup", "settings", "log"):
+            # Center the larger options gear between the frame top and the
+            # aligned HUD/Controller card grid, whose top edge is y=96.
+            text(1254, 48, "⚙", 38, ACCENT, True, "e")
         if self.preview_page == "hud":
-            text(26, 66, "DriveHUD · passive monitor · Firmware V1.0.0", 16, MUTED)
+            text(26, 76, "DriveHUD · passive monitor · Firmware V1.0.0", 16, MUTED)
+            # HOME belongs with the HUD header, not between the metric cards
+            # and sector FIFO.  Right-align it above Head/Density while
+            # reserving the far-right corner for the options gear.
+            text(1168, 76, "HOME: anchored at Track 1.0", 18, MUTED, False, "e")
             # Primary live telemetry in the first two rows; the remaining
             # available HUD tags and sector FIFO stay visible below them.
-            box(24, 82, 420, 220, "Track", self.live_track, value_size=56, value_y=171, value_tag="hud_track")
-            box(440, 82, 660, 220, "Motor", "")
-            text(462, 160, "ON" if self.motor else "OFF", 28, TEXT, True, tag="hud_motor")
+            # Align the entire HUD metric grid with the Controller screen.
+            # This makes the two views feel like the same physical display.
+            box(24, 96, 420, 234, "Track", self.live_track, value_size=56, value_y=185, value_tag="hud_track")
+            box(440, 96, 660, 234, "Motor", "")
+            text(462, 174, "ON" if self.motor else "OFF", 28, TEXT, True, tag="hud_motor")
             if self.motor:
                 draw_spinning_disk(time.monotonic())
-            box(680, 82, 900, 220, "Head", "")
-            text(702, 160, self.head_direction, 28, TEXT, True, tag="hud_head")
+            box(680, 96, 900, 234, "Head", "")
+            text(702, 174, self.head_direction, 28, TEXT, True, tag="hud_head")
             draw_head_motion(time.monotonic())
-            box(920, 82, 1256, 220, "Density", f"D{self.live_density}" if self.live_density is not None else "--", value_tag="hud_density")
-            box(24, 232, 420, 370, "RPM", "300.7" if self.motor else "0.0")
-            box(440, 232, 660, 370, "RPM State", "FRESH" if self.motor else "OFF")
-            box(680, 232, 900, 370, "Sector", "06" if self.motor else "--")
-            box(920, 232, 1256, 370, "Sync / Sec", "170" if self.motor else "0")
-            text(946, 342, "raw SYNC / fresh RPM", 14, MUTED)
+            box(920, 96, 1256, 234, "Density", f"D{self.live_density}" if self.live_density is not None else "--", value_tag="hud_density")
+            box(24, 246, 420, 384, "RPM", "300.7" if self.motor else "0.0")
+            box(440, 246, 660, 384, "RPM State", "FRESH" if self.motor else "OFF")
+            box(680, 246, 900, 384, "Sector", "06" if self.motor else "--")
+            box(920, 246, 1256, 384, "Sync / Sec", "170" if self.motor else "0")
+            text(946, 356, "raw SYNC / fresh RPM", 14, MUTED)
             if self.ub3.get() and self.controller_wp_enabled.get():
-                box(24, 382, 420, 520, "Sync / Rev Est", "33.90" if self.motor else "--.--")
+                box(24, 396, 420, 534, "Sync / Rev Est", "33.90" if self.motor else "--.--")
                 protected = self.live_protected if self.live_protected is not None else not self.writable.get()
-                box(440, 382, 1256, 520, "Write Protect", "PROTECTED" if protected else "WRITABLE", value_tag="hud_wp")
+                box(440, 396, 1256, 534, "Write Protect", "PROTECTED" if protected else "WRITABLE", value_tag="hud_wp")
                 hud_wp_action = "Disable override" if self.writable.get() else "Enable writable override"
-                canvas.create_rectangle(850*sx, 447*sy, 1228*sx, 499*sy, fill=OFFLINE if self.writable.get() else ACCENT, outline="")
-                text(1039, 473, hud_wp_action.upper(), 17, BG, True, "center")
+                canvas.create_rectangle(850*sx, 467*sy, 1228*sx, 519*sy, fill=OFFLINE if self.writable.get() else ACCENT, outline="")
+                text(1039, 493, hud_wp_action.upper(), 17, BG, True, "center")
             else:
                 # HUD-only installations remain purely passive: no
                 # write-protect state or control is presented.
-                box(24, 382, 1256, 520, "Sync / Rev Est", "33.90" if self.motor else "--.--")
-            text(28, 548, "HOME: anchored at Track 1.0", 20, MUTED)
-            canvas.create_rectangle(24*sx, 570*sy, 1256*sx, 616*sy, fill=PANEL, outline=PANEL_ALT, width=1)
-            text(42, 594, "RECENT SECTORS", 15, MUTED, True)
-            text(270, 594, "12   02   04   06   08   10   12   02   04   06" if self.motor else "— FIFO empty —", 18, TEXT, True)
+                box(24, 396, 1256, 534, "Sync / Rev Est", "33.90" if self.motor else "--.--")
+            canvas.create_rectangle(24*sx, 546*sy, 1256*sx, 592*sy, fill=PANEL, outline=PANEL_ALT, width=1)
+            text(42, 570, "RECENT SECTORS", 15, MUTED, True)
+            text(270, 570, "12   02   04   06   08   10   12   02   04   06" if self.motor else "— FIFO empty —", 18, TEXT, True)
+            # Match the Controller screen's serial/status line so the
+            # operator can identify the physical monitor board at a glance.
+            text(28, 612, self.hud_connection.get(), 16, ACCENT if self.ub4.get() else OFFLINE)
         elif self.preview_page == "control":
-            text(26, 66, "OneROM Controller", 16, MUTED)
+            text(26, 76, "OneROM Controller", 16, MUTED)
             if self.controller_rom_enabled.get():
                 box(24, 96, 760, 318, "Startup ROM", self.rom_choice.get())
-                text(720, 275, "▼", 24, ACCENT, True, "e")
+                canvas.create_polygon(
+                    696*sx, 120*sy,
+                    736*sx, 120*sy,
+                    716*sx, 150*sy,
+                    fill=ACCENT,
+                    outline="",
+                )
                 text(50, 232, f"Saved: {self.rom_var.get()}", 15, MUTED)
                 canvas.create_rectangle(454*sx, 251*sy, 732*sx, 303*sy, fill=ACCENT, outline="")
                 text(593, 277, "SAVE ROM", 17, BG, True, "center")
@@ -922,7 +999,13 @@ class TouchSimulator(tk.Tk):
                 text(50, 232, "Enable in Settings / controller JSON build.", 15, MUTED)
             if self.controller_iec_enabled.get():
                 box(784, 96, 1256, 318, "Boot IEC Address", self.iec_choice.get())
-                text(1220, 275, "▼", 24, ACCENT, True, "e")
+                canvas.create_polygon(
+                    1192*sx, 120*sy,
+                    1232*sx, 120*sy,
+                    1212*sx, 150*sy,
+                    fill=ACCENT,
+                    outline="",
+                )
                 text(810, 232, f"Saved: {self.iec_var.get()}", 15, MUTED)
                 canvas.create_rectangle(1010*sx, 251*sy, 1228*sx, 303*sy, fill=ACCENT, outline="")
                 text(1119, 277, "SAVE IEC", 17, BG, True, "center")
@@ -938,11 +1021,11 @@ class TouchSimulator(tk.Tk):
             else:
                 box(24, 344, 760, 566, "Write-Protect Override", "NOT ENABLED")
                 text(50, 486, "Enable in Settings / controller JSON build.", 15, MUTED)
-            box(784, 344, 1256, 566, "Connection", "Controller online" if self.ub3.get() else "USB LOST")
-            text(1020, 530, "Tap to open Controller connection setup", 18, MUTED, False, "center")
-            text(28, 594, self.control_status.get(), 16, ACCENT if self.ub3.get() else OFFLINE)
+            # Reserved blank card for future controller status content.
+            canvas.create_rectangle(784*sx, 344*sy, 1256*sx, 566*sy, fill=PANEL, outline=PANEL_ALT, width=1)
+            text(28, 612, self.control_status.get(), 16, ACCENT if self.ub3.get() else OFFLINE)
         elif self.preview_page == "settings":
-            text(26, 66, "Settings", 16, MUTED)
+            text(26, 76, "Settings", 16, MUTED)
             canvas.create_rectangle(24*sx, 96*sy, 620*sx, 214*sy, fill=PANEL, outline=PANEL_ALT, width=1)
             canvas.create_rectangle(660*sx, 96*sy, 1256*sx, 214*sy, fill=PANEL, outline=PANEL_ALT, width=1)
             text(50, 126, "CONTROLLER-ROLE ONEROM", 18, MUTED, True)
@@ -968,11 +1051,16 @@ class TouchSimulator(tk.Tk):
                 if variable.get():
                     text(62, y1+28, "✓", 19, BG, True, "center")
                 text(96, y1+28, label, 18, TEXT, True)
-            appearance_name = COLOR_PALETTES[self.appearance_target][0]
-            box(660, 294, 1256, 482, "Appearance", appearance_name)
+            box(660, 294, 1256, 482, "Appearance")
+            # The small triangle is the touch affordance for this menu card.
+            canvas.create_polygon(
+                1202*sx, 318*sy,
+                1238*sx, 318*sy,
+                1220*sx, 344*sy,
+                fill=ACCENT,
+                outline="",
+            )
             text(686, 456, "MENU", 14, MUTED, True)
-            canvas.create_rectangle(1000*sx, 415*sy, 1228*sx, 467*sy, fill=ACCENT, outline="")
-            text(1114, 441, "CUSTOM COLOR", 17, BG, True, "center")
             text(24, 514, "Controller feature availability mirrors the configuration JSON used when the board is compiled.", 13, MUTED)
             # Kept available for the Windows simulator, but tucked below the
             # configuration grid so it will not dominate the fixed 7-inch UI.
@@ -981,10 +1069,10 @@ class TouchSimulator(tk.Tk):
             text(44, 590, f"{self.preview_scale.get()}%", 20, TEXT, True)
             # Keep the scale control in the open space between its label and
             # the adjustment buttons, rather than low against the footer.
-            text(200, 574, "50%", 14, MUTED, False, "center")
+            text(200, 574, "25%", 14, MUTED, False, "center")
             text(860, 574, "200%", 14, MUTED, False, "center")
             canvas.create_line(200*sx, 594*sy, 860*sx, 594*sy, fill=MUTED, width=max(1, round(5*sy)))
-            knob_x = 200 + (self.preview_scale.get() - 50) / 150 * 660
+            knob_x = 200 + (self.preview_scale.get() - 25) / 175 * 660
             canvas.create_oval((knob_x-12)*sx, 582*sy, (knob_x+12)*sx, 606*sy, fill=ACCENT, outline="")
             canvas.create_rectangle(900*sx, 556*sy, 1060*sx, 608*sy, fill=PANEL_ALT, outline="")
             canvas.create_rectangle(1080*sx, 556*sy, 1240*sx, 608*sy, fill=ACCENT, outline="")
@@ -994,7 +1082,7 @@ class TouchSimulator(tk.Tk):
             role = "controller" if self.preview_page == "controller_connection" else "hud"
             role_title = "CONTROLLER" if role == "controller" else "DRIVEHUD"
             serial_var = self.controller_serial if role == "controller" else self.hud_serial
-            text(26, 66, f"{role_title.title()} OneROM Communication Setup", 16, MUTED)
+            text(26, 76, f"{role_title.title()} OneROM Communication Setup", 16, MUTED)
             box(24, 96, 1256, 188, f"{role_title} ROLE", serial_var.get() or "NO ONEROM SELECTED", value_size=23, value_y=158)
             canvas.create_rectangle(24*sx, 210*sy, 342*sx, 262*sy, fill=PANEL_ALT, outline="")
             text(183, 236, "REFRESH USB DEVICES", 17, TEXT, True, "center")
@@ -1028,11 +1116,15 @@ class TouchSimulator(tk.Tk):
             text(1064, 574, f"CONNECT {role_title}", 17, BG, True, "center")
             text(24, 470, self.usb_status.get(), 18, ACCENT if boards else MUTED)
         elif self.preview_page == "log":
-            text(26, 66, "USB Communications Log", 16, MUTED)
-            canvas.create_rectangle(24*sx, 82*sy, 1256*sx, 616*sy, fill=PANEL, outline=PANEL_ALT)
+            text(26, 70, "USB Communications Log", 16, MUTED)
+            # Match the top elevation of the main HUD and Controller cards.
+            canvas.create_rectangle(24*sx, 96*sy, 1256*sx, 616*sy, fill=PANEL, outline=PANEL_ALT)
             text(48, 112, "LIVE CDC / CONNECTION HISTORY", 16, MUTED, True)
-            canvas.create_rectangle(1018*sx, 96*sy, 1232*sx, 148*sy, fill=ACCENT, outline="")
-            text(1125, 122, "CUT N PASTE", 17, BG, True, "center")
+            # Use the same 300 x 52 touch-button standard as the footer and
+            # Controller actions, with all right-side actions aligned.
+            # The copy action lives in the right-aligned header band.
+            canvas.create_rectangle(956*sx, 22*sy, 1256*sx, 74*sy, fill=ACCENT, outline="")
+            text(1106, 48, "CUT N PASTE", 17, BG, True, "center")
             visible_lines = 20
             max_scroll = max(0, len(self.usb_log_lines) - visible_lines)
             self.log_scroll = max(0, min(self.log_scroll, max_scroll))
@@ -1045,13 +1137,9 @@ class TouchSimulator(tk.Tk):
                 for index, line in enumerate(lines):
                     color = OFFLINE if "interrupted" in line or "failed" in line or "ERROR" in line else TEXT
                     text(48, 150 + index * 22, line[:136], 15, color)
-            canvas.create_rectangle(778*sx, 548*sy, 900*sx, 600*sy, fill=PANEL_ALT, outline="")
-            canvas.create_rectangle(918*sx, 548*sy, 1040*sx, 600*sy, fill=PANEL_ALT, outline="")
-            text(839, 574, "▲ OLDER", 15, TEXT, True, "center")
-            text(979, 574, "▼ NEWER", 15, TEXT, True, "center")
             text(48, 590, f"{len(self.usb_log_lines)} entries · scroll {self.log_scroll}/{max_scroll}", 14, MUTED)
         else:
-            text(26, 66, "OneROM Setup", 16, MUTED)
+            text(26, 76, "OneROM Setup", 16, MUTED)
             box(24, 120, 1256, 410, "No OneROM role configured", "OPEN SETTINGS")
             text(50, 330, "Open Settings to connect the Controller and DriveHUD OneROMs for this drive.", 18, MUTED)
         canvas.create_rectangle(24*sx, 632*sy, 1256*sx, 710*sy, fill=PANEL_ALT, outline="")
@@ -1079,6 +1167,10 @@ class TouchSimulator(tk.Tk):
         elif self.preview_page == "log":
             canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
             text(184, 671, "← BACK", 17, TEXT, True, "center")
+            canvas.create_rectangle(346*sx, 645*sy, 646*sx, 697*sy, fill=PANEL, outline="")
+            canvas.create_rectangle(658*sx, 645*sy, 958*sx, 697*sy, fill=PANEL, outline="")
+            text(496, 671, "▲ OLDER", 17, TEXT, True, "center")
+            text(808, 671, "▼ NEWER", 17, TEXT, True, "center")
         if self.preview_page == "hud":
             text(660, 680, "Values update while disk is spinning.", 20, MUTED, False, "center")
         if self.preview_page == "hud":
@@ -1092,7 +1184,7 @@ class TouchSimulator(tk.Tk):
             hud_state = "connected" if self.ub4.get() else "unassigned"
             footer_status = f"● Controller {controller_state} · DriveHUD {hud_state}"
         elif self.preview_page == "log":
-            footer_status = "● USB communications"
+            footer_status = "● USB Log"
         else:
             footer_status = "● No boards configured"
         diagnostic = self.serial_last_error.get()
@@ -1226,6 +1318,11 @@ class TouchSimulator(tk.Tk):
                     if x1+16 <= x <= x2-16 and row_y+4 <= y <= row_y+row_height-4:
                         if self.popup_menu["kind"] == "appearance":
                             self.appearance_target = choice[1]
+                            # Appearance choices go straight to the completed
+                            # custom-color workflow; there is no intermediate
+                            # button to press on the settings card.
+                            self.color_picker = f"gradient:{self.appearance_target}"
+                            self.hex_keyboard = False
                         else:
                             self.popup_menu["variable"].set(choice)
                             self.control_status.set(self.popup_menu["message"].format(value=choice))
@@ -1235,9 +1332,7 @@ class TouchSimulator(tk.Tk):
                 return
             if self.color_picker is not None:
                 if 1050 <= x <= 1248 and 30 <= y <= 82:
-                    self.color_picker = None
-                    self.hex_keyboard = False
-                    self.open_size_preview()
+                    self.return_to_appearance_menu()
                     return
                 if self.hex_keyboard:
                     key_rows = (
@@ -1287,15 +1382,15 @@ class TouchSimulator(tk.Tk):
                     self.write_protect_prompt = None
                 self.open_size_preview()
                 return
-            if y < 76 and x > 1120:
+            if self.preview_page not in ("setup", "settings", "log") and y < 76 and x > 1120:
                 self.preview_page = "settings"
             elif self.preview_page == "log":
-                if 1018 <= x <= 1232 and 96 <= y <= 148:
+                if 956 <= x <= 1256 and 22 <= y <= 74:
                     self.copy_usb_log()
                     return
-                if 778 <= x <= 900 and 548 <= y <= 600:
+                if 346 <= x <= 646 and 645 <= y <= 697:
                     self.log_scroll = min(max(0, len(self.usb_log_lines) - 20), self.log_scroll + 10)
-                elif 918 <= x <= 1040 and 548 <= y <= 600:
+                elif 658 <= x <= 958 and 645 <= y <= 697:
                     self.log_scroll = max(0, self.log_scroll - 10)
                 elif 12 <= x <= 370 and 630 <= y <= 710:
                     self.preview_page = self.log_return_page
@@ -1338,11 +1433,6 @@ class TouchSimulator(tk.Tk):
             elif self.preview_page == "settings" and 660 <= x <= 1256 and 96 <= y <= 214:
                 self.open_desktop_connection_setup("hud")
                 return
-            elif self.preview_page == "settings" and 1000 <= x <= 1228 and 415 <= y <= 467:
-                self.color_picker = f"gradient:{self.appearance_target}"
-                self.hex_keyboard = False
-                self.open_size_preview()
-                return
             elif self.preview_page == "settings" and 660 <= x <= 1256 and 294 <= y <= 482:
                 self.choose_appearance_menu(event)
                 return
@@ -1354,7 +1444,7 @@ class TouchSimulator(tk.Tk):
                 self.head_direction = "OUT" if self.head_direction == "IN" else "IN"
                 self.open_size_preview()
                 return
-            elif self.preview_page == "hud" and self.ub3.get() and self.controller_wp_enabled.get() and 850 <= x <= 1228 and 447 <= y <= 499:
+            elif self.preview_page == "hud" and self.ub3.get() and self.controller_wp_enabled.get() and 850 <= x <= 1228 and 467 <= y <= 519:
                 self.confirm_write_protect_toggle()
                 return
             elif self.preview_page == "hud" and self.ub3.get() and 645 <= y <= 697 and 34 <= x <= 334:
@@ -1380,11 +1470,8 @@ class TouchSimulator(tk.Tk):
             elif self.preview_page == "control" and self.controller_wp_enabled.get() and 342 <= x <= 732 and 499 <= y <= 551:
                 self.confirm_write_protect_toggle()
                 return
-            elif self.preview_page == "control" and 784 <= x <= 1256 and 344 <= y <= 566:
-                self.open_desktop_connection_setup("controller")
-                return
             elif self.preview_page == "settings" and 200 <= x <= 860 and 578 <= y <= 610:
-                self.preview_scale.set(max(50, min(200, round(50 + ((x - 200) / 660) * 150))))
+                self.preview_scale.set(max(25, min(200, round(25 + ((x - 200) / 660) * 175))))
                 self.open_size_preview()
                 return
             elif self.preview_page == "settings" and 900 <= x <= 1060 and 556 <= y <= 608:
