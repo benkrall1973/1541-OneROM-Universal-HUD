@@ -36,7 +36,14 @@ STATUS_POSITION_RE = re.compile(r"\bTPV=(\d+)\s+TP2=(\d+)")
 STATUS_DENSITY_RE = re.compile(r"\bDV=(\d+)\s+D=(\d+)")
 STATUS_MOTOR_RE = re.compile(r"\bM=(\d+)")
 STATUS_WRITE_GATE_RE = re.compile(r"\bWGV=(\d+)\s+WG=(\d+)")
+STATUS_CAPTURE_RE = re.compile(
+    r"\bCAP=(\d+)\s+PROD=(\d+)\s+CONS=(\d+)\s+ROV=(\d+)\s+QOV=(\d+)"
+)
 HDRPHY_RE = re.compile(r"\bHDRPHY\b.*?\bT=(\d+)\s+S=(\d+)")
+HDRMETA_RE = re.compile(
+    r"\bHDRMETA\b.*?\bID1=\$([0-9A-Fa-f]{2})\s+ID2=\$([0-9A-Fa-f]{2})"
+    r"\s+CHK=\$([0-9A-Fa-f]{2})\s+OK=([01])"
+)
 RPM_RE = re.compile(r"\bRPM\b.*?\bRPM=([0-9]+(?:\.[0-9]+)?)")
 SYNC_RE = re.compile(r"\bSYNC\b.*?\bCOUNT=(\d+)\s+LEVEL=(\d+)")
 HEAD_STALL_TIMEOUT = 0.75
@@ -84,6 +91,15 @@ class TelemetryState:
     sync_count: int | None = None
     sync_level: int | None = None
     header_track: int | None = None
+    header_id1: int | None = None
+    header_id2: int | None = None
+    header_checksum: int | None = None
+    header_checksum_valid: bool | None = None
+    capture_count: int | None = None
+    produced_total: int | None = None
+    consumed_total: int | None = None
+    ring_overrun: int | None = None
+    queue_overflow: int | None = None
 
     @property
     def track(self) -> str:
@@ -242,6 +258,13 @@ class DriveTelemetryParser:
             self.state.header_track = int(match.group(1))
             self.state.sector = int(match.group(2))
             return self.state
+        match = HDRMETA_RE.search(line)
+        if match:
+            self.state.header_id1 = int(match.group(1), 16)
+            self.state.header_id2 = int(match.group(2), 16)
+            self.state.header_checksum = int(match.group(3), 16)
+            self.state.header_checksum_valid = bool(int(match.group(4)))
+            return self.state
         match = RPM_RE.search(line)
         if match:
             self.state.rpm = float(match.group(1))
@@ -265,6 +288,13 @@ class DriveTelemetryParser:
         match = STATUS_WRITE_GATE_RE.search(line)
         if match and int(match.group(1)):
             self.state.writing = bool(int(match.group(2)))
+        match = STATUS_CAPTURE_RE.search(line)
+        if match:
+            self.state.capture_count = int(match.group(1))
+            self.state.produced_total = int(match.group(2))
+            self.state.consumed_total = int(match.group(3))
+            self.state.ring_overrun = int(match.group(4))
+            self.state.queue_overflow = int(match.group(5))
         match = STATUS_POSITION_RE.search(line)
         if match and int(match.group(1)):
             self.state.position_half_tracks = max(2, int(match.group(2)))

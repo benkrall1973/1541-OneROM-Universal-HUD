@@ -18,7 +18,7 @@ from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discove
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.3"
+APP_VERSION = "V0.0.4"
 # The FIFO has 1,026 virtual pixels from x=230 to the card's right edge.
 # 31 "88" entries plus their 30 separators are 92 fixed-width glyphs; at
 # the 18px Cascadia Mono HUD font that leaves a safe right-hand margin.
@@ -112,8 +112,21 @@ class TouchSimulator(tk.Tk):
         self.live_sector: int | None = None
         self.live_sync_count: int | None = None
         self.last_stable_rpm: float | None = None
+        self.rpm_samples: list[float] = []
         self.recent_sectors: list[int] = []
         self._fifo_track: int | None = None
+        self.last_header_track: int | None = None
+        self.write_pulse_count = 0
+        self.phase_event_count = 0
+        self.activity_history: list[str] = []
+        self.capture_count: int | None = None
+        self.ring_overrun: int | None = None
+        self.queue_overflow: int | None = None
+        self.disk_id_votes: dict[tuple[int, int], int] = {}
+        self.confirmed_disk_id: tuple[int, int] | None = None
+        self.disk_id_mismatch = False
+        self.header_checksum_valid: bool | None = None
+        self.disk_id_reverify_pending = False
         self._hud_dirty = False
         self._confirmed_writable = False
         self.controller_wp_available: bool | None = None
@@ -461,8 +474,13 @@ class TouchSimulator(tk.Tk):
                 self.live_track = state.track
                 self.track_var.set(state.track)
                 if state.motor is not None:
+                    motor_changed = state.motor != self.motor
                     self.motor = state.motor
                     self.motor_var.set("ON" if state.motor else "OFF")
+                    if motor_changed:
+                        self.record_activity("MOTOR ON" if state.motor else "MOTOR OFF")
+                        if state.motor:
+                            self.begin_disk_identity_verification()
                 if state.density is not None:
                     self.live_density = state.density
                     # Density is rendered directly on the fixed 7-inch HUD;
@@ -472,26 +490,54 @@ class TouchSimulator(tk.Tk):
                 if state.rpm is not None:
                     self.live_rpm = state.rpm
                     self.rpm_var.set(f"{state.rpm:.2f}")
-                if state.sector is not None:
+                # The parser retains its last sector between CDC records.
+                # Promote it to the HUD only when this specific record is a
+                # newly decoded physical header; otherwise it can be stale
+                # after a seek, homing pass, or motor stop.
+                if line.startswith("HDRPHY ") and state.sector is not None and self.motor:
                     self.live_sector = state.sector
                     self.sector_var.set(f"{state.sector:02d}")
                 if state.sync_count is not None:
                     self.live_sync_count = state.sync_count
+                    if line.startswith("SYNC "):
+                        sample = self.effective_rpm()
+                        if sample is not None:
+                            self.rpm_samples.append(sample)
+                            del self.rpm_samples[:-5]
+                if state.capture_count is not None:
+                    self.capture_count = state.capture_count
+                    self.ring_overrun = state.ring_overrun
+                    self.queue_overflow = state.queue_overflow
+                if line.startswith("HDRMETA "):
+                    self.observe_header_metadata(
+                        state.header_id1,
+                        state.header_id2,
+                        state.header_checksum_valid,
+                    )
                 if state.motor is False:
                     self.last_stable_rpm = None
                     self._writing_display_until = 0.0
+                    self.rpm_samples.clear()
+                    self.clear_current_header()
                     self.clear_recent_sectors()
                 elif line.startswith("PHASE "):
                     # A physical head step makes earlier sectors unrelated to
                     # the current position, just as in the proven HUD GUI.
+                    self.phase_event_count += 1
+                    self.record_activity(f"SEEK {state.head}")
+                    self.clear_current_header()
                     self.clear_recent_sectors()
                 elif line.startswith("HDRPHY ") and state.header_track is not None and state.sector is not None:
+                    self.last_header_track = state.header_track
                     self.push_recent_sector(state.header_track, state.sector)
+                    self.record_activity(f"READ T{state.header_track:02d} S{state.sector:02d}")
                 if state.protected is not None:
                     self.schedule_write_protect_update(state.protected)
                 if state.writing is not None:
                     self.live_writing = state.writing
-                    if state.writing:
+                    if line.startswith("WRITE_GATE ") and state.writing:
+                        self.write_pulse_count += 1
+                        self.record_activity("WRITE GATE")
                         # The physical CB2 write-gate pulse can be shorter
                         # than one CDC receive batch. Hold it briefly so the
                         # operator can actually see a confirmed write.
@@ -624,6 +670,90 @@ class TouchSimulator(tk.Tk):
         self.recent_sectors.clear()
         self._fifo_track = None
 
+    def clear_current_header(self) -> None:
+        """Forget a header after movement or motor-off makes it stale.
+
+        A sector is physically confirmed only while its own header is being
+        decoded.  Retaining it through a seek, homing pass, or parked motor
+        would make the passive HUD claim a position it cannot guarantee.
+        """
+        self.live_sector = None
+        self.last_header_track = None
+        self.sector_var.set("--")
+
+    def clear_disk_identity(self) -> None:
+        """Discard all cached identity evidence when a link is reset."""
+        self.disk_id_votes.clear()
+        self.confirmed_disk_id = None
+        self.disk_id_mismatch = False
+        self.header_checksum_valid = None
+        self.disk_id_reverify_pending = False
+
+    def begin_disk_identity_verification(self) -> None:
+        """Keep the displayed ID, but require fresh headers after motor-on."""
+        self.disk_id_votes.clear()
+        self.disk_id_mismatch = False
+        self.header_checksum_valid = None
+        self.disk_id_reverify_pending = True
+
+    def observe_header_metadata(
+        self, id1: int | None, id2: int | None, checksum_valid: bool | None
+    ) -> None:
+        """Accept an ID only after two checksum-valid physical headers agree."""
+        self.header_checksum_valid = checksum_valid
+        if id1 is None or id2 is None or not checksum_valid:
+            return
+        identity = (id1, id2)
+        self.disk_id_votes[identity] = self.disk_id_votes.get(identity, 0) + 1
+        if len(self.disk_id_votes) > 1:
+            self.disk_id_mismatch = True
+            self.confirmed_disk_id = None
+        elif self.disk_id_votes[identity] >= 2:
+            self.confirmed_disk_id = identity
+            self.disk_id_reverify_pending = False
+
+    def disk_identity_label(self) -> str:
+        if self.disk_id_mismatch:
+            return "ID MISMATCH"
+        if self.confirmed_disk_id is not None:
+            return f"ID {self.confirmed_disk_id[0]:02X} {self.confirmed_disk_id[1]:02X}"
+        return "VERIFYING ID" if self.header_checksum_valid else "WAITING FOR ID"
+
+    def disk_identity_detail(self) -> str:
+        if self.disk_id_mismatch:
+            return "VALID HEADERS DISAGREE"
+        if self.disk_id_reverify_pending and self.confirmed_disk_id is not None:
+            return "LAST CONFIRMED · REVERIFYING"
+        if self.header_checksum_valid is False:
+            return "HEADER CHECK FAILED"
+        if self.confirmed_disk_id is not None:
+            return "HEADER CHECK OK · TWO MATCHES" if self.motor else "LAST CONFIRMED · HEADER CHECK OK"
+        if self.header_checksum_valid:
+            return "HEADER CHECK OK · NEED ONE MORE"
+        return "PHYSICAL HEADER METADATA PENDING"
+
+    def record_activity(self, event: str) -> None:
+        """Keep a compact, evidence-only activity history for Diagnostics."""
+        if not self.activity_history or self.activity_history[-1] != event:
+            self.activity_history.append(event)
+            del self.activity_history[:-5]
+
+    def diagnostic_history_text(self) -> str:
+        """Return the newest evidence that fits inside its fixed HUD card."""
+        if not self.activity_history:
+            return "WAITING FOR DRIVE ACTIVITY"
+        compact: list[str] = []
+        # Five compact read events fit within the 816-pixel evidence card at
+        # the fixed 7-inch layout width, while leaving a right-hand margin.
+        for event in self.activity_history[-5:]:
+            if event.startswith("READ "):
+                compact.append(f"R {event[5:]}")
+            elif event == "WRITE GATE":
+                compact.append("WRITE")
+            else:
+                compact.append(event)
+        return "  ·  ".join(compact)
+
     def push_recent_sector(self, track: int, sector: int) -> None:
         """Keep a full-width FIFO of recent physical header sectors."""
         if self._fifo_track is None:
@@ -651,6 +781,30 @@ class TouchSimulator(tk.Tk):
         # the nearest physical count per revolution.
         return estimate, round(estimate), expected
 
+    def expected_sector_count(self) -> int | None:
+        return {3: 21, 2: 19, 1: 18, 0: 17}.get(self.live_density)
+
+    def header_offset(self) -> float | None:
+        """Mechanical position minus the latest physical-header track."""
+        position = self.telemetry_parser.state.position_half_tracks
+        if position is None or self.last_header_track is None:
+            return None
+        return position / 2.0 - self.last_header_track
+
+    def rpm_quality_detail(self) -> str:
+        if not self.motor:
+            return "MOTOR OFF"
+        if not self.rpm_samples:
+            return "ACQUIRING"
+        spread = max(self.rpm_samples) - min(self.rpm_samples)
+        return f"LOCKED · ±{spread / 2:.2f}"
+
+    def capture_health_detail(self) -> tuple[str, str]:
+        if self.capture_count is None:
+            return "WAITING FOR STATUS", MUTED
+        dropped = (self.ring_overrun or 0) + (self.queue_overflow or 0)
+        return ("CAPTURE OK" if dropped == 0 else f"DROPS {dropped}", ACCENT if dropped == 0 else WARNING)
+
     def effective_rpm(self) -> float | None:
         """Return qualified RPM from SYNC/sec, rejecting partial windows."""
         expected_by_density = {3: 42, 2: 38, 1: 36, 0: 34}
@@ -674,13 +828,16 @@ class TouchSimulator(tk.Tk):
 
     def update_live_hud_fields(self) -> None:
         """Update existing HUD Canvas items without rebuilding the screen."""
-        if self.preview_page != "hud":
+        if self.preview_page not in ("hud", "diagnostics"):
             return
         preview = getattr(self, "preview", None)
         canvas = getattr(self, "preview_canvas", None)
         if preview is None or canvas is None or not preview.winfo_exists():
             return
         try:
+            if self.preview_page == "diagnostics":
+                self.update_live_diagnostics_fields(canvas)
+                return
             canvas.itemconfigure("hud_track", text=self.live_track)
             canvas.itemconfigure("hud_motor", text="ON" if self.motor else "OFF")
             canvas.itemconfigure("hud_head", text=self.head_var.get())
@@ -703,9 +860,41 @@ class TouchSimulator(tk.Tk):
             canvas.itemconfigure("hud_sync_rev_estimate", text=estimate_detail)
             canvas.itemconfigure("hud_sync_rev_detail", text=expected_detail)
             canvas.itemconfigure("hud_wp", text=self.hud_write_protect_label())
+            canvas.itemconfigure("hud_wp_detail", text=self.hud_write_protect_detail())
         except tk.TclError:
             # The screen may have changed between CDC receive and paint.
             pass
+
+    def update_live_diagnostics_fields(self, canvas: tk.Canvas) -> None:
+        """Refresh the Diagnostics cards without rebuilding the canvas."""
+        offset = self.header_offset()
+        header = (
+            f"T{self.last_header_track:02d} S{self.live_sector:02d}"
+            if self.last_header_track is not None and self.live_sector is not None else "WAITING"
+        )
+        expected = self.expected_sector_count()
+        coverage = f"{len(set(self.recent_sectors))}/{expected} SEEN" if expected else "WAITING"
+        rpm = self.effective_rpm()
+        capture, capture_color = self.capture_health_detail()
+        canvas.itemconfigure("diag_position", text=self.live_track)
+        canvas.itemconfigure(
+            "diag_offset",
+            text=f"PHASE ESTIMATE · HEADER Δ {offset:+.1f}" if offset is not None else "PHASE ESTIMATE · HEADER WAITING",
+        )
+        canvas.itemconfigure("diag_header", text=header)
+        canvas.itemconfigure("diag_header_detail", text="PHYSICAL HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER")
+        canvas.itemconfigure("diag_rpm", text=f"{rpm:.2f}" if rpm is not None else "--.--")
+        sync_detail = f"SYNC {self.live_sync_count}/S" if self.live_sync_count is not None else "SYNC WAITING"
+        canvas.itemconfigure("diag_rpm_detail", text=f"{self.rpm_quality_detail()} · {sync_detail}")
+        canvas.itemconfigure("diag_coverage", text=coverage)
+        canvas.itemconfigure("diag_coverage_detail", text=f"D{self.live_density} ZONE" if self.live_density is not None else "DENSITY UNKNOWN")
+        canvas.itemconfigure("diag_activity", text=self.disk_activity_label())
+        canvas.itemconfigure("diag_activity_detail", text=f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}")
+        canvas.itemconfigure("diag_media", text=self.disk_identity_label())
+        canvas.itemconfigure("diag_media_detail", text=self.disk_identity_detail())
+        canvas.itemconfigure("diag_capture", text=capture, fill=capture_color)
+        canvas.itemconfigure("diag_capture_detail", text=(f"CAP {self.capture_count} · ROV {self.ring_overrun or 0} · QOV {self.queue_overflow or 0}" if self.capture_count is not None else "STATUS PENDING"))
+        canvas.itemconfigure("diag_history", text=self.diagnostic_history_text())
 
     def schedule_write_protect_update(self, protected: bool) -> None:
         """Apply the proven GUI-only 250 ms last-event-wins WP debounce."""
@@ -734,7 +923,14 @@ class TouchSimulator(tk.Tk):
         if self.live_protected is None:
             return "WAITING FOR SENSOR"
         return "PROTECTED" if self.live_protected else "WRITABLE"
-        self.update_live_hud_fields()
+
+    def hud_write_protect_detail(self) -> str:
+        """Explain whether the displayed permission is sensor or override led."""
+        if self._confirmed_writable:
+            return "CONTROLLER OVERRIDE ACTIVE"
+        if self.live_protected is None:
+            return "PHYSICAL SENSOR PENDING"
+        return "PHYSICAL WRITE-PROTECT SENSOR"
 
     def apply_device_state(self, initial=False) -> None:
         # A maintained override must never survive loss of the control board.
@@ -978,7 +1174,7 @@ class TouchSimulator(tk.Tk):
         """Keep the compact UI on a screen supported by installed boards."""
         if self.preview_page in ("settings", "controller_connection", "hud_connection", "log"):
             return
-        if self.preview_page == "hud" and not self.ub4.get():
+        if self.preview_page in ("hud", "diagnostics") and not self.ub4.get():
             self.preview_page = "control" if self.ub3.get() else "setup"
         elif self.preview_page == "control" and not self.ub3.get():
             self.preview_page = "hud" if self.ub4.get() else "setup"
@@ -1129,7 +1325,7 @@ class TouchSimulator(tk.Tk):
             # aligned HUD/Controller card grid, whose top edge is y=96.
             text(1254, 48, "⚙", 38, ACCENT, True, "e")
         if self.preview_page == "hud":
-            text(26, 76, "DriveHUD · passive monitor · Firmware V1.0.1", 16, MUTED)
+            text(26, 76, "DriveHUD · passive monitor · Firmware V1.0.2", 16, MUTED)
             # HOME belongs with the HUD header, not between the metric cards
             # and sector FIFO.  Right-align it above Head/Density while
             # reserving the far-right corner for the options gear.
@@ -1173,30 +1369,18 @@ class TouchSimulator(tk.Tk):
             # Keep the diagnostic caption against the lower card margin so
             # the enlarged live count above it has clear breathing room.
             text(946, 368, "raw SYNC / fresh RPM", 14, MUTED)
-            if self.ub3.get() and self.controller_wp_enabled.get():
-                sync_estimate, sync_count_per_rev, sync_expected = self.sync_revolution_reading()
-                box(24, 396, 420, 534, "Sync / Rev")
-                canvas.create_text(396*sx, 474*sy, text=str(sync_count_per_rev) if sync_count_per_rev is not None else "--",
-                                   fill=TEXT, anchor="e", font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_sync_rev")
-                estimate_detail = f"EST {sync_estimate:.2f}" if sync_estimate is not None else ""
-                expected_detail = f"EXPECTED {sync_expected}" if sync_expected is not None else "WAITING FOR SYNC"
-                text(50, 518, estimate_detail, 16, TEXT, True, tag="hud_sync_rev_estimate")
-                text(160, 518, expected_detail, 14, MUTED, True, tag="hud_sync_rev_detail")
-                box(440, 396, 1256, 534, "Write-Protect Override", self.hud_write_protect_label(), value_tag="hud_wp")
-                hud_wp_action = "Disable override" if self.writable.get() else "Enable writable override"
-                canvas.create_rectangle(850*sx, 467*sy, 1228*sx, 519*sy, fill=OFFLINE if self.writable.get() else ACCENT, outline="")
-                text(1039, 493, hud_wp_action.upper(), 17, BG, True, "center")
-            else:
-                # HUD-only installations remain purely passive: no
-                # write-protect state or control is presented.
-                sync_estimate, sync_count_per_rev, sync_expected = self.sync_revolution_reading()
-                box(24, 396, 1256, 534, "Sync / Rev")
-                canvas.create_text(1232*sx, 474*sy, text=str(sync_count_per_rev) if sync_count_per_rev is not None else "--",
-                                   fill=TEXT, anchor="e", font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_sync_rev")
-                estimate_detail = f"EST {sync_estimate:.2f}" if sync_estimate is not None else ""
-                expected_detail = f"EXPECTED {sync_expected}" if sync_expected is not None else "WAITING FOR SYNC"
-                text(50, 518, estimate_detail, 16, TEXT, True, tag="hud_sync_rev_estimate")
-                text(160, 518, expected_detail, 14, MUTED, True, tag="hud_sync_rev_detail")
+            sync_estimate, sync_count_per_rev, sync_expected = self.sync_revolution_reading()
+            box(24, 396, 420, 534, "Sync / Rev")
+            canvas.create_text(396*sx, 474*sy, text=str(sync_count_per_rev) if sync_count_per_rev is not None else "--",
+                               fill=TEXT, anchor="e", font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_sync_rev")
+            estimate_detail = f"EST {sync_estimate:.2f}" if sync_estimate is not None else ""
+            expected_detail = f"EXPECTED {sync_expected}" if sync_expected is not None else "WAITING FOR SYNC"
+            text(50, 518, estimate_detail, 16, TEXT, True, tag="hud_sync_rev_estimate")
+            text(160, 518, expected_detail, 14, MUTED, True, tag="hud_sync_rev_detail")
+            box(440, 396, 820, 534, "Drive Diagnostics", "LIVE DATA", value_size=22, value_y=454)
+            text(466, 506, "TAP FOR DETAILS", 14, ACCENT, True)
+            box(840, 396, 1256, 534, "Write Protect", self.hud_write_protect_label(), value_size=25, value_y=458, value_tag="hud_wp")
+            text(866, 506, self.hud_write_protect_detail(), 14, MUTED, True, tag="hud_wp_detail")
             canvas.create_rectangle(24*sx, 546*sy, 1256*sx, 592*sy, fill=PANEL, outline=PANEL_ALT, width=1)
             text(42, 570, "RECENT SECTORS", 15, MUTED, True)
             canvas.create_text(
@@ -1207,6 +1391,42 @@ class TouchSimulator(tk.Tk):
             )
             # Match the Controller screen's serial/status line so the
             # operator can identify the physical monitor board at a glance.
+            text(28, 612, self.hud_connection.get(), 16, ACCENT if self.ub4.get() else OFFLINE)
+        elif self.preview_page == "diagnostics":
+            text(26, 76, "Drive Diagnostics · passive measurements", 16, MUTED)
+            box(24, 96, 420, 244, "Mechanical Position")
+            canvas.create_text(396*sx, 172*sy, text=self.live_track, fill=TEXT, anchor="e",
+                               font=("Cascadia Mono", max(7, round(50*sy)), "normal"), tags="diag_position")
+            offset = self.header_offset()
+            text(50, 220, f"HEADER Δ {offset:+.1f}" if offset is not None else "HEADER WAITING", 15, MUTED, True, tag="diag_offset")
+            box(440, 96, 820, 244, "Physical Header")
+            header = f"T{self.last_header_track:02d} S{self.live_sector:02d}" if self.last_header_track is not None and self.live_sector is not None else "WAITING"
+            text(466, 172, header, 35, TEXT, True, tag="diag_header")
+            text(466, 220, "PHYSICAL HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER", 15, MUTED, True, tag="diag_header_detail")
+            box(840, 96, 1256, 244, "Rotation")
+            displayed_rpm = self.effective_rpm()
+            canvas.create_text(1232*sx, 172*sy, text=f"{displayed_rpm:.2f}" if displayed_rpm is not None else "--.--", fill=TEXT, anchor="e",
+                               font=("Cascadia Mono", max(7, round(50*sy)), "normal"), tags="diag_rpm")
+            text(866, 220, self.rpm_quality_detail(), 15, MUTED, True, tag="diag_rpm_detail")
+            box(24, 260, 420, 408, "Sector Coverage")
+            expected = self.expected_sector_count()
+            coverage = f"{len(set(self.recent_sectors))}/{expected} SEEN" if expected else "WAITING"
+            text(50, 336, coverage, 31, TEXT, True, tag="diag_coverage")
+            text(50, 384, f"D{self.live_density} ZONE" if self.live_density is not None else "DENSITY UNKNOWN", 15, MUTED, True, tag="diag_coverage_detail")
+            box(440, 260, 820, 408, "Activity")
+            text(466, 336, self.disk_activity_label(), 31, TEXT, True, tag="diag_activity")
+            text(466, 384, f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", 15, MUTED, True, tag="diag_activity_detail")
+            box(840, 260, 1256, 408, "Disk Identity")
+            text(866, 336, self.disk_identity_label(), 27, TEXT, True, tag="diag_media")
+            text(866, 384, self.disk_identity_detail(), 14, MUTED, True, tag="diag_media_detail")
+            box(24, 424, 420, 572, "HUD Health")
+            capture, capture_color = self.capture_health_detail()
+            text(50, 500, capture, 27, capture_color, True, tag="diag_capture")
+            capture_detail = f"CAP {self.capture_count} · ROV {self.ring_overrun or 0} · QOV {self.queue_overflow or 0}" if self.capture_count is not None else "STATUS PENDING"
+            text(50, 548, capture_detail, 14, MUTED, True, tag="diag_capture_detail")
+            box(440, 424, 1256, 572, "Recent Evidence")
+            text(466, 480, self.diagnostic_history_text(), 17, TEXT, True, tag="diag_history")
+            text(466, 536, "DOS ERROR / RETRIES: NOT AVAILABLE", 15, MUTED, True)
             text(28, 612, self.hud_connection.get(), 16, ACCENT if self.ub4.get() else OFFLINE)
         elif self.preview_page == "control":
             text(26, 76, "OneROM Controller", 16, MUTED)
@@ -1379,6 +1599,12 @@ class TouchSimulator(tk.Tk):
         if self.preview_page == "hud" and self.ub3.get():
             canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
             text(184, 671, "CONTROL", 17, TEXT, True, "center")
+        elif self.preview_page == "diagnostics":
+            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
+            text(184, 671, "HUD", 17, TEXT, True, "center")
+            if self.ub3.get():
+                canvas.create_rectangle(346*sx, 645*sy, 646*sx, 697*sy, fill=PANEL, outline="")
+                text(496, 671, "CONTROL", 17, TEXT, True, "center")
         elif self.preview_page == "control" and self.ub4.get():
             canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
             text(184, 671, "HUD", 17, TEXT, True, "center")
@@ -1404,10 +1630,16 @@ class TouchSimulator(tk.Tk):
             text(808, 671, "▼ NEWER", 17, TEXT, True, "center")
         if self.preview_page == "hud":
             text(660, 680, "Values update while disk is spinning.", 20, MUTED, False, "center")
+        elif self.preview_page == "diagnostics":
+            # The status at the far right needs its own stable space.  Keep
+            # this deliberately short so it never encroaches on navigation.
+            text(810, 680, "PASSIVE LIVE DATA", 15, MUTED, True, "center")
         if self.preview_page == "hud":
             footer_status = "● DriveHUD connected"
         elif self.preview_page == "control":
             footer_status = "● Controller connected"
+        elif self.preview_page == "diagnostics":
+            footer_status = "● DriveHUD diagnostics"
         elif self.preview_page == "settings":
             footer_status = "● Hardware setup"
         elif self.preview_page in ("controller_connection", "hud_connection"):
@@ -1678,10 +1910,15 @@ class TouchSimulator(tk.Tk):
                 self.head_direction = "OUT" if self.head_direction == "IN" else "IN"
                 self.open_size_preview()
                 return
-            elif self.preview_page == "hud" and self.ub3.get() and self.controller_wp_enabled.get() and 850 <= x <= 1228 and 467 <= y <= 519:
-                self.confirm_write_protect_toggle()
+            elif self.preview_page == "hud" and 440 <= x <= 820 and 396 <= y <= 534:
+                self.preview_page = "diagnostics"
+                self.open_size_preview()
                 return
             elif self.preview_page == "hud" and self.ub3.get() and 645 <= y <= 697 and 34 <= x <= 334:
+                self.preview_page = "control"
+            elif self.preview_page == "diagnostics" and 645 <= y <= 697 and 34 <= x <= 334:
+                self.preview_page = "hud"
+            elif self.preview_page == "diagnostics" and self.ub3.get() and 645 <= y <= 697 and 346 <= x <= 646:
                 self.preview_page = "control"
             elif self.preview_page == "control" and self.ub4.get() and 645 <= y <= 697 and 34 <= x <= 334:
                 self.preview_page = "hud"
