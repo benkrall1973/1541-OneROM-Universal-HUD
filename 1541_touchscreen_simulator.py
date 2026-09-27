@@ -18,7 +18,7 @@ from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discove
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.2"
+APP_VERSION = "V0.0.3"
 # The FIFO has 1,026 virtual pixels from x=230 to the card's right edge.
 # 31 "88" entries plus their 30 separators are 92 fixed-width glyphs; at
 # the 18px Cascadia Mono HUD font that leaves a safe right-hand margin.
@@ -1091,6 +1091,10 @@ class TouchSimulator(tk.Tk):
         def draw_head_motion(phase: float) -> None:
             """Use foreshortened chevrons to show head motion in depth."""
             canvas.delete("head")
+            # Chevrons represent current physical travel only.  A stalled
+            # head is not moving, and a parked head has no active direction.
+            if self.head_var.get() not in ("IN", "OUT"):
+                return
             # Add one chevron per beat.  Four downward-pointing marks make
             # depth visible without changing the physical direction glyph.
             count = int(phase * (4 / 1.5)) % 4 + 1
@@ -1125,7 +1129,7 @@ class TouchSimulator(tk.Tk):
             # aligned HUD/Controller card grid, whose top edge is y=96.
             text(1254, 48, "⚙", 38, ACCENT, True, "e")
         if self.preview_page == "hud":
-            text(26, 76, "DriveHUD · passive monitor · Firmware V1.0.0", 16, MUTED)
+            text(26, 76, "DriveHUD · passive monitor · Firmware V1.0.1", 16, MUTED)
             # HOME belongs with the HUD header, not between the metric cards
             # and sector FIFO.  Right-align it above Head/Density while
             # reserving the far-right corner for the options gear.
