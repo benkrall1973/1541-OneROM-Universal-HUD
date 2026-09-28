@@ -47,7 +47,7 @@ HDRMETA_RE = re.compile(
 )
 RPM_RE = re.compile(r"\bRPM\b.*?\bRPM=([0-9]+(?:\.[0-9]+)?)")
 SYNC_RE = re.compile(r"\bSYNC\b.*?\bCOUNT=(\d+)\s+LEVEL=(\d+)")
-HEAD_STALL_TIMEOUT = 0.75
+HEAD_STALL_TIMEOUT = 0.8
 
 
 @dataclass(frozen=True)
@@ -218,6 +218,8 @@ class DriveTelemetryParser:
     def __init__(self) -> None:
         self.state = TelemetryState()
         self._last_motion = 0.0
+        self._last_requested_track: int | None = None
+        self._last_direction: str | None = None
 
     def process(self, line: str) -> TelemetryState:
         self._refresh_head_state()
@@ -276,6 +278,11 @@ class DriveTelemetryParser:
             self.state.sync_level = int(match.group(2))
         return self.state
 
+    def refresh(self) -> TelemetryState:
+        """Refresh time-based state when the CDC stream has no new records."""
+        self._refresh_head_state()
+        return self.state
+
     def _state_snapshot(self, line: str) -> None:
         match = STATUS_WP_RE.search(line)
         if match and int(match.group(1)):
@@ -321,7 +328,7 @@ class DriveTelemetryParser:
             self._last_motion = time.monotonic()
 
     def _refresh_head_state(self) -> None:
-        """Report stalled motion when the motor runs without a fresh phase step."""
+        """Report a stall after 0.8 seconds without target or phase activity."""
         if not self.state.motor:
             self.state.head = "PARK"
         elif self._last_motion and time.monotonic() - self._last_motion >= HEAD_STALL_TIMEOUT:
@@ -329,22 +336,54 @@ class DriveTelemetryParser:
 
     def _set_track(self, track: int) -> None:
         # $0022 is a DOS destination-track hint, not a continuously reliable
-        # head-position source.  Use it only for the initial anchor.  Once
-        # phase traffic or a status position has established a position, the
-        # reference HUD never lets later $0022 writes snap the display back
-        # to Track 1.0.
+        # head-position source. It provides the requested direction, but only
+        # anchors the displayed position until phase or status data arrives.
         if self.state.position_half_tracks is None:
             self.state.position_half_tracks = max(2, track * 2)
+        previous_track = self._last_requested_track
+        self._last_requested_track = track
+        if not self.state.motor:
+            self.state.head = "PARK"
+            return
+        if previous_track is None:
+            # Establish a baseline only. There is no direction until a
+            # subsequent target differs.
+            self._last_motion = time.monotonic()
+            return
+        if track == previous_track:
+            # STATE records repeat the latest target. They are snapshots, not
+            # fresh seek requests, so they must not erase IN/OUT or postpone
+            # the stall timer.
+            return
+        self._last_motion = time.monotonic()
+        if track > previous_track:
+            self.state.head = "IN"
+            self._last_direction = "IN"
+        else:
+            self.state.head = "OUT"
+            self._last_direction = "OUT"
 
     def _phase(self, delta: int) -> None:
+        # Every observed phase transition proves that the head is active. A
+        # delta of two can occur when capture skips an intermediate phase, so
+        # it must refresh the motion timer instead of falsely reporting STALL.
+        if self.state.motor:
+            self._last_motion = time.monotonic()
         if delta == 1:
             if self.state.position_half_tracks is not None:
                 self.state.position_half_tracks += 1
             self.state.head = "IN" if self.state.motor else "PARK"
-            self._last_motion = time.monotonic()
+            if self.state.motor:
+                self._last_direction = "IN"
         elif delta == 3:
             if self.state.position_half_tracks is not None:
                 self.state.position_half_tracks = max(2, self.state.position_half_tracks - 1)
             self.state.head = "OUT" if self.state.motor else "PARK"
-            self._last_motion = time.monotonic()
+            if self.state.motor:
+                self._last_direction = "OUT"
+        elif self.state.motor and self._last_direction is not None:
+            # Direction is ambiguous after a skipped sample; retain the last
+            # confirmed target/phase direction until a later record resolves
+            # it, rather than replacing live movement with STALL.
+            self.state.head = self._last_direction
 

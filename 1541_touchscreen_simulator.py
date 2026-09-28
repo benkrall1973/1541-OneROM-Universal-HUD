@@ -18,7 +18,7 @@ from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discove
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.5"
+APP_VERSION = "V0.0.6"
 # The FIFO has 1,026 virtual pixels from x=230 to the card's right edge.
 # 31 "88" entries plus their 30 separators are 92 fixed-width glyphs; at
 # the 18px Cascadia Mono HUD font that leaves a safe right-hand margin.
@@ -122,6 +122,12 @@ class TouchSimulator(tk.Tk):
         self.capture_count: int | None = None
         self.ring_overrun: int | None = None
         self.queue_overflow: int | None = None
+        self.capture_rate: float | None = None
+        self._capture_rate_count: int | None = None
+        self._capture_rate_time: float | None = None
+        self.header_timestamps: list[float] = []
+        self.header_valid_count = 0
+        self.header_invalid_count = 0
         # The firmware counters are lifetime counters.  These baselines make
         # the Health card a resettable diagnostic window without resetting or
         # disturbing the passive capture firmware.
@@ -143,6 +149,21 @@ class TouchSimulator(tk.Tk):
         self.usb_log_lines: list[str] = []
         self.log_scroll = 0
         self.log_return_page = "settings"
+        # The passive HUD is an expandable card list.  Priorities 1–6 pin
+        # the default visible cards; unpinned diagnostics follow by name.
+        self.hud_scroll_index = 0
+        self.hud_help_card: str | None = None
+        self._hud_subscription_mask: int | None = None
+        self._hud_telemetry_enabled = False
+        self._hud_redraw_after: str | None = None
+        self.hud_card_priorities: dict[str, int | None] = {
+            "track": 1,
+            "rotation": 2,
+            "activity": 3,
+            "physical_header": 4,
+            "sector_coverage": 5,
+            "capture_health": 6,
+        }
 
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -427,6 +448,14 @@ class TouchSimulator(tk.Tk):
                 self.after(150, link.assert_dtr)
                 if role == "controller":
                     self.after(300, self.request_controller_wp_state)
+                else:
+                    # Current HUD firmware starts with its optional telemetry
+                    # mask clear. STATUS continues in that mode, but the
+                    # MOTOR, PHASE, and TRACK_WRITE records required by the
+                    # Head card are suppressed. Enable passive event output
+                    # once after the DTR attach edge; this sends no command
+                    # to the 1541 or its bus.
+                    self.after(300, lambda current_link=link: self.enable_hud_telemetry(current_link))
             self.drive_binding = binding
             save_binding(self.binding_path, binding)
             self.ub3.set("controller" in self.usb_links)
@@ -439,6 +468,18 @@ class TouchSimulator(tk.Tk):
         except Exception as exc:
             self.usb_status.set(f"USB connection failed: {exc}")
             self.append_usb_log("SYSTEM", self.usb_status.get())
+
+    def enable_hud_telemetry(self, link: CdcBoardLink) -> None:
+        """Enable every passive firmware telemetry class after HUD attach."""
+        if self.usb_links.get("hud") is not link or not link.connected:
+            return
+        try:
+            link.write_command("HUDCFG M=31")
+            self._hud_subscription_mask = 31
+            self._hud_telemetry_enabled = True
+            self.append_usb_log("SYSTEM", "DriveHUD passive telemetry enabled.")
+        except Exception as exc:
+            self.append_usb_log("SYSTEM", f"DriveHUD telemetry setup failed: {exc}")
 
     def release_role_binding(self, role: str) -> None:
         """Release one persisted role without touching the other OneROM."""
@@ -470,17 +511,19 @@ class TouchSimulator(tk.Tk):
             return
         try:
             changed = False
+            motor_visual_changed = False
             # Keep the UI responsive even if firmware emits a burst of
-            # diagnostics. Preserve STATUS/STATE records before trimming
-            # high-rate headers: firmware sends status first, and otherwise a
-            # read burst can push the health record out of the newest 96.
+            # diagnostics. Preserve every state-changing record before
+            # trimming high-rate headers: a seek can otherwise occur just
+            # before the newest 96 records and lose its IN/OUT evidence.
             received_lines = link.read_lines()
-            tail_lines = received_lines[-96:]
-            retained_control_lines = [
-                line for line in received_lines[:-96]
-                if line.startswith(("STATUS ", "STATE "))
+            first_tail_index = max(0, len(received_lines) - 96)
+            telemetry_lines = [
+                line for index, line in enumerate(received_lines)
+                if index >= first_tail_index
+                or line.startswith(("STATUS ", "STATE ", "TRACK_WRITE ", "PHASE ", "MOTOR "))
             ]
-            for line in retained_control_lines + tail_lines:
+            for line in telemetry_lines:
                 self.append_usb_log("HUD", line)
                 state = self.telemetry_parser.process(line)
                 changed = True
@@ -491,9 +534,13 @@ class TouchSimulator(tk.Tk):
                     self.motor = state.motor
                     self.motor_var.set("ON" if state.motor else "OFF")
                     if motor_changed:
+                        motor_visual_changed = True
                         self.record_activity("MOTOR ON" if state.motor else "MOTOR OFF")
                         if state.motor:
                             self.begin_disk_identity_verification()
+                            self.header_timestamps.clear()
+                            self.header_valid_count = 0
+                            self.header_invalid_count = 0
                 if state.density is not None:
                     self.live_density = state.density
                     # Density is rendered directly on the fixed 7-inch HUD;
@@ -521,16 +568,24 @@ class TouchSimulator(tk.Tk):
                     self.capture_count = state.capture_count
                     self.ring_overrun = state.ring_overrun
                     self.queue_overflow = state.queue_overflow
+                    if line.startswith("STATUS "):
+                        self.observe_capture_rate(state.capture_count)
                 if line.startswith("HDRMETA "):
+                    # A running copy of the desktop can retain an older
+                    # telemetry parser during an in-place update.  Metadata
+                    # is optional diagnostic enrichment; it must never tear
+                    # down the CDC link if those newly added fields are not
+                    # present yet.
                     self.observe_header_metadata(
-                        state.header_id1,
-                        state.header_id2,
-                        state.header_checksum_valid,
+                        getattr(state, "header_id1", None),
+                        getattr(state, "header_id2", None),
+                        getattr(state, "header_checksum_valid", None),
                     )
                 if state.motor is False:
                     self.last_stable_rpm = None
                     self._writing_display_until = 0.0
                     self.rpm_samples.clear()
+                    self.header_timestamps.clear()
                     self.clear_current_header()
                     self.clear_recent_sectors()
                 elif line.startswith("PHASE "):
@@ -542,6 +597,7 @@ class TouchSimulator(tk.Tk):
                     self.clear_recent_sectors()
                 elif line.startswith("HDRPHY ") and state.header_track is not None and state.sector is not None:
                     self.last_header_track = state.header_track
+                    self.observe_header_rate()
                     self.push_recent_sector(state.header_track, state.sector)
                     self.record_activity(f"READ T{state.header_track:02d} S{state.sector:02d}")
                 if state.protected is not None:
@@ -560,6 +616,14 @@ class TouchSimulator(tk.Tk):
                     self.head_var.set(state.head)
                     if state.head in ("IN", "OUT"):
                         self.head_direction = state.head
+            # A stalled head must update even when the CDC stream is quiet.
+            # The parser records the last target/phase event independently
+            # from incoming status records, so refresh it every 20 ms poll.
+            previous_head = self.head_var.get()
+            state = self.telemetry_parser.refresh()
+            if state.head != previous_head:
+                self.head_var.set(state.head)
+                changed = True
             # Never rebuild the entire Canvas from the CDC receive loop.
             # Only existing live HUD items are updated in place.
             displayed_rpm = self.effective_rpm()
@@ -569,7 +633,12 @@ class TouchSimulator(tk.Tk):
             if changed:
                 self.serial_last_error.set("")
                 self.update_live_hud_fields()
+                # The platter switches between stationary and animated modes
+                # only on a motor transition, never on routine telemetry.
+                if motor_visual_changed and self.preview_page == "hud":
+                    self.open_size_preview()
         except Exception as exc:
+            self._hud_subscription_mask = None
             self.record_serial_diagnostic("DriveHUD", link, exc)
             link.close()
             self.usb_links.pop("hud", None)
@@ -646,6 +715,11 @@ class TouchSimulator(tk.Tk):
             self.after(150, link.assert_dtr)
             if role == "controller":
                 self.after(300, self.request_controller_wp_state)
+            else:
+                # Startup/reconnect takes this path rather than the Settings
+                # save path, so it needs the same one-time passive telemetry
+                # subscription.
+                self.after(300, lambda current_link=link: self.enable_hud_telemetry(current_link))
             self._reconnect_delay_ms[role] = 1000
             if role == "controller":
                 self.ub3.set(True)
@@ -714,6 +788,10 @@ class TouchSimulator(tk.Tk):
     ) -> None:
         """Accept an ID only after two checksum-valid physical headers agree."""
         self.header_checksum_valid = checksum_valid
+        if checksum_valid is True:
+            self.header_valid_count += 1
+        elif checksum_valid is False:
+            self.header_invalid_count += 1
         if id1 is None or id2 is None or not checksum_valid:
             return
         identity = (id1, id2)
@@ -823,6 +901,37 @@ class TouchSimulator(tk.Tk):
         dropped = ring_overrun + queue_overflow
         return ("CAPTURE OK" if dropped == 0 else f"DROPS {dropped}", ACCENT if dropped == 0 else WARNING)
 
+    def observe_capture_rate(self, capture_count: int) -> None:
+        """Derive passive sample throughput from the periodic health record."""
+        now = time.monotonic()
+        if self._capture_rate_count is not None and self._capture_rate_time is not None:
+            elapsed = now - self._capture_rate_time
+            advanced = capture_count - self._capture_rate_count
+            if elapsed > 0.2 and advanced >= 0:
+                self.capture_rate = advanced / elapsed
+        self._capture_rate_count = capture_count
+        self._capture_rate_time = now
+
+    def observe_header_rate(self) -> None:
+        """Keep a rolling five-second physical-header arrival window."""
+        now = time.monotonic()
+        self.header_timestamps.append(now)
+        cutoff = now - 5.0
+        while self.header_timestamps and self.header_timestamps[0] < cutoff:
+            del self.header_timestamps[0]
+
+    def header_rate(self) -> float | None:
+        if len(self.header_timestamps) < 2:
+            return None
+        elapsed = self.header_timestamps[-1] - self.header_timestamps[0]
+        return (len(self.header_timestamps) - 1) / elapsed if elapsed > 0 else None
+
+    def header_validation_detail(self) -> str:
+        total = self.header_valid_count + self.header_invalid_count
+        if not total:
+            return "WAITING FOR HEADER CHECK"
+        return f"CHECKS {self.header_valid_count}/{total} VALID"
+
     def diagnostic_drop_counts(self) -> tuple[int, int]:
         """Return capture-drop counters relative to the last Clear action."""
         ring_overrun = self.ring_overrun or 0
@@ -866,9 +975,111 @@ class TouchSimulator(tk.Tk):
             return "OFF"
         return "WRITING" if time.monotonic() < self._writing_display_until else "READING"
 
+    def scroll_hud_cards(self) -> list[dict[str, str | int | None]]:
+        """Return every safe passive measurement as a sortable HUD card."""
+        rpm = self.effective_rpm()
+        offset = self.header_offset()
+        expected = self.expected_sector_count()
+        coverage = f"SEEN {len(set(self.recent_sectors))}/{expected}" if expected else "WAITING"
+        header = (f"T{self.last_header_track:02d} S{self.live_sector:02d}"
+                  if self.last_header_track is not None and self.live_sector is not None else "WAITING")
+        capture, _ = self.capture_health_detail()
+        ring_overrun, queue_overflow = self.diagnostic_drop_counts()
+        sync_estimate, sync_per_rev, sync_expected = self.sync_revolution_reading()
+        header_rate = self.header_rate()
+        history_first, history_second = self.diagnostic_history_lines()
+        cards = [
+            ("track", "Track / Position", self.live_track, f"HEADER Δ {offset:+.1f}" if offset is not None else "POSITION ESTIMATE · HEADER WAITING", "Derived mechanical position; corrected when physical headers are decoded."),
+            ("rotation", "Rotation", f"{rpm:.2f}" if rpm is not None else "--.--", self.rpm_quality_detail(), "RPM derived from fresh SYNC pulse counts using the current density zone."),
+            ("activity", "Activity", self.disk_activity_label(), f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", "WRITING is the observed write-gate signal; otherwise active spinning media is READING."),
+            ("physical_header", "Physical Header", header, "CONFIRMED HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER", "Latest decoded on-disk track and sector header; it is physical media evidence."),
+            ("sector_coverage", "Sector Coverage", coverage, f"D{self.live_density} ZONE" if self.live_density is not None else "DENSITY UNKNOWN", "Unique sector numbers seen during this current observation window."),
+            ("capture_health", "Capture Health", capture, f"CAP {self.capture_count} · ROV {ring_overrun} · QOV {queue_overflow}" if self.capture_count is not None else "STATUS PENDING", "ROV and QOV are passive capture overruns since the local diagnostic reset."),
+            ("disk_identity", "Disk Identity", self.disk_identity_label(), self.header_validation_detail(), "Disk ID bytes are confirmed only after matching decoded headers; this does not decode DOS directory data."),
+            ("write_protect", "Write Protect", self.hud_write_protect_label(), self.hud_write_protect_detail(), "Reports the physical write-protect sensor and any confirmed Controller override. This screen cannot change it."),
+            ("density", "Density Zone", f"D{self.live_density}" if self.live_density is not None else "--", f"EXPECTED {sync_expected} SYNC / REV" if sync_expected else "WAITING FOR DENSITY", "Density is inferred from 1541 timing/header telemetry and determines expected SYNC density."),
+            ("motor_head", "Motor / Head", "ON" if self.motor else "OFF", f"HEAD {self.head_var.get()} · {self.phase_event_count} STEPS", "Motor is the observed drive signal. Head state combines step activity and motor condition."),
+            ("header_rate", "Header Rate", f"{header_rate:.1f}/S" if header_rate is not None else "WAITING", "DECODED PHYSICAL HEADERS / SECOND", "Rolling rate of successfully decoded physical headers over the last five seconds."),
+            ("capture_rate", "Capture Rate", f"{self.capture_rate / 1000:.0f}K/S" if self.capture_rate is not None else "WAITING", "PASSIVE CAPTURE EVENTS / SECOND", "Rate of passive firmware capture events reported through the compact status record."),
+            ("sync_rate", "SYNC Rate", f"{self.live_sync_count}/S" if self.live_sync_count is not None else "WAITING", "RAW SYNC PULSES / SECOND", "Raw SYNC pulse count from the latest one-second capture interval."),
+            ("sync_per_rev", "SYNC / Revolution", str(sync_per_rev) if sync_per_rev is not None else "--", f"EST {sync_estimate:.2f}" if sync_estimate is not None else "WAITING FOR SYNC", "SYNC pulses per revolution; compared with the density-zone expectation."),
+            ("mechanism", "Mechanism", f"{self.phase_event_count} STEPS", f"TRACK {self.live_track} · HEAD {self.head_var.get()}", "Cumulative observed step/phase transitions since this HUD connection was opened."),
+            ("recent_evidence", "Recent Evidence", history_first, history_second or "PASSIVE EVENT HISTORY", "Recent decoded headers, seek events, and motor changes. It is an observation trace, not DOS error data."),
+        ]
+        result = []
+        for card_id, title, value, detail, help_text in cards:
+            result.append({"id": card_id, "title": title, "value": value, "detail": detail,
+                           "help": help_text, "priority": self.hud_card_priorities.get(card_id)})
+        return sorted(result, key=lambda card: (0, int(card["priority"]), str(card["title"])) if card["priority"] else (1, str(card["title"])))
+
+    @staticmethod
+    def scroll_card_paint_text(card: dict[str, str | int | None]) -> tuple[str, str]:
+        """Fit special long-form cards into the shared scrolling row."""
+        value, detail = str(card["value"]), str(card["detail"])
+        if card["id"] == "recent_evidence":
+            # Evidence is an event trace, not a primary measurement. Keep a
+            # useful leading portion on its own compact line and reserve the
+            # lower line for its description.
+            return (value if len(value) <= 64 else f"{value[:61]}...", detail)
+        return value, detail
+
+    def cycle_hud_card_priority(self, card_id: str) -> None:
+        """Move one card through P1…P6 then unpinned, swapping occupied slots."""
+        current = self.hud_card_priorities.get(card_id)
+        next_priority = 1 if current is None else (None if current >= 6 else current + 1)
+        if next_priority is not None:
+            for other_id, other_priority in self.hud_card_priorities.items():
+                if other_id != card_id and other_priority == next_priority:
+                    self.hud_card_priorities[other_id] = current
+                    break
+        self.hud_card_priorities[card_id] = next_priority
+        self.hud_scroll_index = 0
+
+    def visible_hud_subscription_mask(self) -> int:
+        """Return the firmware telemetry classes needed by the six visible cards."""
+        core, headers, metadata, rpm, sync = 1, 2, 4, 8, 16
+        needed = {
+            "track": core, "rotation": rpm | sync, "activity": core,
+            "physical_header": headers, "sector_coverage": headers,
+            "capture_health": 0, "disk_identity": headers | metadata,
+            "write_protect": core, "density": core, "motor_head": core,
+            "header_rate": headers, "capture_rate": 0, "sync_rate": sync,
+            "sync_per_rev": sync, "mechanism": core,
+            "recent_evidence": core | headers,
+        }
+        cards = self.scroll_hud_cards()
+        visible = cards[self.hud_scroll_index:self.hud_scroll_index + 6]
+        # These are bit flags, not quantities.  Arithmetic addition breaks
+        # when two visible cards need the same class: for example two CORE
+        # cards made 1 + 1 == 2 (HEADERS), which accidentally turned CORE
+        # telemetry off.  Combine each required class exactly once.
+        mask = 0
+        for card in visible:
+            mask |= needed.get(str(card["id"]), 0)
+        return mask
+
+    def update_hud_subscription(self, link: CdcBoardLink) -> None:
+        """Tell the HUD firmware to emit only telemetry used by this viewport."""
+        mask = self.visible_hud_subscription_mask()
+        if mask != self._hud_subscription_mask:
+            link.write_command(f"HUDCFG M={mask}")
+            self._hud_subscription_mask = mask
+
+    def request_hud_redraw(self) -> None:
+        """Rebuild the visible six cards at a bounded desktop-only cadence."""
+        if self._hud_redraw_after is not None:
+            return
+
+        def redraw() -> None:
+            self._hud_redraw_after = None
+            if self.preview_page == "hud":
+                self.open_size_preview()
+
+        self._hud_redraw_after = self.after(150, redraw)
+
     def update_live_hud_fields(self) -> None:
         """Update existing HUD Canvas items without rebuilding the screen."""
-        if self.preview_page not in ("hud", "diagnostics"):
+        if self.preview_page not in ("hud", "diagnostics", "diagnostics_detail"):
             return
         preview = getattr(self, "preview", None)
         canvas = getattr(self, "preview_canvas", None)
@@ -878,6 +1089,25 @@ class TouchSimulator(tk.Tk):
             if self.preview_page == "diagnostics":
                 self.update_live_diagnostics_fields(canvas)
                 return
+            if self.preview_page == "diagnostics_detail":
+                self.update_system_diagnostics_fields(canvas)
+                return
+            # The scrolling HUD can display any six cards.  Tags for cards
+            # outside the viewport simply match no canvas item, which lets us
+            # refresh the current view without rebuilding it on each sample.
+            for card in self.scroll_hud_cards():
+                card_id = str(card["id"])
+                value, detail = self.scroll_card_paint_text(card)
+                if card_id != "recent_evidence" and len(value) > 24:
+                    value = f"{value[:21]}..."
+                canvas.itemconfigure(f"scroll_{card_id}_value", text=value)
+                canvas.itemconfigure(f"scroll_{card_id}_detail", text=detail)
+            canvas.itemconfigure("hud_head_state", text=self.head_var.get())
+            # Paint the existing visible rows only.  Recreating the whole
+            # Canvas while the CDC stream is active can keep Windows/Tk in a
+            # perpetual redraw cycle, making a healthy link look frozen.
+            canvas.update_idletasks()
+            return
             canvas.itemconfigure("hud_track", text=self.live_track)
             canvas.itemconfigure("hud_motor", text="ON" if self.motor else "OFF")
             canvas.itemconfigure("hud_head", text=self.head_var.get())
@@ -931,13 +1161,33 @@ class TouchSimulator(tk.Tk):
         canvas.itemconfigure("diag_activity", text=self.disk_activity_label())
         canvas.itemconfigure("diag_activity_detail", text=f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}")
         canvas.itemconfigure("diag_media", text=self.disk_identity_label())
-        canvas.itemconfigure("diag_media_detail", text=self.disk_identity_detail())
         canvas.itemconfigure("diag_capture", text=capture, fill=capture_color)
         ring_overrun, queue_overflow = self.diagnostic_drop_counts()
         canvas.itemconfigure("diag_capture_detail", text=(f"CAP {self.capture_count} · ROV {ring_overrun} · QOV {queue_overflow}" if self.capture_count is not None else "STATUS PENDING"))
         history_first, history_second = self.diagnostic_history_lines()
         canvas.itemconfigure("diag_history", text=history_first)
         canvas.itemconfigure("diag_history_2", text=history_second)
+
+    def update_system_diagnostics_fields(self, canvas: tk.Canvas) -> None:
+        """Refresh the deeper passive-measurement page from current telemetry."""
+        rate = self.header_rate()
+        rpm = self.effective_rpm()
+        spread = (max(self.rpm_samples) - min(self.rpm_samples)) if len(self.rpm_samples) > 1 else None
+        capture, capture_color = self.capture_health_detail()
+        ring_overrun, queue_overflow = self.diagnostic_drop_counts()
+        history_first, history_second = self.diagnostic_history_lines()
+        canvas.itemconfigure("sys_capture_rate", text=(f"{self.capture_rate / 1000:.0f}K/S" if self.capture_rate is not None else "WAITING"))
+        canvas.itemconfigure("sys_header_rate", text=(f"{rate:.1f}/S" if rate is not None else "WAITING"))
+        canvas.itemconfigure("sys_rotation", text=(f"{rpm:.2f}" if rpm is not None else "--.--"))
+        canvas.itemconfigure("sys_rotation_detail", text=(f"±{spread / 2:.2f} RPM · SYNC {self.live_sync_count}/S" if spread is not None and self.live_sync_count is not None else self.rpm_quality_detail()))
+        canvas.itemconfigure("sys_mechanism", text=f"{self.phase_event_count} STEPS")
+        canvas.itemconfigure("sys_mechanism_detail", text=f"{self.head_var.get()} · POSITION {self.live_track}")
+        canvas.itemconfigure("sys_media", text=self.disk_identity_label())
+        canvas.itemconfigure("sys_media_detail", text=self.header_validation_detail())
+        canvas.itemconfigure("sys_health", text=capture, fill=capture_color)
+        canvas.itemconfigure("sys_health_detail", text=(f"ROV {ring_overrun} · QOV {queue_overflow} · CAP {self.capture_count}" if self.capture_count is not None else "STATUS PENDING"))
+        canvas.itemconfigure("sys_history", text=history_first)
+        canvas.itemconfigure("sys_history_2", text=history_second)
 
     def schedule_write_protect_update(self, protected: bool) -> None:
         """Apply the proven GUI-only 250 ms last-event-wins WP debounce."""
@@ -1290,16 +1540,20 @@ class TouchSimulator(tk.Tk):
         def draw_spinning_disk(phase: float) -> None:
             """A tiny 5.25-inch floppy with deliberately subtle motion marks."""
             canvas.delete("disk")
-            cx, cy, radius = 606, 168, 35
+            # The live motor icon belongs to the dedicated status column.
+            cx, cy, radius = 1190, 169, 35
             canvas.create_oval((cx-radius)*sx, (cy-radius)*sy, (cx+radius)*sx, (cy+radius)*sy,
                                fill="#28343b", outline="#82959b", width=max(1, round(2*sy)), tags="disk")
             canvas.create_oval((cx-15)*sx, (cy-15)*sy, (cx+15)*sx, (cy+15)*sy,
                                fill="#101820", outline="#a9bbc4", width=max(1, round(sy)), tags="disk")
             canvas.create_oval((cx-4)*sx, (cy-4)*sy, (cx+4)*sx, (cy+4)*sy,
                                fill="#d5e5e9", outline="", tags="disk")
-            # Three curved arrow strokes orbit just outside the disk rim.
-            # They are 120 degrees apart and use a 15-pixel radial margin so
-            # the spin direction is clear without touching the disk itself.
+            # A stopped drive is still physically present. Keep the platter
+            # visible, but suppress the motion arrows.
+            if not self.motor:
+                return
+            # Three curved arrows orbit the platter only while it is
+            # running. Their absence makes a stopped disk unambiguous.
             active = ACCENT if int(phase * 5) % 2 == 0 else "#76ded0"
             arrow_radius = 47
             arrow_sweep = math.radians(52)
@@ -1314,8 +1568,6 @@ class TouchSimulator(tk.Tk):
                 canvas.create_line(*arc_points, fill=active,
                                    width=max(1, round(3*sy)), smooth=True,
                                    capstyle="round", tags="disk")
-                # The tangential arrowhead makes the clockwise motion
-                # readable even when only one arrow is visible at a glance.
                 tip_x = cx + math.cos(end_angle) * arrow_radius
                 tip_y = cy + math.sin(end_angle) * arrow_radius
                 tangent_x, tangent_y = -math.sin(end_angle), math.cos(end_angle)
@@ -1337,10 +1589,10 @@ class TouchSimulator(tk.Tk):
             # Add one chevron per beat.  Four downward-pointing marks make
             # depth visible without changing the physical direction glyph.
             count = int(phase * (4 / 1.5)) % 4 + 1
-            center_x = 855
+            center_x = 1190
             for index in range(count):
                 if self.head_direction == "IN":
-                    y = 126 + index * 22
+                    y = 282 + index * 22
                     # IN approaches: small at the top, large at the bottom.
                     scale = (0.45, 0.63, 0.81, 1.0)[index]
                     points = (
@@ -1351,7 +1603,7 @@ class TouchSimulator(tk.Tk):
                 else:
                     # OUT leaves: a large upward chevron begins at the
                     # bottom and shrinks as it moves upward into distance.
-                    y = 192 - index * 22
+                    y = 350 - index * 22
                     scale = (1.0, 0.81, 0.63, 0.45)[index]
                     points = (
                         (center_x - 20 * scale, y + 11 * scale),
@@ -1367,74 +1619,65 @@ class TouchSimulator(tk.Tk):
             # Center the larger options gear between the frame top and the
             # aligned HUD/Controller card grid, whose top edge is y=96.
             text(1254, 48, "⚙", 38, ACCENT, True, "e")
+        if self.preview_page == "control" and self.ub4.get():
+            canvas.create_rectangle(990*sx, 18*sy, 1170*sx, 66*sy, fill=PANEL_ALT, outline=ACCENT)
+            text(1080, 42, "HUD", 15, TEXT, True, "center")
         if self.preview_page == "hud":
-            text(26, 76, "DriveHUD · passive monitor · Firmware V1.0.2", 16, MUTED)
-            # HOME belongs with the HUD header, not between the metric cards
-            # and sector FIFO.  Right-align it above Head/Density while
-            # reserving the far-right corner for the options gear.
-            text(1168, 76, "HOME: anchored at Track 1.0", 18, MUTED, False, "e")
-            # Primary live telemetry in the first two rows; the remaining
-            # available HUD tags and sector FIFO stay visible below them.
-            # Align the entire HUD metric grid with the Controller screen.
-            # This makes the two views feel like the same physical display.
-            box(24, 96, 420, 234, "Track")
-            canvas.create_text(396*sx, 185*sy, text=self.live_track, fill=TEXT, anchor="e",
-                               font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_track")
-            box(440, 96, 660, 234, "Motor", "")
-            text(462, 174, "ON" if self.motor else "OFF", 28, TEXT, True, tag="hud_motor")
-            if self.motor:
-                draw_spinning_disk(time.monotonic())
-            box(680, 96, 900, 234, "Head", "")
-            text(702, 174, self.head_var.get(), 28, TEXT, True, tag="hud_head")
-            draw_head_motion(time.monotonic())
-            box(920, 96, 1256, 234, "Density")
-            canvas.create_text(1232*sx, 174*sy,
-                               text=f"D{self.live_density}" if self.live_density is not None else "--",
-                               fill=TEXT, anchor="e",
-                               font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_density")
-            box(24, 246, 420, 384, "RPM")
-            displayed_rpm = self.effective_rpm()
-            canvas.create_text(396*sx, 324*sy,
-                               text=f"{displayed_rpm:.2f}" if displayed_rpm is not None else "0.00",
-                               fill=TEXT, anchor="e",
-                               font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_rpm")
-            box(440, 246, 660, 384, "Activity", self.disk_activity_label(), value_tag="hud_rpm_state")
-            box(680, 246, 900, 384, "Sector")
-            canvas.create_text(876*sx, 324*sy,
-                               text=f"{self.live_sector:02d}" if self.live_sector is not None else "--",
-                               fill=TEXT, anchor="e",
-                               font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_sector")
-            box(920, 246, 1256, 384, "Sync / Sec")
-            canvas.create_text(1232*sx, 324*sy,
-                               text=str(self.live_sync_count) if self.live_sync_count is not None else "0",
-                               fill=TEXT, anchor="e",
-                               font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_sync")
-            # Keep the diagnostic caption against the lower card margin so
-            # the enlarged live count above it has clear breathing room.
-            text(946, 368, "raw SYNC / fresh RPM", 14, MUTED)
-            sync_estimate, sync_count_per_rev, sync_expected = self.sync_revolution_reading()
-            box(24, 396, 420, 534, "Sync / Rev")
-            canvas.create_text(396*sx, 474*sy, text=str(sync_count_per_rev) if sync_count_per_rev is not None else "--",
-                               fill=TEXT, anchor="e", font=("Cascadia Mono", max(7, round(56*sy)), "normal"), tags="hud_sync_rev")
-            estimate_detail = f"EST {sync_estimate:.2f}" if sync_estimate is not None else ""
-            expected_detail = f"EXPECTED {sync_expected}" if sync_expected is not None else "WAITING FOR SYNC"
-            text(50, 518, estimate_detail, 16, TEXT, True, tag="hud_sync_rev_estimate")
-            text(160, 518, expected_detail, 14, MUTED, True, tag="hud_sync_rev_detail")
-            box(440, 396, 820, 534, "Drive Diagnostics", "LIVE DATA", value_size=22, value_y=454)
-            text(466, 506, "TAP FOR DETAILS", 14, ACCENT, True)
-            box(840, 396, 1256, 534, "Write Protect", self.hud_write_protect_label(), value_size=25, value_y=458, value_tag="hud_wp")
-            text(866, 506, self.hud_write_protect_detail(), 14, MUTED, True, tag="hud_wp_detail")
-            canvas.create_rectangle(24*sx, 546*sy, 1256*sx, 592*sy, fill=PANEL, outline=PANEL_ALT, width=1)
-            text(42, 570, "RECENT SECTORS", 15, MUTED, True)
-            canvas.create_text(
-                230*sx, 570*sy,
-                text=" ".join(f"{sector:02d}" for sector in self.recent_sectors) if self.recent_sectors else "— FIFO empty —",
-                fill=TEXT, anchor="w",
-                font=("Cascadia Mono", max(7, round(18*sy)), "normal"), tags="hud_fifo",
-            )
-            # Match the Controller screen's serial/status line so the
-            # operator can identify the physical monitor board at a glance.
-            text(28, 612, self.hud_connection.get(), 16, ACCENT if self.ub4.get() else OFFLINE)
+            text(26, 76, "DriveHUD · passive measurements · tap P# to set display priority", 16, MUTED)
+            # A compact list leaves a dedicated right-hand status column.
+            cards = self.scroll_hud_cards()
+            max_start = max(0, len(cards) - 6)
+            self.hud_scroll_index = min(self.hud_scroll_index, max_start)
+            visible = cards[self.hud_scroll_index:self.hud_scroll_index + 6]
+            for index, card in enumerate(visible):
+                y1 = 96 + index * 100
+                # The HUD has no footer: use its full screen height for six
+                # generous, readable cards with a small four-pixel gutter.
+                y2 = y1 + 96
+                canvas.create_rectangle(24*sx, y1*sy, 1006*sx, y2*sy, fill=PANEL, outline=PANEL_ALT, width=1)
+                text(48, y1 + 19, str(card["title"]).upper(), 14, MUTED, True)
+                value, detail = self.scroll_card_paint_text(card)
+                display_value = value if len(value) <= 24 else f"{value[:21]}..."
+                # Values retain a consistent visual weight across every
+                # card.  Supporting text begins well to their right.
+                if card["id"] == "recent_evidence":
+                    text(48, y1 + 52, value, 15, TEXT, True, tag=f"scroll_{card['id']}_value")
+                    text(48, y1 + 78, detail, 13, MUTED, True, tag=f"scroll_{card['id']}_detail")
+                else:
+                    text(48, y1 + 60, display_value, 24, TEXT, True, tag=f"scroll_{card['id']}_value")
+                    text(400, y1 + 60, detail, 14, MUTED, True, tag=f"scroll_{card['id']}_detail")
+                priority = card["priority"]
+                # Help precedes the display priority, matching the natural
+                # left-to-right reading order: what it means, then its rank.
+                canvas.create_rectangle(854*sx, (y1 + 26)*sy, 912*sx, (y1 + 70)*sy, fill=PANEL_ALT, outline=ACCENT)
+                text(883, y1 + 48, "?", 20, ACCENT, True, "center")
+                canvas.create_rectangle(924*sx, (y1 + 26)*sy, 982*sx, (y1 + 70)*sy, fill=PANEL_ALT, outline=ACCENT)
+                text(953, y1 + 48, f"P{priority}" if priority else "P–", 15, TEXT, True, "center")
+            # Persistent, centered status cards live at the far right.
+            status_cards = ((96, 242, "MOTOR"), (246, 392, "HEAD"), (396, 542, "WRITE PROTECT"), (546, 692, "CONTROLLER"))
+            for y1, y2, label in status_cards:
+                canvas.create_rectangle(1020*sx, y1*sy, 1256*sx, y2*sy, fill=PANEL, outline=PANEL_ALT, width=1)
+                text(1044, y1 + 20, label, 14, MUTED, True)
+            draw_spinning_disk(time.monotonic())
+            text(1100, 169, "ON" if self.motor else "OFF", 28, TEXT, True, "center")
+            head_state = self.head_var.get()
+            # Keep the state label left and the animated motion cue right so
+            # IN/OUT remains readable alongside the working chevrons.
+            text(1044, 319, head_state, 28, TEXT, True, "w", tag="hud_head_state")
+            if head_state in ("IN", "OUT"):
+                draw_head_motion(time.monotonic())
+            wp_color = ACCENT if self.hud_write_protect_label() in ("WRITABLE", "FORCES WRITABLE") else OFFLINE
+            text(1133, 469, "W/O", 36, wp_color, True, "center")
+            text(1133, 619, "▶", 42, ACCENT if self.ub3.get() else MUTED, True, "center")
+            telemetry_label = "TELEMETRY ON" if self._hud_telemetry_enabled else "TELEMETRY WAITING"
+            text(24, 710, f"SHOWING {self.hud_scroll_index + 1}–{min(self.hud_scroll_index + 6, len(cards))} OF {len(cards)} · {telemetry_label} · P1–P6 PINNED · ? HELP", 14, ACCENT, True)
+            if self.hud_help_card:
+                card = next((entry for entry in cards if entry["id"] == self.hud_help_card), None)
+                if card:
+                    canvas.create_rectangle(120*sx, 218*sy, 1090*sx, 486*sy, fill=BG, outline=ACCENT, width=max(1, round(2*sy)))
+                    text(156, 260, str(card["title"]).upper(), 24, TEXT, True)
+                    text(156, 310, str(card["help"]), 18, MUTED, False)
+                    text(156, 386, "SOURCE: PASSIVE DRIVEHUD TELEMETRY · TAP ANYWHERE TO CLOSE", 15, ACCENT, True)
         elif self.preview_page == "diagnostics":
             text(26, 76, "Drive Diagnostics · passive measurements", 16, MUTED)
             box(24, 96, 420, 244, "Mechanical Position")
@@ -1460,14 +1703,16 @@ class TouchSimulator(tk.Tk):
             box(440, 260, 820, 408, "Activity")
             text(466, 336, self.disk_activity_label(), 31, TEXT, True, tag="diag_activity")
             text(466, 384, f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", 15, MUTED, True, tag="diag_activity_detail")
-            box(840, 260, 1256, 408, "Disk Identity")
+            box(840, 260, 1256, 408, "Disk ID / System")
             text(866, 336, self.disk_identity_label(), 35, TEXT, True, tag="diag_media")
-            text(866, 384, self.disk_identity_detail(), 14, MUTED, True, tag="diag_media_detail")
+            text(866, 384, "TAP FOR SYSTEM DIAGNOSTICS", 14, ACCENT, True)
             box(24, 424, 420, 572, "HUD Health")
             capture, capture_color = self.capture_health_detail()
             text(50, 500, capture, 27, capture_color, True, tag="diag_capture")
-            canvas.create_rectangle(284*sx, 476*sy, 396*sx, 520*sy, fill=PANEL_ALT, outline=ACCENT)
-            text(340, 498, "CLEAR", 14, TEXT, True, "center")
+            # Keep the local diagnostic reset in the header band so it does
+            # not collide with long health states such as WAITING FOR STATUS.
+            canvas.create_rectangle(284*sx, 434*sy, 396*sx, 466*sy, fill=PANEL_ALT, outline=ACCENT)
+            text(340, 450, "CLEAR", 14, TEXT, True, "center")
             ring_overrun, queue_overflow = self.diagnostic_drop_counts()
             capture_detail = f"CAP {self.capture_count} · ROV {ring_overrun} · QOV {queue_overflow}" if self.capture_count is not None else "STATUS PENDING"
             text(50, 548, capture_detail, 14, MUTED, True, tag="diag_capture_detail")
@@ -1479,6 +1724,39 @@ class TouchSimulator(tk.Tk):
             # pixels above the lower edge of this 148-pixel-high card.
             # This is a capability note, not an active fault; keep it quiet.
             text(466, 548, "DOS ERROR / RETRY DATA UNAVAILABLE", 13, MUTED)
+            text(28, 612, self.hud_connection.get(), 16, ACCENT if self.ub4.get() else OFFLINE)
+        elif self.preview_page == "diagnostics_detail":
+            text(26, 76, "System Diagnostics · passive measurements", 16, MUTED)
+            box(24, 96, 420, 244, "Capture Rate")
+            text(50, 172, f"{self.capture_rate / 1000:.0f}K/S" if self.capture_rate is not None else "WAITING", 35, TEXT, True, tag="sys_capture_rate")
+            text(50, 220, "PASSIVE CAPTURE EVENTS PER SECOND", 15, MUTED, True)
+            box(440, 96, 820, 244, "Header Rate")
+            header_rate = self.header_rate()
+            text(466, 172, f"{header_rate:.1f}/S" if header_rate is not None else "WAITING", 35, TEXT, True, tag="sys_header_rate")
+            text(466, 220, "DECODED PHYSICAL HEADERS", 15, MUTED, True)
+            box(840, 96, 1256, 244, "Rotation Quality")
+            displayed_rpm = self.effective_rpm()
+            text(866, 172, f"{displayed_rpm:.2f}" if displayed_rpm is not None else "--.--", 35, TEXT, True, tag="sys_rotation")
+            text(866, 220, self.rpm_quality_detail(), 15, MUTED, True, tag="sys_rotation_detail")
+            box(24, 260, 420, 408, "Mechanism")
+            text(50, 336, f"{self.phase_event_count} STEPS", 31, TEXT, True, tag="sys_mechanism")
+            text(50, 384, f"{self.head_var.get()} · POSITION {self.live_track}", 15, MUTED, True, tag="sys_mechanism_detail")
+            box(440, 260, 820, 408, "Media Validation")
+            text(466, 336, self.disk_identity_label(), 31, TEXT, True, tag="sys_media")
+            text(466, 384, self.header_validation_detail(), 15, MUTED, True, tag="sys_media_detail")
+            box(840, 260, 1256, 408, "Capture Integrity")
+            capture, capture_color = self.capture_health_detail()
+            text(866, 336, capture, 31, capture_color, True, tag="sys_health")
+            ring_overrun, queue_overflow = self.diagnostic_drop_counts()
+            text(866, 384, f"ROV {ring_overrun} · QOV {queue_overflow}", 15, MUTED, True, tag="sys_health_detail")
+            box(24, 424, 420, 572, "Observability")
+            text(50, 500, "PASSIVE", 27, ACCENT, True)
+            text(50, 548, "DOS ERRORS / RETRIES NOT EXPOSED", 13, MUTED)
+            box(440, 424, 1256, 572, "Recent Evidence")
+            history_first, history_second = self.diagnostic_history_lines()
+            text(466, 486, history_first, 17, TEXT, True, tag="sys_history")
+            text(466, 516, history_second, 17, TEXT, True, tag="sys_history_2")
+            text(466, 548, "HEADER/RPM/STEP DATA FROM UB4 PASSIVE CAPTURE", 13, MUTED)
             text(28, 612, self.hud_connection.get(), 16, ACCENT if self.ub4.get() else OFFLINE)
         elif self.preview_page == "control":
             text(26, 76, "OneROM Controller", 16, MUTED)
@@ -1645,7 +1923,8 @@ class TouchSimulator(tk.Tk):
             text(26, 76, "OneROM Setup", 16, MUTED)
             box(24, 120, 1256, 410, "No OneROM role configured", "OPEN SETTINGS")
             text(50, 330, "Open Settings to connect the Controller and DriveHUD OneROMs for this drive.", 18, MUTED)
-        canvas.create_rectangle(24*sx, 632*sy, 1256*sx, 710*sy, fill=PANEL_ALT, outline="")
+        if self.preview_page not in ("hud", "control"):
+            canvas.create_rectangle(24*sx, 632*sy, 1256*sx, 710*sy, fill=PANEL_ALT, outline="")
         # Deliberately large touch targets.  Only offer a destination that is
         # actually installed: the compact UI should never expose a dead tab.
         if self.preview_page == "hud" and self.ub3.get():
@@ -1657,6 +1936,11 @@ class TouchSimulator(tk.Tk):
             if self.ub3.get():
                 canvas.create_rectangle(346*sx, 645*sy, 646*sx, 697*sy, fill=PANEL, outline="")
                 text(496, 671, "CONTROL", 17, TEXT, True, "center")
+        elif self.preview_page == "diagnostics_detail":
+            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
+            text(184, 671, "HUD", 17, TEXT, True, "center")
+            canvas.create_rectangle(346*sx, 645*sy, 646*sx, 697*sy, fill=PANEL, outline="")
+            text(496, 671, "DIAGNOSTICS", 17, TEXT, True, "center")
         elif self.preview_page == "control" and self.ub4.get():
             canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
             text(184, 671, "HUD", 17, TEXT, True, "center")
@@ -1680,9 +1964,7 @@ class TouchSimulator(tk.Tk):
             canvas.create_rectangle(658*sx, 645*sy, 958*sx, 697*sy, fill=PANEL, outline="")
             text(496, 671, "▲ OLDER", 17, TEXT, True, "center")
             text(808, 671, "▼ NEWER", 17, TEXT, True, "center")
-        if self.preview_page == "hud":
-            text(660, 680, "Values update while disk is spinning.", 20, MUTED, False, "center")
-        elif self.preview_page == "diagnostics":
+        if self.preview_page in ("diagnostics", "diagnostics_detail"):
             # The status at the far right needs its own stable space.  Keep
             # this deliberately short so it never encroaches on navigation.
             # Left-align the footer descriptor with the available content
@@ -1694,6 +1976,8 @@ class TouchSimulator(tk.Tk):
             footer_status = "● Controller connected"
         elif self.preview_page == "diagnostics":
             footer_status = "● DriveHUD diagnostics"
+        elif self.preview_page == "diagnostics_detail":
+            footer_status = "● DriveHUD system diagnostics"
         elif self.preview_page == "settings":
             footer_status = "● Hardware setup"
         elif self.preview_page in ("controller_connection", "hud_connection"):
@@ -1704,11 +1988,12 @@ class TouchSimulator(tk.Tk):
             footer_status = "● USB Log"
         else:
             footer_status = "● No boards configured"
-        diagnostic = self.serial_last_error.get()
-        if diagnostic:
-            text(1240, 680, f"USB ERROR: {diagnostic[:88]}", 14, OFFLINE, True, "e")
-        else:
-            text(1240, 680, footer_status, 20, ACCENT if self.preview_page != "setup" else MUTED, True, "e")
+        if self.preview_page not in ("hud", "control"):
+            diagnostic = self.serial_last_error.get()
+            if diagnostic:
+                text(1240, 680, f"USB ERROR: {diagnostic[:88]}", 14, OFFLINE, True, "e")
+            else:
+                text(1240, 680, footer_status, 20, ACCENT if self.preview_page != "setup" else MUTED, True, "e")
         if self.popup_menu is not None:
             if self.hex_entry is not None and self.hex_entry.winfo_exists():
                 self.hex_entry.destroy()
@@ -1899,7 +2184,11 @@ class TouchSimulator(tk.Tk):
                     self.write_protect_prompt = None
                 self.open_size_preview()
                 return
-            if self.preview_page not in ("setup", "settings", "log") and y < 76 and x > 1120:
+            if self.preview_page == "hud" and self.hud_help_card is not None:
+                self.hud_help_card = None
+                self.open_size_preview()
+                return
+            if self.preview_page not in ("setup", "settings", "log") and y < 76 and x > 1180:
                 self.preview_page = "settings"
             elif self.preview_page == "log":
                 if 636 <= x <= 936 and 22 <= y <= 74:
@@ -1956,27 +2245,46 @@ class TouchSimulator(tk.Tk):
             elif self.preview_page == "settings" and 660 <= x <= 1256 and 294 <= y <= 482:
                 self.choose_appearance_menu(event)
                 return
-            elif self.preview_page == "hud" and 440 <= x <= 660 and 82 <= y <= 220:
-                self.motor = not self.motor
+            elif self.preview_page == "hud" and self.ub3.get() and 990 <= x <= 1170 and 18 <= y <= 66:
+                self.preview_page = "control"
                 self.open_size_preview()
                 return
-            elif self.preview_page == "hud" and 680 <= x <= 900 and 82 <= y <= 220:
-                self.head_direction = "OUT" if self.head_direction == "IN" else "IN"
+            elif self.preview_page == "hud" and 1020 <= x <= 1256 and 546 <= y <= 692:
+                if self.ub3.get():
+                    self.preview_page = "control"
+                else:
+                    self.usb_status.set("Controller is not connected.")
                 self.open_size_preview()
                 return
-            elif self.preview_page == "hud" and 440 <= x <= 820 and 396 <= y <= 534:
-                self.preview_page = "diagnostics"
-                self.open_size_preview()
-                return
-            elif self.preview_page == "diagnostics" and 284 <= x <= 396 and 476 <= y <= 520:
+            elif self.preview_page == "hud" and 24 <= x <= 1006 and 96 <= y <= 692:
+                visible = self.scroll_hud_cards()[self.hud_scroll_index:self.hud_scroll_index + 6]
+                index = int((y - 96) // 100)
+                if 0 <= index < len(visible):
+                    card = visible[index]
+                    row_y = 96 + index * 100
+                    if 854 <= x <= 912 and row_y + 26 <= y <= row_y + 70:
+                        self.hud_help_card = str(card["id"])
+                    elif 924 <= x <= 982 and row_y + 26 <= y <= row_y + 70:
+                        self.cycle_hud_card_priority(str(card["id"]))
+                    self.open_size_preview()
+                    return
+            elif self.preview_page == "diagnostics" and 284 <= x <= 396 and 434 <= y <= 466:
                 self.clear_diagnostic_drops()
                 return
-            elif self.preview_page == "hud" and self.ub3.get() and 645 <= y <= 697 and 34 <= x <= 334:
-                self.preview_page = "control"
+            elif self.preview_page == "diagnostics" and 840 <= x <= 1256 and 260 <= y <= 408:
+                self.preview_page = "diagnostics_detail"
+                self.open_size_preview()
+                return
             elif self.preview_page == "diagnostics" and 645 <= y <= 697 and 34 <= x <= 334:
                 self.preview_page = "hud"
             elif self.preview_page == "diagnostics" and self.ub3.get() and 645 <= y <= 697 and 346 <= x <= 646:
                 self.preview_page = "control"
+            elif self.preview_page == "diagnostics_detail" and 645 <= y <= 697 and 34 <= x <= 334:
+                self.preview_page = "hud"
+            elif self.preview_page == "diagnostics_detail" and 645 <= y <= 697 and 346 <= x <= 646:
+                self.preview_page = "diagnostics"
+            elif self.preview_page == "control" and self.ub4.get() and 990 <= x <= 1170 and 18 <= y <= 66:
+                self.preview_page = "hud"
             elif self.preview_page == "control" and self.ub4.get() and 645 <= y <= 697 and 34 <= x <= 334:
                 self.preview_page = "hud"
             elif self.preview_page == "settings" and self.ub4.get() and 645 <= y <= 697 and 34 <= x <= 334:
@@ -2037,8 +2345,6 @@ class TouchSimulator(tk.Tk):
                     if self.write_protect_prompt is None:
                         if self.motor:
                             draw_spinning_disk(time.monotonic())
-                        else:
-                            canvas.delete("disk")
                         draw_head_motion(time.monotonic())
                     self._preview_animation_id = preview.after(180, animate_disk)
             self._preview_animation_id = preview.after(180, animate_disk)
