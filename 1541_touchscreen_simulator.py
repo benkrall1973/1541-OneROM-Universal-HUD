@@ -1301,6 +1301,68 @@ class TouchSimulator(tk.Tk):
 
         self._hud_redraw_after = self.after(150, redraw)
 
+    def preview_icon_tooltip(self, x: float, y: float) -> str | None:
+        """Return the plain-language label for a hovered canvas icon."""
+        if 14 <= y <= 70:
+            top_icons = {
+                "hud": ((1136, 1192, "Open USB log"), (1200, 1256, "Open settings")),
+                "settings": ((1136, 1192, "Open USB log"), (1200, 1256, "Open Monitor list")),
+                "log": (
+                    (1008, 1064, "Clear log entries"),
+                    (1072, 1128, "Copy log entries"),
+                    (1136, 1192, "Open Monitor list"),
+                    (1200, 1256, "Open settings"),
+                ),
+                "controller_connection": ((1136, 1192, "Open Monitor list"), (1200, 1256, "Open settings")),
+                "hud_connection": ((1136, 1192, "Open Monitor list"), (1200, 1256, "Open settings")),
+            }
+            for left, right, label in top_icons.get(self.preview_page, ()):
+                if left <= x <= right:
+                    return label
+        if HUD_SCROLL_LEFT <= x <= HUD_SCROLL_RIGHT:
+            scroll_labels = (
+                (100, 240, "First page" if self.preview_page == "log" else "Back five cards"),
+                (244, 384, "Previous page" if self.preview_page == "log" else "Previous card"),
+                (388, 528, "Next page" if self.preview_page == "log" else "Next card"),
+                (532, 672, "Last page" if self.preview_page == "log" else "Forward five cards"),
+            )
+            for top, bottom, label in scroll_labels:
+                if top <= y <= bottom:
+                    return label
+        if self.preview_page == "settings" and 1178 <= x <= 1246 and 470 <= y <= 530:
+            return "Customize appearance"
+        if self.preview_page in ("controller_connection", "hud_connection") and 24 <= x <= 314 and 620 <= y <= 672:
+            return "Back to settings"
+        if self.preview_page == "hud" and HUD_HELP_LEFT <= x <= HUD_HELP_RIGHT:
+            index = int((y - HUD_CARD_TOP) // HUD_CARD_PITCH)
+            row_y = HUD_CARD_TOP + index * HUD_CARD_PITCH
+            if 0 <= index < HUD_VISIBLE_CARD_COUNT and row_y + 23 <= y <= row_y + 87:
+                return "Card help"
+        return None
+
+    def update_preview_tooltip(self, event: tk.Event, canvas: tk.Canvas, sx: float, sy: float) -> None:
+        """Draw a small bounded tooltip for hoverable touchscreen icons."""
+        canvas.delete("icon_tooltip")
+        if any((self.hud_help_card, self.priority_prompt_card, self.write_protect_prompt,
+                self.clear_drops_prompt, self.dashboard_setting_prompt, self.popup_menu)):
+            return
+        label = self.preview_icon_tooltip(event.x / sx, event.y / sy)
+        if not label:
+            return
+        label_id = canvas.create_text(event.x + 14, event.y + 18, text=label, anchor="nw",
+                                      fill=TEXT, font=("Segoe UI", 12, "bold"), tags="icon_tooltip")
+        left, top, right, bottom = canvas.bbox(label_id)
+        # Keep the tooltip inside the fixed 7-inch canvas rather than
+        # letting it disappear off the right/bottom edge.
+        shift_x = min(0, canvas.winfo_width() - right - 8)
+        shift_y = min(0, canvas.winfo_height() - bottom - 8)
+        if shift_x or shift_y:
+            canvas.move(label_id, shift_x, shift_y)
+            left, top, right, bottom = canvas.bbox(label_id)
+        background = canvas.create_rectangle(left - 7, top - 5, right + 7, bottom + 5,
+                                             fill=BG, outline=ACCENT, tags="icon_tooltip")
+        canvas.tag_lower(background, label_id)
+
     def update_live_hud_fields(self) -> None:
         """Update existing Monitor Canvas items without rebuilding the screen."""
         if self.preview_page != "hud":
@@ -2175,7 +2237,9 @@ class TouchSimulator(tk.Tk):
             # Four equal, evenly spaced actions make the connection workflow
             # clear: return, scan, release the assigned role, or connect.
             canvas.create_rectangle(24*sx, 620*sy, 314*sx, 672*sy, fill=PANEL_ALT, outline=ACCENT)
-            text(169, 646, "BACK", 15, TEXT, True, "center")
+            # Segoe's triangle glyph carries extra descent; lift its anchor
+            # slightly so the *visible* triangle centers in the 52px button.
+            text(169, 640, "◀", 34, ACCENT, True, "center")
             for x1, label, color in (
                 (338, "REFRESH DEVICES", ACCENT),
                 (652, f"RELEASE {role_title}", OFFLINE),
@@ -2629,6 +2693,8 @@ class TouchSimulator(tk.Tk):
         # Bind directly to the drawing surface.  On some Windows/Tk builds a
         # Canvas does not reliably forward touch/mouse events to its Toplevel.
         canvas.bind("<Button-1>", clicked)
+        canvas.bind("<Motion>", lambda event: self.update_preview_tooltip(event, canvas, sx, sy))
+        canvas.bind("<Leave>", lambda _event: canvas.delete("icon_tooltip"))
         preview.bind("<Escape>", lambda _event: self.destroy())
         preview.protocol("WM_DELETE_WINDOW", self.destroy)
         previous_animation = getattr(self, "_preview_animation_id", None)
