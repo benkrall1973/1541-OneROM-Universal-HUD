@@ -18,7 +18,7 @@ from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discove
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.6"
+APP_VERSION = "V0.0.7"
 # The FIFO has 1,026 virtual pixels from x=230 to the card's right edge.
 # 31 "88" entries plus their 30 separators are 92 fixed-width glyphs; at
 # the 18px Cascadia Mono HUD font that leaves a safe right-hand margin.
@@ -153,6 +153,8 @@ class TouchSimulator(tk.Tk):
         # the default visible cards; unpinned diagnostics follow by name.
         self.hud_scroll_index = 0
         self.hud_help_card: str | None = None
+        self.priority_prompt_card: str | None = None
+        self.priority_prompt_value = ""
         self._hud_subscription_mask: int | None = None
         self._hud_telemetry_enabled = False
         self._hud_redraw_after: str | None = None
@@ -600,7 +602,16 @@ class TouchSimulator(tk.Tk):
                     self.observe_header_rate()
                     self.push_recent_sector(state.header_track, state.sector)
                     self.record_activity(f"READ T{state.header_track:02d} S{state.sector:02d}")
-                if state.protected is not None:
+                # ``state.protected`` is deliberately retained by the parser
+                # between records.  Debouncing that retained value on every
+                # header/SYNC record kept cancelling the 250 ms timer during
+                # active reads, so a real disk-notch change never reached the
+                # display.  Only a fresh physical WP record (or the initial
+                # authoritative STATE snapshot) may start the debounce.
+                if state.protected is not None and (
+                    line.startswith("WRITE_PROTECT ")
+                    or ("WPV=" in line and " WP=" in line)
+                ):
                     self.schedule_write_protect_update(state.protected)
                 if state.writing is not None:
                     self.live_writing = state.writing
@@ -1010,7 +1021,13 @@ class TouchSimulator(tk.Tk):
         for card_id, title, value, detail, help_text in cards:
             result.append({"id": card_id, "title": title, "value": value, "detail": detail,
                            "help": help_text, "priority": self.hud_card_priorities.get(card_id)})
-        return sorted(result, key=lambda card: (0, int(card["priority"]), str(card["title"])) if card["priority"] else (1, str(card["title"])))
+        return sorted(
+            result,
+            key=lambda card: (
+                (0, int(card["priority"]), str(card["title"]))
+                if card["priority"] is not None else (1, str(card["title"]))
+            ),
+        )
 
     @staticmethod
     def scroll_card_paint_text(card: dict[str, str | int | None]) -> tuple[str, str]:
@@ -1034,6 +1051,11 @@ class TouchSimulator(tk.Tk):
                     break
         self.hud_card_priorities[card_id] = next_priority
         self.hud_scroll_index = 0
+
+    def scroll_hud_by(self, amount: int) -> None:
+        """Move the six-card viewport while retaining a valid final page."""
+        max_start = max(0, len(self.scroll_hud_cards()) - 6)
+        self.hud_scroll_index = max(0, min(max_start, self.hud_scroll_index + amount))
 
     def visible_hud_subscription_mask(self) -> int:
         """Return the firmware telemetry classes needed by the six visible cards."""
@@ -1103,6 +1125,12 @@ class TouchSimulator(tk.Tk):
                 canvas.itemconfigure(f"scroll_{card_id}_value", text=value)
                 canvas.itemconfigure(f"scroll_{card_id}_detail", text=detail)
             canvas.itemconfigure("hud_head_state", text=self.head_var.get())
+            canvas.itemconfigure(
+                "hud_wp_override",
+                text="W/O",
+                fill=OFFLINE if self._confirmed_writable else ACCENT,
+            )
+            canvas.itemconfigure("hud_disk_status", text=self.physical_disk_write_status())
             # Paint the existing visible rows only.  Recreating the whole
             # Canvas while the CDC stream is active can keep Windows/Tk in a
             # perpetual redraw cycle, making a healthy link look frozen.
@@ -1205,6 +1233,10 @@ class TouchSimulator(tk.Tk):
             return
         self.live_protected = self._wp_pending_state
         self.wp_var.set("PROTECTED" if self.live_protected else "WRITABLE")
+        # The fixed right-side card is updated in place: no full Canvas
+        # rebuild is needed merely because a disk was inserted or removed.
+        self._hud_dirty = True
+        self.update_live_hud_fields()
 
     def hud_write_protect_label(self) -> str:
         """Return effective write permission, not only the passive sensor bit."""
@@ -1224,6 +1256,12 @@ class TouchSimulator(tk.Tk):
         if self.live_protected is None:
             return "PHYSICAL SENSOR PENDING"
         return "PHYSICAL WRITE-PROTECT SENSOR"
+
+    def physical_disk_write_status(self) -> str:
+        """Return the observed media notch/sensor state, independent of X2."""
+        if self.live_protected is None:
+            return "DISK STATUS WAITING"
+        return "DISK PROTECTED" if self.live_protected else "DISK WRITABLE"
 
     def apply_device_state(self, initial=False) -> None:
         # A maintained override must never survive loss of the control board.
@@ -1541,7 +1579,7 @@ class TouchSimulator(tk.Tk):
             """A tiny 5.25-inch floppy with deliberately subtle motion marks."""
             canvas.delete("disk")
             # The live motor icon belongs to the dedicated status column.
-            cx, cy, radius = 1190, 169, 35
+            cx, cy, radius = 1190, 173, 35
             canvas.create_oval((cx-radius)*sx, (cy-radius)*sy, (cx+radius)*sx, (cy+radius)*sy,
                                fill="#28343b", outline="#82959b", width=max(1, round(2*sy)), tags="disk")
             canvas.create_oval((cx-15)*sx, (cy-15)*sy, (cx+15)*sx, (cy+15)*sy,
@@ -1592,7 +1630,7 @@ class TouchSimulator(tk.Tk):
             center_x = 1190
             for index in range(count):
                 if self.head_direction == "IN":
-                    y = 282 + index * 22
+                    y = 280 + index * 22
                     # IN approaches: small at the top, large at the bottom.
                     scale = (0.45, 0.63, 0.81, 1.0)[index]
                     points = (
@@ -1603,7 +1641,7 @@ class TouchSimulator(tk.Tk):
                 else:
                     # OUT leaves: a large upward chevron begins at the
                     # bottom and shrinks as it moves upward into distance.
-                    y = 350 - index * 22
+                    y = 348 - index * 22
                     scale = (1.0, 0.81, 0.63, 0.45)[index]
                     points = (
                         (center_x - 20 * scale, y + 11 * scale),
@@ -1630,11 +1668,11 @@ class TouchSimulator(tk.Tk):
             self.hud_scroll_index = min(self.hud_scroll_index, max_start)
             visible = cards[self.hud_scroll_index:self.hud_scroll_index + 6]
             for index, card in enumerate(visible):
-                y1 = 96 + index * 100
-                # The HUD has no footer: use its full screen height for six
-                # generous, readable cards with a small four-pixel gutter.
-                y2 = y1 + 96
-                canvas.create_rectangle(24*sx, y1*sy, 1006*sx, y2*sy, fill=PANEL, outline=PANEL_ALT, width=1)
+                # Preserve a clean gap below the subtitle while slightly
+                # compressing each row so the footer retains its margin.
+                y1 = 100 + index * 96
+                y2 = y1 + 92
+                canvas.create_rectangle(24*sx, y1*sy, 920*sx, y2*sy, fill=PANEL, outline=ACCENT, width=1)
                 text(48, y1 + 19, str(card["title"]).upper(), 14, MUTED, True)
                 value, detail = self.scroll_card_paint_text(card)
                 display_value = value if len(value) <= 24 else f"{value[:21]}..."
@@ -1642,35 +1680,47 @@ class TouchSimulator(tk.Tk):
                 # card.  Supporting text begins well to their right.
                 if card["id"] == "recent_evidence":
                     text(48, y1 + 52, value, 15, TEXT, True, tag=f"scroll_{card['id']}_value")
-                    text(48, y1 + 78, detail, 13, MUTED, True, tag=f"scroll_{card['id']}_detail")
+                    text(48, y1 + 78, detail, 15, TEXT, True, tag=f"scroll_{card['id']}_detail")
                 else:
                     text(48, y1 + 60, display_value, 24, TEXT, True, tag=f"scroll_{card['id']}_value")
                     text(400, y1 + 60, detail, 14, MUTED, True, tag=f"scroll_{card['id']}_detail")
                 priority = card["priority"]
                 # Help precedes the display priority, matching the natural
                 # left-to-right reading order: what it means, then its rank.
-                canvas.create_rectangle(854*sx, (y1 + 26)*sy, 912*sx, (y1 + 70)*sy, fill=PANEL_ALT, outline=ACCENT)
-                text(883, y1 + 48, "?", 20, ACCENT, True, "center")
-                canvas.create_rectangle(924*sx, (y1 + 26)*sy, 982*sx, (y1 + 70)*sy, fill=PANEL_ALT, outline=ACCENT)
-                text(953, y1 + 48, f"P{priority}" if priority else "P–", 15, TEXT, True, "center")
+                # Large, finger-friendly actions occupy the right edge of
+                # every card without reducing the primary value area.
+                canvas.create_rectangle(746*sx, (y1 + 14)*sy, 818*sx, (y1 + 78)*sy, fill=PANEL_ALT, outline=ACCENT)
+                text(782, y1 + 50, "?", 25, ACCENT, True, "center")
+                canvas.create_rectangle(826*sx, (y1 + 14)*sy, 908*sx, (y1 + 78)*sy, fill=PANEL_ALT, outline=ACCENT)
+                text(867, y1 + 50, f"P{priority}" if priority else "P–", 18, TEXT, True, "center")
+            # Four finger-sized scrolling controls. The symbols intentionally
+            # omit their former 5/1 labels: direction alone is clearer.
+            for y1, label in ((100, "⇑"), (244, "↑"), (388, "↓"), (532, "⇓")):
+                canvas.create_rectangle(934*sx, y1*sy, 1006*sx, (y1 + 140)*sy, fill=PANEL_ALT, outline=ACCENT)
+                text(970, y1 + 70, label, 38, TEXT, True, "center")
             # Persistent, centered status cards live at the far right.
-            status_cards = ((96, 242, "MOTOR"), (246, 392, "HEAD"), (396, 542, "WRITE PROTECT"), (546, 692, "CONTROLLER"))
+            status_cards = ((100, 240, "MOTOR"), (244, 384, "HEAD"), (388, 528, "WRITE PROTECT"), (532, 672, "CONTROLLER"))
             for y1, y2, label in status_cards:
-                canvas.create_rectangle(1020*sx, y1*sy, 1256*sx, y2*sy, fill=PANEL, outline=PANEL_ALT, width=1)
+                canvas.create_rectangle(1020*sx, y1*sy, 1256*sx, y2*sy, fill=PANEL, outline=ACCENT, width=1)
                 text(1044, y1 + 20, label, 14, MUTED, True)
             draw_spinning_disk(time.monotonic())
-            text(1100, 169, "ON" if self.motor else "OFF", 28, TEXT, True, "center")
+            # HUD values share one consistent type scale; the labels and
+            # icons remain visually distinct without looking like data.
+            text(1100, 173, "ON" if self.motor else "OFF", 24, TEXT, True, "center")
             head_state = self.head_var.get()
             # Keep the state label left and the animated motion cue right so
             # IN/OUT remains readable alongside the working chevrons.
-            text(1044, 319, head_state, 28, TEXT, True, "w", tag="hud_head_state")
+            text(1044, 317, head_state, 24, TEXT, True, "w", tag="hud_head_state")
             if head_state in ("IN", "OUT"):
                 draw_head_motion(time.monotonic())
-            wp_color = ACCENT if self.hud_write_protect_label() in ("WRITABLE", "FORCES WRITABLE") else OFFLINE
-            text(1133, 469, "W/O", 36, wp_color, True, "center")
-            text(1133, 619, "▶", 42, ACCENT if self.ub3.get() else MUTED, True, "center")
+            # Red W/O is reserved for the active Controller override. The
+            # line below continues to report the physical disk sensor state.
+            wp_color = OFFLINE if self._confirmed_writable else ACCENT
+            text(1138, 460, "W/O", 24, wp_color, True, "center", tag="hud_wp_override")
+            text(1138, 504, self.physical_disk_write_status(), 14, TEXT, True, "center", tag="hud_disk_status")
+            text(1133, 608, "▶", 58, ACCENT if self.ub3.get() else MUTED, True, "center")
             telemetry_label = "TELEMETRY ON" if self._hud_telemetry_enabled else "TELEMETRY WAITING"
-            text(24, 710, f"SHOWING {self.hud_scroll_index + 1}–{min(self.hud_scroll_index + 6, len(cards))} OF {len(cards)} · {telemetry_label} · P1–P6 PINNED · ? HELP", 14, ACCENT, True)
+            text(24, 698, f"SHOWING {self.hud_scroll_index + 1}–{min(self.hud_scroll_index + 6, len(cards))} OF {len(cards)} · {telemetry_label} · P1–P6 PINNED · ? HELP", 14, ACCENT, True)
             if self.hud_help_card:
                 card = next((entry for entry in cards if entry["id"] == self.hud_help_card), None)
                 if card:
@@ -1678,6 +1728,37 @@ class TouchSimulator(tk.Tk):
                     text(156, 260, str(card["title"]).upper(), 24, TEXT, True)
                     text(156, 310, str(card["help"]), 18, MUTED, False)
                     text(156, 386, "SOURCE: PASSIVE DRIVEHUD TELEMETRY · TAP ANYWHERE TO CLOSE", 15, ACCENT, True)
+                    if card["id"] == "capture_health":
+                        # Health counters are displayed relative to a local
+                        # baseline, so Clear starts a fresh diagnostic window
+                        # without transmitting anything to the drive.
+                        canvas.create_rectangle(888*sx, 430*sy, 1054*sx, 466*sy, fill=PANEL_ALT, outline=ACCENT)
+                        text(971, 448, "CLEAR DROPS", 14, TEXT, True, "center")
+            if self.priority_prompt_card:
+                card = next((entry for entry in cards if entry["id"] == self.priority_prompt_card), None)
+                canvas.create_rectangle(330*sx, 152*sy, 950*sx, 570*sy, fill=BG, outline=ACCENT, width=max(1, round(2*sy)))
+                text(640, 188, "SET DISPLAY PRIORITY", 22, TEXT, True, "center")
+                text(640, 218, str(card["title"]).upper() if card else "CARD", 15, MUTED, True, "center")
+                shown_value = self.priority_prompt_value or "—"
+                # Keep the selected value clearly separated from the first
+                # keypad row while retaining the balanced modal layout.
+                text(640, 252, shown_value, 36, ACCENT, True, "center")
+                # Digits are deliberately large touch targets. Two digits
+                # permit priorities 0–99 and duplicate values are allowed.
+                for row, digits in enumerate((("1", "2", "3"), ("4", "5", "6"), ("7", "8", "9"))):
+                    for column, digit in enumerate(digits):
+                        x1, y1 = 424 + column * 150, 288 + row * 58
+                        canvas.create_rectangle(x1*sx, y1*sy, (x1 + 132)*sx, (y1 + 46)*sy, fill=PANEL_ALT, outline=ACCENT)
+                        text(x1 + 66, y1 + 23, digit, 20, TEXT, True, "center")
+                canvas.create_rectangle(574*sx, 462*sy, 706*sx, 508*sy, fill=PANEL_ALT, outline=ACCENT)
+                text(640, 485, "0", 20, TEXT, True, "center")
+                for x1, label, fill, foreground in (
+                    (424, "CLEAR", PANEL_ALT, TEXT),
+                    (574, "CLOSE", PANEL_ALT, TEXT),
+                    (724, "ENTER", ACCENT, BG),
+                ):
+                    canvas.create_rectangle(x1*sx, 522*sy, (x1 + 132)*sx, 558*sy, fill=fill, outline=ACCENT)
+                    text(x1 + 66, 540, label, 15, foreground, True, "center")
         elif self.preview_page == "diagnostics":
             text(26, 76, "Drive Diagnostics · passive measurements", 16, MUTED)
             box(24, 96, 420, 244, "Mechanical Position")
@@ -1927,10 +2008,7 @@ class TouchSimulator(tk.Tk):
             canvas.create_rectangle(24*sx, 632*sy, 1256*sx, 710*sy, fill=PANEL_ALT, outline="")
         # Deliberately large touch targets.  Only offer a destination that is
         # actually installed: the compact UI should never expose a dead tab.
-        if self.preview_page == "hud" and self.ub3.get():
-            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
-            text(184, 671, "CONTROL", 17, TEXT, True, "center")
-        elif self.preview_page == "diagnostics":
+        if self.preview_page == "diagnostics":
             canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
             text(184, 671, "HUD", 17, TEXT, True, "center")
             if self.ub3.get():
@@ -2184,7 +2262,33 @@ class TouchSimulator(tk.Tk):
                     self.write_protect_prompt = None
                 self.open_size_preview()
                 return
+            if self.preview_page == "hud" and self.priority_prompt_card is not None:
+                selected_digit: str | None = None
+                for row, digits in enumerate((("1", "2", "3"), ("4", "5", "6"), ("7", "8", "9"))):
+                    for column, digit in enumerate(digits):
+                        x1, y1 = 424 + column * 150, 288 + row * 58
+                        if x1 <= x <= x1 + 132 and y1 <= y <= y1 + 46:
+                            selected_digit = digit
+                if 574 <= x <= 706 and 462 <= y <= 508:
+                    selected_digit = "0"
+                if selected_digit is not None and len(self.priority_prompt_value) < 2:
+                    self.priority_prompt_value += selected_digit
+                elif 424 <= x <= 556 and 522 <= y <= 558:
+                    self.priority_prompt_value = ""
+                elif 574 <= x <= 706 and 522 <= y <= 558:
+                    self.priority_prompt_card = None
+                    self.priority_prompt_value = ""
+                elif 724 <= x <= 856 and 522 <= y <= 558:
+                    if self.priority_prompt_value:
+                        self.hud_card_priorities[self.priority_prompt_card] = int(self.priority_prompt_value)
+                        self.hud_scroll_index = 0
+                    self.priority_prompt_card = None
+                    self.priority_prompt_value = ""
+                self.open_size_preview()
+                return
             if self.preview_page == "hud" and self.hud_help_card is not None:
+                if self.hud_help_card == "capture_health" and 888 <= x <= 1054 and 430 <= y <= 466:
+                    self.clear_diagnostic_drops()
                 self.hud_help_card = None
                 self.open_size_preview()
                 return
@@ -2249,23 +2353,36 @@ class TouchSimulator(tk.Tk):
                 self.preview_page = "control"
                 self.open_size_preview()
                 return
-            elif self.preview_page == "hud" and 1020 <= x <= 1256 and 546 <= y <= 692:
+            elif self.preview_page == "hud" and 1020 <= x <= 1256 and 532 <= y <= 672:
                 if self.ub3.get():
                     self.preview_page = "control"
                 else:
                     self.usb_status.set("Controller is not connected.")
                 self.open_size_preview()
                 return
-            elif self.preview_page == "hud" and 24 <= x <= 1006 and 96 <= y <= 692:
+            elif self.preview_page == "hud" and 934 <= x <= 1006:
+                if 100 <= y <= 240:
+                    self.scroll_hud_by(-5)
+                elif 244 <= y <= 384:
+                    self.scroll_hud_by(-1)
+                elif 388 <= y <= 528:
+                    self.scroll_hud_by(1)
+                elif 532 <= y <= 672:
+                    self.scroll_hud_by(5)
+                self.open_size_preview()
+                return
+            elif self.preview_page == "hud" and 24 <= x <= 920 and 100 <= y <= 672:
                 visible = self.scroll_hud_cards()[self.hud_scroll_index:self.hud_scroll_index + 6]
-                index = int((y - 96) // 100)
+                index = int((y - 100) // 96)
                 if 0 <= index < len(visible):
                     card = visible[index]
-                    row_y = 96 + index * 100
-                    if 854 <= x <= 912 and row_y + 26 <= y <= row_y + 70:
+                    row_y = 100 + index * 96
+                    if 746 <= x <= 818 and row_y + 14 <= y <= row_y + 78:
                         self.hud_help_card = str(card["id"])
-                    elif 924 <= x <= 982 and row_y + 26 <= y <= row_y + 70:
-                        self.cycle_hud_card_priority(str(card["id"]))
+                    elif 826 <= x <= 908 and row_y + 14 <= y <= row_y + 78:
+                        self.priority_prompt_card = str(card["id"])
+                        priority = card["priority"]
+                        self.priority_prompt_value = str(priority) if priority is not None else ""
                     self.open_size_preview()
                     return
             elif self.preview_page == "diagnostics" and 284 <= x <= 396 and 434 <= y <= 466:
