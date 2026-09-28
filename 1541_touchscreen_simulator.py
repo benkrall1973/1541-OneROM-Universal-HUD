@@ -11,6 +11,7 @@ import time
 import math
 import colorsys
 import re
+import os
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
@@ -20,7 +21,7 @@ from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discove
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.8"
+APP_VERSION = "V0.0.9"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -34,6 +35,7 @@ HUD_PRIORITY_LEFT, HUD_PRIORITY_RIGHT = 1036, 1110
 # before Priority, while remaining wide enough for its full safety label.
 HUD_OVERRIDE_LEFT, HUD_OVERRIDE_RIGHT = 720, 944
 HUD_SCROLL_LEFT, HUD_SCROLL_RIGHT = 1150, 1256
+CONTROL_REPLY_TIMEOUT_MS = 3000
 # The FIFO has 1,026 virtual pixels from x=230 to the card's right edge.
 # 31 "88" entries plus their 30 separators are 92 fixed-width glyphs; at
 # the 18px Cascadia Mono HUD font that leaves a safe right-hand margin.
@@ -81,6 +83,19 @@ DEFAULT_HUD_CARD_PRIORITIES = {
     "write_protect": 5,
     "density": 6,
     "sync_per_rev": 7,
+    # Every available card is persisted, even when it starts unpinned. That
+    # makes P– an explicit user-editable state rather than an absent setting.
+    "physical_header": None,
+    "sector_coverage": None,
+    "capture_health": None,
+    "disk_identity": None,
+    "header_rate": None,
+    "capture_rate": None,
+    "sync_rate": None,
+    "mechanism": None,
+    "recent_evidence": None,
+    "startup_rom": None,
+    "boot_iec": None,
 }
 
 
@@ -99,7 +114,12 @@ class TouchSimulator(tk.Tk):
         # Desktop-only layout aid: exposes the optional Control OneROM UI
         # without pretending there is a serial connection.  It is never used
         # by discovery, telemetry, command dispatch, or drive calculations.
-        self.controller_gui_preview = True
+        # Preview is explicit and defaults on only for the Windows design
+        # host. Production/Pi deployments default to real hardware state;
+        # ONEROM_PREVIEW=1 can deliberately re-enable preview there.
+        self.controller_gui_preview = os.environ.get(
+            "ONEROM_PREVIEW", "1" if os.name == "nt" else "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         # These mirror the optional Control OneROM capabilities selected in
         # the board's configuration JSON at compile time.  The touchscreen may
         # show only the controls the finished Control OneROM actually supports.
@@ -166,7 +186,7 @@ class TouchSimulator(tk.Tk):
         self.live_protected: bool | None = None
         self.live_writing: bool | None = None
         self._writing_display_until = 0.0
-        self.live_rpm: float | None = None
+        self.firmware_rpm: float | None = None
         self.live_sector: int | None = None
         self.live_sync_count: int | None = None
         self.last_stable_rpm: float | None = None
@@ -202,6 +222,7 @@ class TouchSimulator(tk.Tk):
         # being queued from an explicit reply received over the CDC link.
         self.controller_card_feedback: dict[str, str] = {}
         self._pending_controller_card: str | None = None
+        self._controller_transactions: dict[str, str] = {}
         self.controller_wp_available: bool | None = None
         self._pending_wp_override: bool | None = None
         self._wp_pending_state: bool | None = None
@@ -223,6 +244,7 @@ class TouchSimulator(tk.Tk):
         self._hud_redraw_after: str | None = None
         self.hud_card_priorities: dict[str, int | None] = dict(DEFAULT_HUD_CARD_PRIORITIES)
         self.load_saved_hud_priorities()
+        self.save_hud_priorities()
 
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -450,6 +472,8 @@ class TouchSimulator(tk.Tk):
             drive_id="1541 Drive",
             controller_serial=self.controller_serial.get().strip(),
             hud_serial=self.hud_serial.get().strip(),
+            appearance=dict(self.drive_binding.appearance),
+            priorities=dict(self.drive_binding.priorities),
         )
         try:
             if selected_role == "controller" and binding.controller_serial and binding.controller_serial == binding.hud_serial:
@@ -472,6 +496,8 @@ class TouchSimulator(tk.Tk):
                     continue
                 if existing is not None:
                     existing.close()
+                if role == "hud":
+                    self.reset_monitor_state()
                 link = CdcBoardLink(board)
                 link.open()
                 self.usb_links[role] = link
@@ -522,6 +548,8 @@ class TouchSimulator(tk.Tk):
         link = self.usb_links.pop(role, None)
         if link is not None:
             link.close()
+        if role == "hud":
+            self.reset_monitor_state()
         if role == "controller":
             self.controller_serial.set("")
         else:
@@ -530,6 +558,8 @@ class TouchSimulator(tk.Tk):
             drive_id="1541 Drive",
             controller_serial=self.controller_serial.get().strip(),
             hud_serial=self.hud_serial.get().strip(),
+            appearance=dict(self.drive_binding.appearance),
+            priorities=dict(self.drive_binding.priorities),
         )
         save_binding(self.binding_path, self.drive_binding)
         self.ub3.set("controller" in self.usb_links)
@@ -538,6 +568,49 @@ class TouchSimulator(tk.Tk):
         self.usb_status.set(f"{role_name} binding released. The other OneROM role was left unchanged.")
         self.append_usb_log("SYSTEM", self.usb_status.get())
         self.apply_device_state()
+
+    def reset_monitor_state(self) -> None:
+        """Invalidate every passive reading when its physical CDC session changes."""
+        self.telemetry_parser = DriveTelemetryParser()
+        self.live_track = "--.-"
+        self.live_density = None
+        self.live_protected = None
+        self.live_writing = None
+        self._writing_display_until = 0.0
+        self.firmware_rpm = None
+        self.live_sector = None
+        self.live_sync_count = None
+        self.motor = False
+        self.head_direction = "PARK"
+        self.last_stable_rpm = None
+        self.rpm_samples.clear()
+        self.recent_sectors.clear()
+        self._fifo_track = None
+        self.last_header_track = None
+        self.write_pulse_count = 0
+        self.phase_event_count = 0
+        self.activity_history.clear()
+        self.capture_count = None
+        self.ring_overrun = None
+        self.queue_overflow = None
+        self.capture_rate = None
+        self._capture_rate_count = None
+        self._capture_rate_time = None
+        self.header_timestamps.clear()
+        self.header_valid_count = 0
+        self.header_invalid_count = 0
+        self.health_ring_overrun_baseline = 0
+        self.health_queue_overflow_baseline = 0
+        self.clear_disk_identity()
+        self._hud_subscription_mask = None
+        self._hud_telemetry_enabled = False
+        for name, value in (
+            ("track_var", "--.-"), ("motor_var", "OFF"),
+            ("rpm_var", "--.--"), ("sector_var", "--"), ("head_var", "PARK"),
+        ):
+            variable = getattr(self, name, None)
+            if variable is not None:
+                variable.set(value)
 
     def poll_usb_telemetry(self) -> None:
         """Apply passive Monitor CDC telemetry without emitting control commands."""
@@ -552,14 +625,12 @@ class TouchSimulator(tk.Tk):
             # trimming high-rate headers: a seek can otherwise occur just
             # before the newest 96 records and lose its IN/OUT evidence.
             received_lines = link.read_lines()
-            first_tail_index = max(0, len(received_lines) - 96)
-            telemetry_lines = [
-                line for index, line in enumerate(received_lines)
-                if index >= first_tail_index
-                or line.startswith(("STATUS ", "STATE ", "TRACK_WRITE ", "PHASE ", "MOTOR "))
-            ]
-            for line in telemetry_lines:
-                self.append_usb_log("MONITOR", line)
+            # Process every complete CDC record. The visible history is
+            # intentionally throttled, never the measurement stream.
+            first_log_index = max(0, len(received_lines) - 96)
+            for index, line in enumerate(received_lines):
+                if index >= first_log_index:
+                    self.append_usb_log("MONITOR", line)
                 state = self.telemetry_parser.process(line)
                 changed = True
                 self.live_track = state.track
@@ -583,7 +654,7 @@ class TouchSimulator(tk.Tk):
                     if hasattr(self, "density_var"):
                         self.density_var.set(f"D{state.density}")
                 if state.rpm is not None:
-                    self.live_rpm = state.rpm
+                    self.firmware_rpm = state.rpm
                     self.rpm_var.set(f"{state.rpm:.2f}")
                 # The parser retains its last sector between CDC records.
                 # Promote it to the HUD only when this specific record is a
@@ -683,6 +754,7 @@ class TouchSimulator(tk.Tk):
                     self.open_size_preview()
         except Exception as exc:
             self._hud_subscription_mask = None
+            self.reset_monitor_state()
             self.record_serial_diagnostic("Monitor", link, exc)
             link.close()
             self.usb_links.pop("hud", None)
@@ -756,6 +828,8 @@ class TouchSimulator(tk.Tk):
                 self.schedule_role_reconnect(role)
                 return
             link = CdcBoardLink(board)
+            if role == "hud":
+                self.reset_monitor_state()
             link.open()
             self.usb_links[role] = link
             self.after(150, link.assert_dtr)
@@ -851,14 +925,14 @@ class TouchSimulator(tk.Tk):
 
     def disk_identity_label(self) -> str:
         if self.disk_id_mismatch:
-            return "ID MISMATCH"
+            return "ID CONFLICT"
         if self.confirmed_disk_id is not None:
             return f"ID {self.confirmed_disk_id[0]:02X} {self.confirmed_disk_id[1]:02X}"
         return "VERIFYING ID" if self.header_checksum_valid else "WAITING FOR ID"
 
     def disk_identity_detail(self) -> str:
         if self.disk_id_mismatch:
-            return "VALID HEADERS DISAGREE"
+            return "VALID HEADERS CONFLICT"
         if self.disk_id_reverify_pending and self.confirmed_disk_id is not None:
             return "LAST CONFIRMED · REVERIFYING"
         if self.header_checksum_valid is False:
@@ -912,11 +986,11 @@ class TouchSimulator(tk.Tk):
         if (
             not self.motor
             or self.live_sync_count is None
-            or self.live_rpm is None
-            or self.live_rpm <= 0
+            or self.firmware_rpm is None
+            or self.firmware_rpm <= 0
         ):
             return None, None, expected
-        estimate = self.live_sync_count * 60 / self.live_rpm
+        estimate = self.live_sync_count * 60 / self.firmware_rpm
         # Individual SYNC pulses are discrete.  The fraction belongs to the
         # one-second-window/RPM diagnostic, while the primary HUD value is
         # the nearest physical count per revolution.
@@ -935,10 +1009,11 @@ class TouchSimulator(tk.Tk):
     def rpm_quality_detail(self) -> str:
         if not self.motor:
             return "MOTOR OFF"
+        firmware = f" · FW {self.firmware_rpm:.2f}" if self.firmware_rpm is not None else ""
         if not self.rpm_samples:
-            return "MOTOR ON · ACQUIRING"
+            return f"MOTOR ON · SYNC ACQUIRING{firmware}"
         spread = max(self.rpm_samples) - min(self.rpm_samples)
-        return f"MOTOR ON · LOCKED ±{spread / 2:.2f}"
+        return f"MOTOR ON · SYNC ±{spread / 2:.2f}{firmware}"
 
     def capture_health_detail(self) -> tuple[str, str]:
         if self.capture_count is None:
@@ -1041,12 +1116,12 @@ class TouchSimulator(tk.Tk):
         history_first, history_second = self.diagnostic_history_lines()
         cards = [
             ("track", "Track / Position", self.live_track, f"HEADER Δ {offset:+.1f}" if offset is not None else "POSITION ESTIMATE · HEADER WAITING", "Position is estimated from observed target-track writes and phase transitions. A decoded physical header corrects that estimate. HEADER Δ is estimated position minus the latest physical header track; WAITING means no usable header has been decoded yet."),
-            ("rotation", "Motor Status", f"{rpm:.2f}" if rpm is not None else "--.--", self.rpm_quality_detail(), "RPM is derived as SYNC pulses per second × 60 ÷ expected SYNC marks per revolution. Expected marks are D3=42, D2=38, D1=36, D0=34. Readings outside 240–360 RPM are rejected; the platter arrows appear only while motor telemetry is ON."),
+            ("rotation", "Motor Status", f"{rpm:.2f}" if rpm is not None else "--.--", self.rpm_quality_detail(), "Primary RPM is SYNC-derived: pulses per second × 60 ÷ expected SYNC marks per revolution. Expected marks are D3=42, D2=38, D1=36, D0=34. FW is the firmware-reported RPM used independently by SYNC / Revolution. Readings outside 240–360 RPM are rejected; the platter arrows appear only while motor telemetry is ON."),
             ("activity", "Activity", self.disk_activity_label(), f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", "WRITING is an observed write-gate pulse. Otherwise a spinning disk is shown as READING; OFF means motor telemetry is off. WRITE PULSES and STEPS are cumulative observations since this Monitor connection began, not DOS file-operation counts."),
             ("physical_header", "Physical Header", header, "CONFIRMED HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER", "This is the newest decoded on-disk GCR header: physical track and sector, not a software estimate. It clears after a seek or motor stop because that old header would no longer describe the current head location."),
             ("sector_coverage", "Sector Coverage", coverage, f"D{self.live_density} ZONE" if self.live_density is not None else "DENSITY UNKNOWN", "Counts unique sector numbers decoded on the current track observation window. Normal drive activity does not read every sector, so incomplete coverage is not a bad-sector report. Expected sectors are D3=21, D2=19, D1=18, D0=17."),
             ("capture_health", "Capture Health", capture, f"CAP {self.capture_count} · ROV {ring_overrun} · QOV {queue_overflow}" if self.capture_count is not None else "STATUS PENDING", "CAP is the firmware capture count. ROV is raw capture-ring overrun; QOV is diagnostic queue overflow. DROPS is ROV + QOV since the last local Clear Drops action. Clearing changes only this display baseline, never firmware counters or telemetry."),
-            ("disk_identity", "Disk Identity", self.disk_identity_label(), self.header_validation_detail(), "Disk ID is accepted only after two matching, checksum-valid physical headers. VERIFYING means more evidence is needed; ID MISMATCH means valid headers disagreed. This validates header metadata only and does not inspect the DOS directory or files."),
+            ("disk_identity", "Disk Identity", self.disk_identity_label(), self.header_validation_detail(), "Disk ID is accepted only after two matching, checksum-valid physical headers. VERIFYING means more evidence is needed; ID CONFLICT means valid headers disagreed. This validates header metadata only and does not inspect the DOS directory or files."),
             ("density", "Density Zone", f"D{self.live_density}" if self.live_density is not None else "--", f"EXPECTED {sync_expected} SYNC / REV" if sync_expected else "WAITING FOR DENSITY", "Density is inferred from Monitor timing/header telemetry. It selects the expected sector and SYNC geometry used by coverage and RPM calculations: D3=42, D2=38, D1=36, D0=34 SYNC marks per revolution."),
             ("head", "Head", self.head_var.get(), f"POSITION {self.live_track} · {self.phase_event_count} STEPS", "IN means track/phase evidence moved toward higher tracks; OUT means lower tracks. STALL means the motor is running with no target or phase movement for 0.8 seconds. PARK means motor telemetry is off. Position remains an estimate until a physical header confirms it."),
             ("header_rate", "Header Rate", f"{header_rate:.1f}/S" if header_rate is not None else "WAITING", "Rate of checksum-decoded physical headers over a rolling five-second window. It is a passive observation rate, not a guarantee of disk health. WAITING means fewer than two valid header timestamps are available."),
@@ -1103,11 +1178,16 @@ class TouchSimulator(tk.Tk):
 
     def dashboard_connection_status(self) -> tuple[str, str]:
         """Describe actual board connections without mistaking preview for USB."""
-        hud = "MONITOR ONEROM: CONNECTED" if self.ub4.get() else "MONITOR ONEROM: OFFLINE"
+        hud = (
+            "MONITOR: CONNECTED" if self.ub4.get() else
+            "MONITOR: ASSIGNED / OFFLINE" if self.drive_binding.hud_serial else
+            "MONITOR: UNASSIGNED"
+        )
         controller = (
-            "CONTROL ONEROM: CONNECTED" if self.ub3.get() else
-            "CONTROL ONEROM: PREVIEW" if self.controller_gui_preview else
-            "CONTROL ONEROM: OFFLINE"
+            "CONTROL: CONNECTED" if self.ub3.get() else
+            "CONTROL: ASSIGNED / OFFLINE" if self.drive_binding.controller_serial else
+            "CONTROL: PREVIEW" if self.controller_gui_preview else
+            "CONTROL: UNASSIGNED"
         )
         color = ACCENT if self.ub4.get() and self.ub3.get() else MUTED
         return f"{hud} · {controller}", color
@@ -1223,19 +1303,13 @@ class TouchSimulator(tk.Tk):
 
     def update_live_hud_fields(self) -> None:
         """Update existing Monitor Canvas items without rebuilding the screen."""
-        if self.preview_page not in ("hud", "diagnostics", "diagnostics_detail"):
+        if self.preview_page != "hud":
             return
         preview = getattr(self, "preview", None)
         canvas = getattr(self, "preview_canvas", None)
         if preview is None or canvas is None or not preview.winfo_exists():
             return
         try:
-            if self.preview_page == "diagnostics":
-                self.update_live_diagnostics_fields(canvas)
-                return
-            if self.preview_page == "diagnostics_detail":
-                self.update_system_diagnostics_fields(canvas)
-                return
             # Only configure canvas tags for visible cards. Updating every
             # hidden card on every CDC batch is pointless work and was one
             # contributor to the old slow/frozen-looking display behavior.
@@ -1260,60 +1334,6 @@ class TouchSimulator(tk.Tk):
         except tk.TclError:
             # The screen may have changed between CDC receive and paint.
             pass
-
-    def update_live_diagnostics_fields(self, canvas: tk.Canvas) -> None:
-        """Refresh the Diagnostics cards without rebuilding the canvas."""
-        offset = self.header_offset()
-        header = (
-            f"T{self.last_header_track:02d} S{self.live_sector:02d}"
-            if self.last_header_track is not None and self.live_sector is not None else "WAITING"
-        )
-        expected = self.expected_sector_count()
-        coverage = f"SEEN {len(set(self.recent_sectors))}/{expected}" if expected else "WAITING"
-        rpm = self.effective_rpm()
-        capture, capture_color = self.capture_health_detail()
-        canvas.itemconfigure("diag_position", text=self.live_track)
-        canvas.itemconfigure(
-            "diag_offset",
-            text=f"PHASE ESTIMATE · HEADER Δ {offset:+.1f}" if offset is not None else "PHASE ESTIMATE · HEADER WAITING",
-        )
-        canvas.itemconfigure("diag_header", text=header)
-        canvas.itemconfigure("diag_header_detail", text="PHYSICAL HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER")
-        canvas.itemconfigure("diag_rpm", text=f"{rpm:.2f}" if rpm is not None else "--.--")
-        sync_detail = f"SYNC {self.live_sync_count}/S" if self.live_sync_count is not None else "SYNC WAITING"
-        canvas.itemconfigure("diag_rpm_detail", text=f"{self.rpm_quality_detail()} · {sync_detail}")
-        canvas.itemconfigure("diag_coverage", text=coverage)
-        canvas.itemconfigure("diag_coverage_detail", text=f"D{self.live_density} ZONE" if self.live_density is not None else "DENSITY UNKNOWN")
-        canvas.itemconfigure("diag_activity", text=self.disk_activity_label())
-        canvas.itemconfigure("diag_activity_detail", text=f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}")
-        canvas.itemconfigure("diag_media", text=self.disk_identity_label())
-        canvas.itemconfigure("diag_capture", text=capture, fill=capture_color)
-        ring_overrun, queue_overflow = self.diagnostic_drop_counts()
-        canvas.itemconfigure("diag_capture_detail", text=(f"CAP {self.capture_count} · ROV {ring_overrun} · QOV {queue_overflow}" if self.capture_count is not None else "STATUS PENDING"))
-        history_first, history_second = self.diagnostic_history_lines()
-        canvas.itemconfigure("diag_history", text=history_first)
-        canvas.itemconfigure("diag_history_2", text=history_second)
-
-    def update_system_diagnostics_fields(self, canvas: tk.Canvas) -> None:
-        """Refresh the deeper passive-measurement page from current telemetry."""
-        rate = self.header_rate()
-        rpm = self.effective_rpm()
-        spread = (max(self.rpm_samples) - min(self.rpm_samples)) if len(self.rpm_samples) > 1 else None
-        capture, capture_color = self.capture_health_detail()
-        ring_overrun, queue_overflow = self.diagnostic_drop_counts()
-        history_first, history_second = self.diagnostic_history_lines()
-        canvas.itemconfigure("sys_capture_rate", text=(f"{self.capture_rate / 1000:.0f}K/S" if self.capture_rate is not None else "WAITING"))
-        canvas.itemconfigure("sys_header_rate", text=(f"{rate:.1f}/S" if rate is not None else "WAITING"))
-        canvas.itemconfigure("sys_rotation", text=(f"{rpm:.2f}" if rpm is not None else "--.--"))
-        canvas.itemconfigure("sys_rotation_detail", text=(f"±{spread / 2:.2f} RPM · SYNC {self.live_sync_count}/S" if spread is not None and self.live_sync_count is not None else self.rpm_quality_detail()))
-        canvas.itemconfigure("sys_mechanism", text=f"{self.phase_event_count} STEPS")
-        canvas.itemconfigure("sys_mechanism_detail", text=f"{self.head_var.get()} · POSITION {self.live_track}")
-        canvas.itemconfigure("sys_media", text=self.disk_identity_label())
-        canvas.itemconfigure("sys_media_detail", text=self.header_validation_detail())
-        canvas.itemconfigure("sys_health", text=capture, fill=capture_color)
-        canvas.itemconfigure("sys_health_detail", text=(f"ROV {ring_overrun} · QOV {queue_overflow} · CAP {self.capture_count}" if self.capture_count is not None else "STATUS PENDING"))
-        canvas.itemconfigure("sys_history", text=history_first)
-        canvas.itemconfigure("sys_history_2", text=history_second)
 
     def schedule_write_protect_update(self, protected: bool) -> None:
         """Apply the proven GUI-only 250 ms last-event-wins WP debounce."""
@@ -1392,6 +1412,7 @@ class TouchSimulator(tk.Tk):
             self.send_controller_command(f"ROMSET={slot}")
             self.rom_var.set(choice)
             self._pending_controller_card = "startup_rom"
+            self.begin_controller_transaction("startup_rom")
             self.controller_card_feedback["startup_rom"] = "SENT · WAITING FOR CONFIRMATION"
             self.control_status.set(f"Startup ROM slot {slot} sent to the connected Control OneROM.")
         except Exception as exc:
@@ -1408,6 +1429,7 @@ class TouchSimulator(tk.Tk):
             self.send_controller_command(f"ROMIEC={address}")
             self.iec_var.set(choice)
             self._pending_controller_card = "boot_iec"
+            self.begin_controller_transaction("boot_iec")
             self.controller_card_feedback["boot_iec"] = "SENT · WAITING FOR CONFIRMATION"
             self.control_status.set(f"Boot IEC address {address} sent to the connected Control OneROM.")
         except Exception as exc:
@@ -1422,20 +1444,20 @@ class TouchSimulator(tk.Tk):
         upper = line.upper()
         card_id = (
             "startup_rom" if "ROMSET" in upper else
-            "boot_iec" if "ROMIEC" in upper else self._pending_controller_card
+            "boot_iec" if "ROMIEC" in upper else None
         )
-        if card_id is None:
+        if card_id is None or card_id not in self._controller_transactions:
             return False
         if ",OK," in upper or upper.endswith(",OK"):
             self.controller_card_feedback[card_id] = "CONFIRMED BY CONTROL ONEROM"
             self.control_status.set(f"Control OneROM confirmed {card_id.replace('_', ' ')}.")
-            self._pending_controller_card = None
         elif ",FAIL" in upper or ",ERROR," in upper:
             self.controller_card_feedback[card_id] = "CONTROL ONEROM REJECTED SAVE"
             self.control_status.set(f"Control OneROM rejected {card_id.replace('_', ' ')}.")
-            self._pending_controller_card = None
         else:
             return False
+        self.finish_controller_transaction(card_id)
+        self._pending_controller_card = None
         self._hud_dirty = True
         self.update_live_hud_fields()
         return True
@@ -1445,6 +1467,7 @@ class TouchSimulator(tk.Tk):
         try:
             self.send_controller_command("ROMWP=ON" if desired else "ROMWP=OFF")
             self._pending_wp_override = desired
+            self.begin_controller_transaction("write_protect")
             self.control_status.set("Verifying X2 write-protect override…")
         except Exception as exc:
             self.writable.set(self._confirmed_writable)
@@ -1495,6 +1518,39 @@ class TouchSimulator(tk.Tk):
             self.writable.set(self._confirmed_writable)
             self.control_status.set(f"Control OneROM did not verify X2 override: {line}")
         self._pending_wp_override = None
+        self.finish_controller_transaction("write_protect")
+        self.update_live_hud_fields()
+
+    def begin_controller_transaction(self, card_id: str) -> None:
+        """Start a bounded UI transaction for one explicit Control command."""
+        self.finish_controller_transaction(card_id)
+        self._controller_transactions[card_id] = self.after(
+            CONTROL_REPLY_TIMEOUT_MS,
+            lambda current=card_id: self.controller_transaction_timeout(current),
+        )
+
+    def finish_controller_transaction(self, card_id: str) -> None:
+        """Cancel a transaction timer once its matching reply is received."""
+        after_id = self._controller_transactions.pop(card_id, None)
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+
+    def controller_transaction_timeout(self, card_id: str) -> None:
+        """Make missing Control replies visible instead of waiting forever."""
+        if self._controller_transactions.pop(card_id, None) is None:
+            return
+        if card_id == "write_protect":
+            self._pending_wp_override = None
+            self.writable.set(self._confirmed_writable)
+        if self._pending_controller_card == card_id:
+            self._pending_controller_card = None
+        self.controller_card_feedback[card_id] = "CONTROL RESPONSE TIMEOUT"
+        self.control_status.set(f"Control OneROM response timeout: {card_id.replace('_', ' ')}.")
+        self.append_usb_log("CONTROL", self.control_status.get())
+        self._hud_dirty = True
         self.update_live_hud_fields()
 
     def send_controller_command(self, command: str) -> None:
@@ -1506,6 +1562,10 @@ class TouchSimulator(tk.Tk):
 
     def confirm_write_protect_toggle(self) -> None:
         """Show an in-display confirmation before changing it through UB3."""
+        if self._controller_transactions:
+            self.control_status.set("Waiting for the prior Control OneROM confirmation.")
+            self.open_size_preview()
+            return
         if not self.controller_preview_available():
             self.control_status.set("Write-protect control unavailable: Control OneROM is disconnected.")
             self.open_size_preview()
@@ -1565,6 +1625,10 @@ class TouchSimulator(tk.Tk):
 
     def choose_dashboard_control(self, card_id: str, event) -> None:
         """Open the appropriate compact menu for a Control OneROM dashboard card."""
+        if self._controller_transactions:
+            self.control_status.set("Waiting for the prior Control OneROM confirmation.")
+            self.open_size_preview()
+            return
         if card_id == "startup_rom":
             self.choose_from_menu(
                 event, self.rom_choices, self.rom_choice,
@@ -1724,7 +1788,7 @@ class TouchSimulator(tk.Tk):
             return
         if self.preview_page == "control":
             self.preview_page = "hud" if self.hud_preview_available() else "setup"
-        elif self.preview_page in ("hud", "diagnostics") and not self.hud_preview_available():
+        elif self.preview_page == "hud" and not self.hud_preview_available():
             self.preview_page = "setup"
         elif self.preview_page == "setup" and self.hud_preview_available():
             self.preview_page = "hud"
@@ -2005,86 +2069,6 @@ class TouchSimulator(tk.Tk):
                 ):
                     canvas.create_rectangle(x1*sx, 522*sy, (x1 + 132)*sx, 558*sy, fill=fill, outline=ACCENT)
                     text(x1 + 66, 540, label, 15, foreground, True, "center")
-        elif self.preview_page == "diagnostics":
-            text(26, 76, "Drive Diagnostics · passive measurements", 16, MUTED)
-            box(24, 96, 420, 244, "Mechanical Position")
-            canvas.create_text(50*sx, 172*sy, text=self.live_track, fill=TEXT, anchor="w",
-                               font=("Cascadia Mono", max(7, round(35*sy)), "normal"), tags="diag_position")
-            offset = self.header_offset()
-            text(50, 220, f"HEADER Δ {offset:+.1f}" if offset is not None else "HEADER WAITING", 15, MUTED, True, tag="diag_offset")
-            box(440, 96, 820, 244, "Physical Header")
-            header = f"T{self.last_header_track:02d} S{self.live_sector:02d}" if self.last_header_track is not None and self.live_sector is not None else "WAITING"
-            canvas.create_text(466*sx, 172*sy, text=header, fill=TEXT, anchor="w",
-                               font=("Cascadia Mono", max(7, round(35*sy)), "normal"), tags="diag_header")
-            text(466, 220, "PHYSICAL HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER", 15, MUTED, True, tag="diag_header_detail")
-            box(840, 96, 1256, 244, "Rotation")
-            displayed_rpm = self.effective_rpm()
-            canvas.create_text(866*sx, 172*sy, text=f"{displayed_rpm:.2f}" if displayed_rpm is not None else "--.--", fill=TEXT, anchor="w",
-                               font=("Cascadia Mono", max(7, round(35*sy)), "normal"), tags="diag_rpm")
-            text(866, 220, self.rpm_quality_detail(), 15, MUTED, True, tag="diag_rpm_detail")
-            box(24, 260, 420, 408, "Sector Coverage")
-            expected = self.expected_sector_count()
-            coverage = f"SEEN {len(set(self.recent_sectors))}/{expected}" if expected else "WAITING"
-            text(50, 336, coverage, 31, TEXT, True, tag="diag_coverage")
-            text(50, 384, f"D{self.live_density} ZONE" if self.live_density is not None else "DENSITY UNKNOWN", 15, MUTED, True, tag="diag_coverage_detail")
-            box(440, 260, 820, 408, "Activity")
-            text(466, 336, self.disk_activity_label(), 31, TEXT, True, tag="diag_activity")
-            text(466, 384, f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", 15, MUTED, True, tag="diag_activity_detail")
-            box(840, 260, 1256, 408, "Disk ID / System")
-            text(866, 336, self.disk_identity_label(), 35, TEXT, True, tag="diag_media")
-            text(866, 384, "TAP FOR SYSTEM DIAGNOSTICS", 14, ACCENT, True)
-            box(24, 424, 420, 572, "Monitor Health")
-            capture, capture_color = self.capture_health_detail()
-            text(50, 500, capture, 27, capture_color, True, tag="diag_capture")
-            # Keep the local diagnostic reset in the header band so it does
-            # not collide with long health states such as WAITING FOR STATUS.
-            canvas.create_rectangle(284*sx, 434*sy, 396*sx, 466*sy, fill=PANEL_ALT, outline=ACCENT)
-            text(340, 450, "CLEAR", 14, TEXT, True, "center")
-            ring_overrun, queue_overflow = self.diagnostic_drop_counts()
-            capture_detail = f"CAP {self.capture_count} · ROV {ring_overrun} · QOV {queue_overflow}" if self.capture_count is not None else "STATUS PENDING"
-            text(50, 548, capture_detail, 14, MUTED, True, tag="diag_capture_detail")
-            box(440, 424, 1256, 572, "Recent Evidence")
-            history_first, history_second = self.diagnostic_history_lines()
-            text(466, 486, history_first, 17, TEXT, True, tag="diag_history")
-            text(466, 516, history_second, 17, TEXT, True, tag="diag_history_2")
-            # Match every other card's lower-detail baseline: 24 virtual
-            # pixels above the lower edge of this 148-pixel-high card.
-            # This is a capability note, not an active fault; keep it quiet.
-            text(466, 548, "DOS ERROR / RETRY DATA UNAVAILABLE", 13, MUTED)
-            text(28, 612, self.hud_connection.get(), 16, ACCENT if self.ub4.get() else OFFLINE)
-        elif self.preview_page == "diagnostics_detail":
-            text(26, 76, "System Diagnostics · passive measurements", 16, MUTED)
-            box(24, 96, 420, 244, "Capture Rate")
-            text(50, 172, f"{self.capture_rate / 1000:.0f}K/S" if self.capture_rate is not None else "WAITING", 35, TEXT, True, tag="sys_capture_rate")
-            text(50, 220, "PASSIVE CAPTURE EVENTS PER SECOND", 15, MUTED, True)
-            box(440, 96, 820, 244, "Header Rate")
-            header_rate = self.header_rate()
-            text(466, 172, f"{header_rate:.1f}/S" if header_rate is not None else "WAITING", 35, TEXT, True, tag="sys_header_rate")
-            text(466, 220, "DECODED PHYSICAL HEADERS", 15, MUTED, True)
-            box(840, 96, 1256, 244, "Rotation Quality")
-            displayed_rpm = self.effective_rpm()
-            text(866, 172, f"{displayed_rpm:.2f}" if displayed_rpm is not None else "--.--", 35, TEXT, True, tag="sys_rotation")
-            text(866, 220, self.rpm_quality_detail(), 15, MUTED, True, tag="sys_rotation_detail")
-            box(24, 260, 420, 408, "Mechanism")
-            text(50, 336, f"{self.phase_event_count} STEPS", 31, TEXT, True, tag="sys_mechanism")
-            text(50, 384, f"{self.head_var.get()} · POSITION {self.live_track}", 15, MUTED, True, tag="sys_mechanism_detail")
-            box(440, 260, 820, 408, "Media Validation")
-            text(466, 336, self.disk_identity_label(), 31, TEXT, True, tag="sys_media")
-            text(466, 384, self.header_validation_detail(), 15, MUTED, True, tag="sys_media_detail")
-            box(840, 260, 1256, 408, "Capture Integrity")
-            capture, capture_color = self.capture_health_detail()
-            text(866, 336, capture, 31, capture_color, True, tag="sys_health")
-            ring_overrun, queue_overflow = self.diagnostic_drop_counts()
-            text(866, 384, f"ROV {ring_overrun} · QOV {queue_overflow}", 15, MUTED, True, tag="sys_health_detail")
-            box(24, 424, 420, 572, "Observability")
-            text(50, 500, "PASSIVE", 27, ACCENT, True)
-            text(50, 548, "DOS ERRORS / RETRIES NOT EXPOSED", 13, MUTED)
-            box(440, 424, 1256, 572, "Recent Evidence")
-            history_first, history_second = self.diagnostic_history_lines()
-            text(466, 486, history_first, 17, TEXT, True, tag="sys_history")
-            text(466, 516, history_second, 17, TEXT, True, tag="sys_history_2")
-            text(466, 548, "HEADER/RPM/STEP DATA FROM UB4 PASSIVE CAPTURE", 13, MUTED)
-            text(28, 612, self.hud_connection.get(), 16, ACCENT if self.ub4.get() else OFFLINE)
         elif self.preview_page == "settings":
             text(26, 76, "Settings", 16, MUTED)
             # Setup uses five full-width rows, matching the dashboard list.
@@ -2226,32 +2210,8 @@ class TouchSimulator(tk.Tk):
             text(50, 330, "Open Settings to connect the Control and Monitor OneROMs for this drive.", 18, MUTED)
         # Settings shares the HUD/log's slim y=672…720 footer instead of
         # reserving a separate button bar beneath its content.
-        if self.preview_page not in ("hud", "log", "settings", "controller_connection", "hud_connection"):
-            canvas.create_rectangle(24*sx, 632*sy, 1256*sx, 710*sy, fill=PANEL_ALT, outline="")
-        # Deliberately large touch targets.  Only offer a destination that is
-        # actually installed: the compact UI should never expose a dead tab.
-        if self.preview_page == "diagnostics":
-            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL_ALT, outline=ACCENT)
-            text(184, 671, "MONITOR", 17, TEXT, True, "center")
-        elif self.preview_page == "diagnostics_detail":
-            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL_ALT, outline=ACCENT)
-            text(184, 671, "MONITOR", 17, TEXT, True, "center")
-            canvas.create_rectangle(346*sx, 645*sy, 646*sx, 697*sy, fill=PANEL_ALT, outline=ACCENT)
-            text(496, 671, "DIAGNOSTICS", 17, TEXT, True, "center")
-        # USB diagnostics belong on Hardware Setup, not on the normal Monitor
-        # or Control OneROM operator screens.
-        if self.preview_page in ("diagnostics", "diagnostics_detail"):
-            # The status at the far right needs its own stable space.  Keep
-            # this deliberately short so it never encroaches on navigation.
-            # Left-align the footer descriptor with the available content
-            # lane immediately after Control, instead of floating mid-lane.
-            text(668, 680, "PASSIVE LIVE DATA", 15, MUTED, True)
         if self.preview_page == "hud":
             footer_status = "● Monitor connected"
-        elif self.preview_page == "diagnostics":
-            footer_status = "● Monitor diagnostics"
-        elif self.preview_page == "diagnostics_detail":
-            footer_status = "● Monitor system diagnostics"
         elif self.preview_page == "settings":
             footer_status = "● Hardware setup"
         elif self.preview_page in ("controller_connection", "hud_connection"):
@@ -2645,19 +2605,6 @@ class TouchSimulator(tk.Tk):
                         self.choose_dashboard_control(str(card["id"]), event)
                     self.open_size_preview()
                     return
-            elif self.preview_page == "diagnostics" and 284 <= x <= 396 and 434 <= y <= 466:
-                self.clear_diagnostic_drops()
-                return
-            elif self.preview_page == "diagnostics" and 840 <= x <= 1256 and 260 <= y <= 408:
-                self.preview_page = "diagnostics_detail"
-                self.open_size_preview()
-                return
-            elif self.preview_page == "diagnostics" and 645 <= y <= 697 and 34 <= x <= 334:
-                self.preview_page = "hud"
-            elif self.preview_page == "diagnostics_detail" and 645 <= y <= 697 and 34 <= x <= 334:
-                self.preview_page = "hud"
-            elif self.preview_page == "diagnostics_detail" and 645 <= y <= 697 and 346 <= x <= 646:
-                self.preview_page = "diagnostics"
             elif self.preview_page == "settings" and 270 <= x <= 830 and 614 <= y <= 639:
                 self.preview_scale.set(max(25, min(200, round(25 + ((x - 270) / 560) * 175))))
                 self.open_size_preview()

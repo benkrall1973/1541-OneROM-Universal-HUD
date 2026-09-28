@@ -133,6 +133,19 @@ class DriveBindingPersistenceTests(unittest.TestCase):
         self.assertEqual(loaded.appearance, {"background": "#112233", "accent": "#AABBCC"})
         self.assertEqual(loaded.priorities, {"track": 1, "capture_health": None, "sync_rate": 12})
 
+    def test_unknown_config_fields_do_not_discard_known_settings(self) -> None:
+        path = Path("onerom_drive_bindings.json")
+        payload = (
+            '{"version": 99, "controller_serial": "CONTROL-123", '
+            '"hud_serial": "MONITOR-456", "future_setting": true}'
+        )
+        with patch.object(Path, "read_text", return_value=payload):
+            loaded = load_binding(path)
+
+        self.assertEqual(loaded.version, 99)
+        self.assertEqual(loaded.controller_serial, "CONTROL-123")
+        self.assertEqual(loaded.hud_serial, "MONITOR-456")
+
 
 if __name__ == "__main__":
     unittest.main()

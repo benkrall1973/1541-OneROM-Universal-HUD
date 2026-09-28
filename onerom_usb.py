@@ -73,6 +73,7 @@ class BoardDescriptor:
 class DriveBinding:
     """One drive's OneROM role bindings and local display preferences."""
 
+    version: int = 2
     drive_id: str = "1541 Drive"
     controller_serial: str = ""
     hud_serial: str = ""
@@ -80,6 +81,8 @@ class DriveBinding:
     priorities: dict[str, int | None] = field(default_factory=dict)
 
     def validate(self) -> None:
+        if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version < 1:
+            raise ValueError("Binding configuration version must be a positive integer.")
         if self.controller_serial and self.controller_serial == self.hud_serial:
             raise ValueError("A OneROM serial can be assigned to only one role on a drive.")
         if not isinstance(self.appearance, dict):
@@ -143,7 +146,19 @@ def discover_cdc_boards() -> list[BoardDescriptor]:
 def load_binding(path: Path) -> DriveBinding:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        binding = DriveBinding(**raw)
+        if not isinstance(raw, dict):
+            raise ValueError("Binding configuration must be an object.")
+        # Read only known fields. Newer configurations can therefore retain
+        # harmless unknown data without making an older app discard every
+        # saved USB assignment and display preference.
+        binding = DriveBinding(
+            version=raw.get("version", 1),
+            drive_id=raw.get("drive_id", "1541 Drive"),
+            controller_serial=raw.get("controller_serial", ""),
+            hud_serial=raw.get("hud_serial", ""),
+            appearance=raw.get("appearance", {}),
+            priorities=raw.get("priorities", {}),
+        )
         binding.validate()
         return binding
     except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
