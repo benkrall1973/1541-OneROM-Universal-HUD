@@ -10,15 +10,30 @@ from __future__ import annotations
 import time
 import math
 import colorsys
+import re
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
+from tkinter import font as tkfont
 
 from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discover_cdc_boards, load_binding, save_binding
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.7"
+APP_VERSION = "V0.0.8"
+HUD_VISIBLE_CARD_COUNT = 5
+HUD_CARD_TOP = 100
+# Five rows exactly fill the same y=100…672 span as the four scroll
+# controls. The 4-pixel breathing room remains between adjacent cards.
+HUD_CARD_HEIGHT = 111.2
+HUD_CARD_PITCH = 115.2
+HUD_CARD_RIGHT = 1128
+HUD_HELP_LEFT, HUD_HELP_RIGHT = 954, 1026
+HUD_PRIORITY_LEFT, HUD_PRIORITY_RIGHT = 1036, 1110
+# The override action uses the same 10-pixel gap before Help as Help uses
+# before Priority, while remaining wide enough for its full safety label.
+HUD_OVERRIDE_LEFT, HUD_OVERRIDE_RIGHT = 720, 944
+HUD_SCROLL_LEFT, HUD_SCROLL_RIGHT = 1150, 1256
 # The FIFO has 1,026 virtual pixels from x=230 to the card's right edge.
 # 31 "88" entries plus their 30 separators are 92 fixed-width glyphs; at
 # the 18px Cascadia Mono HUD font that leaves a safe right-hand margin.
@@ -34,13 +49,38 @@ MUTED = "#a9bbc4"
 ACCENT = "#33c3a5"
 WARNING = "#f6c85f"
 OFFLINE = "#ef6b73"
+HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 COLOR_PALETTES = {
     "background": ("Background", ("#101820", "#07121d", "#1b1b1f", "#24303a", "#3b2b1e", "#142331", "#222b38", "#2d2638", "#f1e8d5", "#0c2227", "#15261a", "#2a1e26", "#303030", "#22314c", "#3c3322", "#132b3a", "#241d35", "#e7edf0")),
-    "group": ("Group / Card Boxes", ("#182632", "#203442", "#263945", "#2d3645", "#382f45", "#2e3c34", "#252525", "#3a3025", "#e6e6e6", "#24404a", "#2f4a37", "#4a3542", "#3b3b3b", "#34445b", "#4b4231", "#25495a", "#3e324f", "#f4f4f4")),
-    "button": ("Button Color", ("#33c3a5", "#ef6b73", "#4ea1ff", "#f6c85f", "#af7bff", "#59c36a", "#e77cb4", "#f08a4b", "#e9eef3", "#00a8a8", "#ff8c42", "#61dafb", "#ffcc4d", "#9370db", "#2ecc71", "#ff6b9a", "#ff7043", "#ffffff")),
-    "text1": ("Text 1 - Descriptions", ("#a9bbc4", "#d5e2e8", "#91b8d6", "#d4bc86", "#8acfc3", "#d4a8bf", "#b8c0ce", "#d8af82", "#f0f4f7", "#9fd3d6", "#c3d9bc", "#deb4cf", "#c8c8c8", "#b5c7e0", "#e1c59d", "#9ed1e6", "#cfb5e8", "#ffffff")),
-    "text2": ("Text 2 - Values", ("#eef6fa", "#ffffff", "#c9e4ff", "#ffdf8a", "#5eead4", "#f0b4da", "#d0d9e5", "#f1cfa5", "#dff8f4", "#bffff4", "#e5ffd7", "#ffd0e5", "#e4e4e4", "#d6e5ff", "#ffe1b8", "#c9efff", "#e7d3ff", "#ffffff")),
+    "card": ("Card Surface", ("#182632", "#203442", "#263945", "#2d3645", "#382f45", "#2e3c34", "#252525", "#3a3025", "#e6e6e6", "#24404a", "#2f4a37", "#4a3542", "#3b3b3b", "#34445b", "#4b4231", "#25495a", "#3e324f", "#f4f4f4")),
+    "button_surface": ("Button Surface", ("#203442", "#182632", "#263945", "#2d3645", "#382f45", "#2e3c34", "#252525", "#3a3025", "#24404a", "#2f4a37", "#4a3542", "#3b3b3b", "#34445b", "#4b4231", "#25495a", "#3e324f")),
+    "accent": ("Accent / Active", ("#33c3a5", "#ef6b73", "#4ea1ff", "#f6c85f", "#af7bff", "#59c36a", "#e77cb4", "#f08a4b", "#e9eef3", "#00a8a8", "#ff8c42", "#61dafb", "#ffcc4d", "#9370db", "#2ecc71", "#ff6b9a", "#ff7043", "#ffffff")),
+    "text_primary": ("Primary Text", ("#eef6fa", "#ffffff", "#c9e4ff", "#ffdf8a", "#5eead4", "#f0b4da", "#d0d9e5", "#f1cfa5", "#dff8f4", "#bffff4", "#e5ffd7", "#e4e4e4", "#d6e5ff", "#ffe1b8", "#c9efff", "#e7d3ff")),
+    "text_secondary": ("Secondary Text", ("#a9bbc4", "#d5e2e8", "#91b8d6", "#d4bc86", "#8acfc3", "#d4a8bf", "#b8c0ce", "#d8af82", "#f0f4f7", "#9fd3d6", "#c3d9bc", "#deb4cf", "#c8c8c8", "#b5c7e0", "#e1c59d", "#9ed1e6", "#cfb5e8", "#ffffff")),
+    "warning": ("Warning Text", ("#f6c85f", "#ffcc4d", "#ff8c42", "#f08a4b", "#ffdf8a", "#ffd166", "#ffb703", "#f4a261", "#e9c46a", "#f7b267")),
+    "offline": ("Offline / Error Text", ("#ef6b73", "#ff6b9a", "#ff7043", "#e77cb4", "#f08a4b", "#ff5c5c", "#ff8a8a", "#ff4d6d", "#d95d8a", "#ff9f1c")),
+}
+
+APPEARANCE_CHOICES = (
+    ("Background", "background"),
+    ("Card Surface", "card"),
+    ("Button Surface", "button_surface"),
+    ("Accent / Active", "accent"),
+    ("Primary Text", "text_primary"),
+    ("Secondary Text", "text_secondary"),
+    ("Warning Text", "warning"),
+    ("Offline / Error Text", "offline"),
+)
+APPEARANCE_TARGETS = frozenset(target for _label, target in APPEARANCE_CHOICES)
+DEFAULT_HUD_CARD_PRIORITIES = {
+    "track": 1,
+    "rotation": 2,
+    "head": 3,
+    "activity": 4,
+    "write_protect": 5,
+    "density": 6,
+    "sync_per_rev": 7,
 }
 
 
@@ -56,9 +96,13 @@ class TouchSimulator(tk.Tk):
         # are the only way to attach physical OneROMs to this drive.
         self.ub3 = tk.BooleanVar(value=False)
         self.ub4 = tk.BooleanVar(value=False)
-        # These mirror the optional controller capabilities selected in the
-        # board's configuration JSON at compile time.  The touchscreen may
-        # show only the controls the finished controller actually supports.
+        # Desktop-only layout aid: exposes the optional Control OneROM UI
+        # without pretending there is a serial connection.  It is never used
+        # by discovery, telemetry, command dispatch, or drive calculations.
+        self.controller_gui_preview = True
+        # These mirror the optional Control OneROM capabilities selected in
+        # the board's configuration JSON at compile time.  The touchscreen may
+        # show only the controls the finished Control OneROM actually supports.
         self.controller_rom_enabled = tk.BooleanVar(value=True)
         self.controller_iec_enabled = tk.BooleanVar(value=True)
         self.controller_wp_enabled = tk.BooleanVar(value=True)
@@ -75,6 +119,14 @@ class TouchSimulator(tk.Tk):
             "Slot 7 — ORIGINAL",
         )
         self.iec_choices = ("Device 8", "Device 9", "Device 10", "Device 11")
+        # These Control OneROM settings are rendered as dashboard cards. They
+        # used to be owned by the now-retired standalone Control page.
+        self.rom_var = tk.StringVar(value="Slot 2 — JIFFYDOS")
+        self.rom_choice = tk.StringVar(value="Slot 2 — JIFFYDOS")
+        self.iec_var = tk.StringVar(value="Device 8")
+        self.iec_choice = tk.StringVar(value="Device 8")
+        self.writable = tk.BooleanVar(value=False)
+        self.control_status = tk.StringVar()
         self.current_page = "hud"
         self.last_input = time.monotonic()
         self.screensaver = False
@@ -83,6 +135,11 @@ class TouchSimulator(tk.Tk):
         self.motor = False
         self.head_direction = "IN"
         self.write_protect_prompt: bool | None = None
+        self.clear_drops_prompt = False
+        # ROM and IEC selection is deliberately a two-step operation: a
+        # menu chooses the pending value, then an explicit confirmation is
+        # required before a Control OneROM command can be sent.
+        self.dashboard_setting_prompt: dict[str, str] | None = None
         self.color_picker: str | None = None
         self.popup_menu: dict | None = None
         self.appearance_target = "background"
@@ -95,6 +152,7 @@ class TouchSimulator(tk.Tk):
         except ValueError:
             # Never carry a corrupt historical duplicate assignment forward.
             self.drive_binding = DriveBinding(drive_id="1541 Drive")
+        self.apply_saved_appearance()
         self.controller_serial = tk.StringVar(value=self.drive_binding.controller_serial)
         self.hud_serial = tk.StringVar(value=self.drive_binding.hud_serial)
         self.usb_boards = {}
@@ -140,6 +198,10 @@ class TouchSimulator(tk.Tk):
         self.disk_id_reverify_pending = False
         self._hud_dirty = False
         self._confirmed_writable = False
+        # Per-card Control OneROM command feedback. This distinguishes a command
+        # being queued from an explicit reply received over the CDC link.
+        self.controller_card_feedback: dict[str, str] = {}
+        self._pending_controller_card: str | None = None
         self.controller_wp_available: bool | None = None
         self._pending_wp_override: bool | None = None
         self._wp_pending_state: bool | None = None
@@ -149,8 +211,9 @@ class TouchSimulator(tk.Tk):
         self.usb_log_lines: list[str] = []
         self.log_scroll = 0
         self.log_return_page = "settings"
-        # The passive HUD is an expandable card list.  Priorities 1–6 pin
-        # the default visible cards; unpinned diagnostics follow by name.
+        # The passive Monitor is an expandable card list. These operational
+        # measurements are the default first view; everything else follows
+        # as an unpinned diagnostic card.
         self.hud_scroll_index = 0
         self.hud_help_card: str | None = None
         self.priority_prompt_card: str | None = None
@@ -158,14 +221,8 @@ class TouchSimulator(tk.Tk):
         self._hud_subscription_mask: int | None = None
         self._hud_telemetry_enabled = False
         self._hud_redraw_after: str | None = None
-        self.hud_card_priorities: dict[str, int | None] = {
-            "track": 1,
-            "rotation": 2,
-            "activity": 3,
-            "physical_header": 4,
-            "sector_coverage": 5,
-            "capture_health": 6,
-        }
+        self.hud_card_priorities: dict[str, int | None] = dict(DEFAULT_HUD_CARD_PRIORITIES)
+        self.load_saved_hud_priorities()
 
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -192,7 +249,6 @@ class TouchSimulator(tk.Tk):
         self.body.pack(fill="both", expand=True)
         self.pages: dict[str, ttk.Frame] = {}
         self.build_hud()
-        self.build_control()
         self.build_settings()
         self.build_connection_setup("controller")
         self.build_connection_setup("hud")
@@ -200,10 +256,8 @@ class TouchSimulator(tk.Tk):
         self.refresh_usb_boards()
         self.nav = ttk.Frame(self, padding=(22, 0, 22, 18))
         self.nav.pack(fill="x")
-        self.hud_button = ttk.Button(self.nav, text="DRIVEHUD", style="Nav.TButton", command=lambda: self.show_page("hud"))
-        self.control_button = ttk.Button(self.nav, text="ONEROM CONTROL", style="Nav.TButton", command=lambda: self.show_page("control"))
+        self.hud_button = ttk.Button(self.nav, text="MONITOR", style="Nav.TButton", command=lambda: self.show_page("hud"))
         self.hud_button.pack(side="left")
-        self.control_button.pack(side="left", padx=12)
         ttk.Label(self.nav, text="Touchscreen simulator — USB serial binding ready", style="Sub.TLabel").pack(side="right", pady=12)
 
         self.bind_all("<Button>", self.register_input, add=True)
@@ -230,8 +284,8 @@ class TouchSimulator(tk.Tk):
 
     def build_hud(self) -> None:
         page = self.page("hud")
-        ttk.Label(page, text="DriveHUD", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(page, text="Live 1541 mechanical telemetry — selected DriveHUD board", style="Sub.TLabel").pack(anchor="w", pady=(0, 14))
+        ttk.Label(page, text="Monitor", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(page, text="Live 1541 mechanical telemetry — selected Monitor OneROM", style="Sub.TLabel").pack(anchor="w", pady=(0, 14))
         grid = ttk.Frame(page); grid.pack(fill="both", expand=True)
         grid.columnconfigure((0, 1, 2), weight=1); grid.rowconfigure((0, 1), weight=1)
         self.track_card, self.track_var = self.card(grid, "Track", "18.0")
@@ -245,34 +299,7 @@ class TouchSimulator(tk.Tk):
         footer = ttk.Frame(page, style="Panel.TFrame", padding=14); footer.pack(fill="x", pady=(12, 0))
         self.hud_connection = tk.StringVar()
         ttk.Label(footer, textvariable=self.hud_connection, style="Panel.TLabel").pack(side="left")
-        ttk.Button(footer, text="DRIVEHUD CONNECTION SETUP", command=lambda: self.show_connection_setup("hud")).pack(side="right")
-
-    def build_control(self) -> None:
-        page = self.page("control")
-        ttk.Label(page, text="OneROM Control", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(page, text="Persistent ROM, IEC address, and write-protect configuration — selected Controller board", style="Sub.TLabel").pack(anchor="w", pady=(0, 14))
-        left = ttk.Frame(page); left.pack(side="left", fill="both", expand=True, padx=(0, 8))
-        right = ttk.Frame(page); right.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        rom = ttk.Frame(left, style="Panel.TFrame", padding=18); rom.pack(fill="both", expand=True)
-        ttk.Label(rom, text="STARTUP ROM", style="Section.TLabel").pack(anchor="w")
-        self.rom_var = tk.StringVar(value="Slot 2 — JIFFYDOS")
-        ttk.Label(rom, textvariable=self.rom_var, style="MetricSmall.TLabel").pack(anchor="w", pady=(8, 12))
-        self.rom_choice = ttk.Combobox(rom, values=self.rom_choices, state="readonly", font=("Segoe UI", 12))
-        self.rom_choice.set("Slot 2 — JIFFYDOS"); self.rom_choice.pack(fill="x", pady=4)
-        ttk.Button(rom, text="SAVE STARTUP ROM", command=self.save_rom).pack(anchor="e", pady=(12, 0))
-        iec = ttk.Frame(right, style="Panel.TFrame", padding=18); iec.pack(fill="x")
-        ttk.Label(iec, text="BOOT IEC ADDRESS", style="Section.TLabel").pack(anchor="w")
-        self.iec_var = tk.StringVar(value="Device 8")
-        ttk.Label(iec, textvariable=self.iec_var, style="MetricSmall.TLabel").pack(anchor="w", pady=(8, 12))
-        self.iec_choice = ttk.Combobox(iec, values=self.iec_choices, state="readonly", font=("Segoe UI", 12))
-        self.iec_choice.set("Device 8"); self.iec_choice.pack(fill="x", pady=4)
-        ttk.Button(iec, text="SAVE IEC ADDRESS", command=self.save_iec).pack(anchor="e", pady=(12, 0))
-        protect = ttk.Frame(right, style="Panel.TFrame", padding=18); protect.pack(fill="both", expand=True, pady=(16, 0))
-        ttk.Label(protect, text="WRITE-PROTECT OVERRIDE", style="Section.TLabel").pack(anchor="w")
-        self.writable = tk.BooleanVar(value=False)
-        ttk.Checkbutton(protect, text="Force writable (X2)", variable=self.writable, command=self.update_protection).pack(anchor="w", pady=(12, 4))
-        self.control_status = tk.StringVar()
-        ttk.Label(protect, textvariable=self.control_status, style="Panel.TLabel", wraplength=450).pack(anchor="w", pady=(15, 0))
+        ttk.Button(footer, text="MONITOR ONEROM CONNECTION SETUP", command=lambda: self.show_connection_setup("hud")).pack(side="right")
 
     def build_settings(self) -> None:
         page = self.page("settings")
@@ -282,20 +309,20 @@ class TouchSimulator(tk.Tk):
         devices.columnconfigure((0, 1), weight=1)
         controller_card = ttk.Frame(devices, style="Panel.TFrame", padding=18)
         controller_card.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
-        ttk.Label(controller_card, text="CONTROLLER ONE ROM", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(controller_card, text="CONTROL ONEROM", style="Section.TLabel").pack(anchor="w")
         ttk.Label(controller_card, text="Choose the OneROM that controls ROM, IEC, and write-protect.", style="Panel.TLabel", wraplength=500).pack(anchor="w", pady=(8, 12))
-        ttk.Button(controller_card, text="CONTROLLER CONNECTION SETUP", command=lambda: self.show_connection_setup("controller")).pack(anchor="e")
+        ttk.Button(controller_card, text="CONTROL ONEROM CONNECTION SETUP", command=lambda: self.show_connection_setup("controller")).pack(anchor="e")
         hud_card = ttk.Frame(devices, style="Panel.TFrame", padding=18)
         hud_card.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
-        ttk.Label(hud_card, text="DRIVEHUD ONE ROM", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(hud_card, text="MONITOR ONEROM", style="Section.TLabel").pack(anchor="w")
         ttk.Label(hud_card, text="Choose the OneROM that supplies passive drive telemetry.", style="Panel.TLabel", wraplength=500).pack(anchor="w", pady=(8, 12))
-        ttk.Button(hud_card, text="DRIVEHUD CONNECTION SETUP", command=lambda: self.show_connection_setup("hud")).pack(anchor="e")
+        ttk.Button(hud_card, text="MONITOR ONEROM CONNECTION SETUP", command=lambda: self.show_connection_setup("hud")).pack(anchor="e")
         self.device_summary = tk.StringVar()
         ttk.Label(page, textvariable=self.device_summary, style="Sub.TLabel", wraplength=1100).pack(anchor="w", pady=(14, 0))
         startup = ttk.Frame(page, style="Panel.TFrame", padding=18); startup.pack(fill="x", pady=(14, 0))
         ttk.Label(startup, text="STARTUP AND IDLE BEHAVIOR", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(startup, text="Preferred startup screen:", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(12, 0))
-        ttk.Combobox(startup, textvariable=self.startup, values=("Automatic", "DriveHUD", "OneROM Control"), state="readonly", width=22, font=("Segoe UI", 11)).grid(row=1, column=1, sticky="w", padx=12, pady=(12, 0))
+        ttk.Combobox(startup, textvariable=self.startup, values=("Automatic", "Monitor"), state="readonly", width=22, font=("Segoe UI", 11)).grid(row=1, column=1, sticky="w", padx=12, pady=(12, 0))
         ttk.Button(startup, text="Apply", command=self.apply_startup).grid(row=1, column=2, padx=8, pady=(12, 0))
         ttk.Label(startup, text="Idle before Wilson screen saver (seconds):", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=(12, 0))
         ttk.Spinbox(startup, from_=10, to=3600, textvariable=self.idle_seconds, width=9, font=("Segoe UI", 11)).grid(row=2, column=1, sticky="w", padx=12, pady=(12, 0))
@@ -311,7 +338,7 @@ class TouchSimulator(tk.Tk):
         """Build one dedicated setup page per physical OneROM role."""
         is_controller = role == "controller"
         page = self.page(f"{role}_connection")
-        role_name = "Controller" if is_controller else "DriveHUD"
+        role_name = "Control OneROM" if is_controller else "Monitor OneROM"
         serial_var = self.controller_serial if is_controller else self.hud_serial
         ttk.Label(page, text=f"{role_name} Connection Setup", style="Title.TLabel").pack(anchor="w")
         description = (
@@ -355,10 +382,12 @@ class TouchSimulator(tk.Tk):
         ttk.Label(content, text="Touch anywhere to return to the drive display.", style="Panel.TLabel").pack()
 
     def show_page(self, name: str) -> None:
-        if name == "hud" and not self.ub4.get():
-            name = "control" if self.ub3.get() else "settings"
-        if name == "control" and not self.ub3.get():
-            name = "hud" if self.ub4.get() else "settings"
+        # The dashboard is the single operational surface. It can show Monitor
+        # telemetry, Control OneROM cards, or both; no separate Control screen.
+        if name == "control":
+            name = "hud" if (self.ub3.get() or self.ub4.get()) else "settings"
+        if name == "hud" and not (self.ub3.get() or self.ub4.get()):
+            name = "settings"
         for frame in self.pages.values(): frame.pack_forget()
         self.pages[name].pack(fill="both", expand=True)
         self.current_page = name
@@ -367,10 +396,9 @@ class TouchSimulator(tk.Tk):
         self.register_input()
 
     def default_page(self) -> str:
-        if self.startup.get() == "DriveHUD" and self.ub4.get(): return "hud"
-        if self.startup.get() == "OneROM Control" and self.ub3.get(): return "control"
+        if self.startup.get() in ("DriveHUD", "Monitor") and self.ub4.get(): return "hud"
         if self.ub4.get(): return "hud"
-        if self.ub3.get(): return "control"
+        if self.ub3.get(): return "hud"
         return "settings"
 
     def refresh_usb_boards(self) -> None:
@@ -425,9 +453,9 @@ class TouchSimulator(tk.Tk):
         )
         try:
             if selected_role == "controller" and binding.controller_serial and binding.controller_serial == binding.hud_serial:
-                raise ValueError("This OneROM is currently bound as DriveHUD. Release the DriveHUD binding before assigning it as Controller.")
+                raise ValueError("This OneROM is currently bound as Monitor OneROM. Release the Monitor binding before assigning it as Control OneROM.")
             if selected_role == "hud" and binding.hud_serial and binding.hud_serial == binding.controller_serial:
-                raise ValueError("This OneROM is currently bound as Controller. Release the Controller binding before assigning it as DriveHUD.")
+                raise ValueError("This OneROM is currently bound as Control OneROM. Release the Control binding before assigning it as Monitor OneROM.")
             binding.validate()
             if not self.usb_boards:
                 self.refresh_usb_boards()
@@ -435,10 +463,10 @@ class TouchSimulator(tk.Tk):
             for role in roles:
                 serial_number = binding.controller_serial if role == "controller" else binding.hud_serial
                 if not serial_number:
-                    raise ValueError(f"Select a {role.title()} serial first.")
+                    raise ValueError(f"Select a {'Control OneROM' if role == 'controller' else 'Monitor OneROM'} serial first.")
                 board = self.usb_boards.get(serial_number)
                 if board is None:
-                    raise ValueError(f"{role.title()} serial {serial_number} is not currently connected.")
+                    raise ValueError(f"{'Control OneROM' if role == 'controller' else 'Monitor OneROM'} serial {serial_number} is not currently connected.")
                 existing = self.usb_links.get(role)
                 if existing is not None and existing.board.serial_number == serial_number and existing.connected:
                     continue
@@ -464,7 +492,8 @@ class TouchSimulator(tk.Tk):
             self.ub4.set("hud" in self.usb_links)
             controller_state = "connected" if "controller" in self.usb_links else "saved / offline"
             hud_state = "connected" if "hud" in self.usb_links else "saved / offline"
-            self.usb_status.set(f"{selected_role.title() if selected_role else 'Role'} connected — Controller: {controller_state}; DriveHUD: {hud_state}.")
+            selected_name = "Control OneROM" if selected_role == "controller" else "Monitor OneROM" if selected_role == "hud" else "Roles"
+            self.usb_status.set(f"{selected_name} connected — Control OneROM: {controller_state}; Monitor OneROM: {hud_state}.")
             self.append_usb_log("SYSTEM", self.usb_status.get())
             self.apply_device_state()
         except Exception as exc:
@@ -472,16 +501,19 @@ class TouchSimulator(tk.Tk):
             self.append_usb_log("SYSTEM", self.usb_status.get())
 
     def enable_hud_telemetry(self, link: CdcBoardLink) -> None:
-        """Enable every passive firmware telemetry class after HUD attach."""
+        """Enable every passive firmware telemetry class after Monitor attach."""
         if self.usb_links.get("hud") is not link or not link.connected:
             return
         try:
-            link.write_command("HUDCFG M=31")
-            self._hud_subscription_mask = 31
+            # Start with exactly the classes the active viewport needs. The
+            # default Monitor page needs CORE, RPM, and SYNC; later scrolling
+            # or reprioritizing adds headers/metadata only when required.
+            self._hud_subscription_mask = None
+            self.update_hud_subscription(link)
             self._hud_telemetry_enabled = True
-            self.append_usb_log("SYSTEM", "DriveHUD passive telemetry enabled.")
+            self.append_usb_log("SYSTEM", f"Monitor passive telemetry enabled (M={self._hud_subscription_mask}).")
         except Exception as exc:
-            self.append_usb_log("SYSTEM", f"DriveHUD telemetry setup failed: {exc}")
+            self.append_usb_log("SYSTEM", f"Monitor telemetry setup failed: {exc}")
 
     def release_role_binding(self, role: str) -> None:
         """Release one persisted role without touching the other OneROM."""
@@ -502,12 +534,13 @@ class TouchSimulator(tk.Tk):
         save_binding(self.binding_path, self.drive_binding)
         self.ub3.set("controller" in self.usb_links)
         self.ub4.set("hud" in self.usb_links)
-        self.usb_status.set(f"{role.title()} binding released. The other OneROM role was left unchanged.")
+        role_name = "Control OneROM" if role == "controller" else "Monitor OneROM"
+        self.usb_status.set(f"{role_name} binding released. The other OneROM role was left unchanged.")
         self.append_usb_log("SYSTEM", self.usb_status.get())
         self.apply_device_state()
 
     def poll_usb_telemetry(self) -> None:
-        """Apply passive DriveHUD CDC telemetry without emitting control commands."""
+        """Apply passive Monitor CDC telemetry without emitting control commands."""
         link = self.usb_links.get("hud")
         if link is None:
             return
@@ -526,7 +559,7 @@ class TouchSimulator(tk.Tk):
                 or line.startswith(("STATUS ", "STATE ", "TRACK_WRITE ", "PHASE ", "MOTOR "))
             ]
             for line in telemetry_lines:
-                self.append_usb_log("HUD", line)
+                self.append_usb_log("MONITOR", line)
                 state = self.telemetry_parser.process(line)
                 changed = True
                 self.live_track = state.track
@@ -650,39 +683,41 @@ class TouchSimulator(tk.Tk):
                     self.open_size_preview()
         except Exception as exc:
             self._hud_subscription_mask = None
-            self.record_serial_diagnostic("DriveHUD", link, exc)
+            self.record_serial_diagnostic("Monitor", link, exc)
             link.close()
             self.usb_links.pop("hud", None)
             self.ub4.set(False)
-            self.usb_status.set(f"DriveHUD link interrupted; reconnecting automatically: {exc}")
-            self.append_usb_log("HUD", self.usb_status.get())
+            self.usb_status.set(f"Monitor link interrupted; reconnecting automatically: {exc}")
+            self.append_usb_log("MONITOR", self.usb_status.get())
             self.apply_device_state()
             self.schedule_role_reconnect("hud")
 
     def poll_controller_feedback(self) -> None:
-        """Drain Controller CDC output so its USB log/reply FIFO cannot back up."""
+        """Drain Control OneROM CDC output so its USB log/reply FIFO cannot back up."""
         link = self.usb_links.get("controller")
         if link is None:
             return
         try:
             for line in link.read_lines()[-96:]:
-                self.append_usb_log("CONTROLLER", line)
+                self.append_usb_log("CONTROL", line)
                 # Selector replies are the only controller lines surfaced to
                 # the operator. Other CDC log lines are still drained.
                 if line.startswith("$ROMTEST,"):
                     if line.startswith("$ROMTEST,WP,"):
                         self.handle_controller_wp_reply(line)
                     elif ",OK," in line or line.endswith(",OK"):
-                        self.control_status.set(f"Controller verified: {line}")
+                        if not self.handle_controller_setting_reply(line):
+                            self.control_status.set(f"Control OneROM verified: {line}")
                     elif ",FAIL" in line or ",ERROR," in line:
-                        self.control_status.set(f"Controller rejected request: {line}")
+                        if not self.handle_controller_setting_reply(line):
+                            self.control_status.set(f"Control OneROM rejected request: {line}")
         except Exception as exc:
-            self.record_serial_diagnostic("Controller", link, exc)
+            self.record_serial_diagnostic("Control OneROM", link, exc)
             link.close()
             self.usb_links.pop("controller", None)
             self.ub3.set(False)
-            self.usb_status.set(f"Controller serial link interrupted; reconnecting automatically: {exc}")
-            self.append_usb_log("CONTROLLER", self.usb_status.get())
+            self.usb_status.set(f"Control OneROM serial link interrupted; reconnecting automatically: {exc}")
+            self.append_usb_log("CONTROL", self.usb_status.get())
             self.apply_device_state()
             self.schedule_role_reconnect("controller")
 
@@ -901,9 +936,9 @@ class TouchSimulator(tk.Tk):
         if not self.motor:
             return "MOTOR OFF"
         if not self.rpm_samples:
-            return "ACQUIRING"
+            return "MOTOR ON · ACQUIRING"
         spread = max(self.rpm_samples) - min(self.rpm_samples)
-        return f"LOCKED · ±{spread / 2:.2f}"
+        return f"MOTOR ON · LOCKED ±{spread / 2:.2f}"
 
     def capture_health_detail(self) -> tuple[str, str]:
         if self.capture_count is None:
@@ -961,9 +996,14 @@ class TouchSimulator(tk.Tk):
         """Start a new Health-card diagnostic window without altering capture."""
         self.health_ring_overrun_baseline = self.ring_overrun or 0
         self.health_queue_overflow_baseline = self.queue_overflow or 0
-        self.append_usb_log("SYSTEM", "Cleared HUD Health drop counters (new diagnostic window).")
+        self.append_usb_log("SYSTEM", "Cleared Monitor Health drop counters (new diagnostic window).")
         self._hud_dirty = True
         self.update_live_hud_fields()
+
+    def confirm_clear_diagnostic_drops(self) -> None:
+        """Ask before resetting the local Capture Health diagnostic window."""
+        self.clear_drops_prompt = True
+        self.open_size_preview()
 
     def effective_rpm(self) -> float | None:
         """Return qualified RPM from SYNC/sec, rejecting partial windows."""
@@ -987,7 +1027,7 @@ class TouchSimulator(tk.Tk):
         return "WRITING" if time.monotonic() < self._writing_display_until else "READING"
 
     def scroll_hud_cards(self) -> list[dict[str, str | int | None]]:
-        """Return every safe passive measurement as a sortable HUD card."""
+        """Return the capability-gated telemetry and Control OneROM dashboard cards."""
         rpm = self.effective_rpm()
         offset = self.header_offset()
         expected = self.expected_sector_count()
@@ -1000,92 +1040,174 @@ class TouchSimulator(tk.Tk):
         header_rate = self.header_rate()
         history_first, history_second = self.diagnostic_history_lines()
         cards = [
-            ("track", "Track / Position", self.live_track, f"HEADER Δ {offset:+.1f}" if offset is not None else "POSITION ESTIMATE · HEADER WAITING", "Derived mechanical position; corrected when physical headers are decoded."),
-            ("rotation", "Rotation", f"{rpm:.2f}" if rpm is not None else "--.--", self.rpm_quality_detail(), "RPM derived from fresh SYNC pulse counts using the current density zone."),
-            ("activity", "Activity", self.disk_activity_label(), f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", "WRITING is the observed write-gate signal; otherwise active spinning media is READING."),
-            ("physical_header", "Physical Header", header, "CONFIRMED HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER", "Latest decoded on-disk track and sector header; it is physical media evidence."),
-            ("sector_coverage", "Sector Coverage", coverage, f"D{self.live_density} ZONE" if self.live_density is not None else "DENSITY UNKNOWN", "Unique sector numbers seen during this current observation window."),
-            ("capture_health", "Capture Health", capture, f"CAP {self.capture_count} · ROV {ring_overrun} · QOV {queue_overflow}" if self.capture_count is not None else "STATUS PENDING", "ROV and QOV are passive capture overruns since the local diagnostic reset."),
-            ("disk_identity", "Disk Identity", self.disk_identity_label(), self.header_validation_detail(), "Disk ID bytes are confirmed only after matching decoded headers; this does not decode DOS directory data."),
-            ("write_protect", "Write Protect", self.hud_write_protect_label(), self.hud_write_protect_detail(), "Reports the physical write-protect sensor and any confirmed Controller override. This screen cannot change it."),
-            ("density", "Density Zone", f"D{self.live_density}" if self.live_density is not None else "--", f"EXPECTED {sync_expected} SYNC / REV" if sync_expected else "WAITING FOR DENSITY", "Density is inferred from 1541 timing/header telemetry and determines expected SYNC density."),
-            ("motor_head", "Motor / Head", "ON" if self.motor else "OFF", f"HEAD {self.head_var.get()} · {self.phase_event_count} STEPS", "Motor is the observed drive signal. Head state combines step activity and motor condition."),
-            ("header_rate", "Header Rate", f"{header_rate:.1f}/S" if header_rate is not None else "WAITING", "DECODED PHYSICAL HEADERS / SECOND", "Rolling rate of successfully decoded physical headers over the last five seconds."),
-            ("capture_rate", "Capture Rate", f"{self.capture_rate / 1000:.0f}K/S" if self.capture_rate is not None else "WAITING", "PASSIVE CAPTURE EVENTS / SECOND", "Rate of passive firmware capture events reported through the compact status record."),
-            ("sync_rate", "SYNC Rate", f"{self.live_sync_count}/S" if self.live_sync_count is not None else "WAITING", "RAW SYNC PULSES / SECOND", "Raw SYNC pulse count from the latest one-second capture interval."),
-            ("sync_per_rev", "SYNC / Revolution", str(sync_per_rev) if sync_per_rev is not None else "--", f"EST {sync_estimate:.2f}" if sync_estimate is not None else "WAITING FOR SYNC", "SYNC pulses per revolution; compared with the density-zone expectation."),
-            ("mechanism", "Mechanism", f"{self.phase_event_count} STEPS", f"TRACK {self.live_track} · HEAD {self.head_var.get()}", "Cumulative observed step/phase transitions since this HUD connection was opened."),
-            ("recent_evidence", "Recent Evidence", history_first, history_second or "PASSIVE EVENT HISTORY", "Recent decoded headers, seek events, and motor changes. It is an observation trace, not DOS error data."),
+            ("track", "Track / Position", self.live_track, f"HEADER Δ {offset:+.1f}" if offset is not None else "POSITION ESTIMATE · HEADER WAITING", "Position is estimated from observed target-track writes and phase transitions. A decoded physical header corrects that estimate. HEADER Δ is estimated position minus the latest physical header track; WAITING means no usable header has been decoded yet."),
+            ("rotation", "Motor Status", f"{rpm:.2f}" if rpm is not None else "--.--", self.rpm_quality_detail(), "RPM is derived as SYNC pulses per second × 60 ÷ expected SYNC marks per revolution. Expected marks are D3=42, D2=38, D1=36, D0=34. Readings outside 240–360 RPM are rejected; the platter arrows appear only while motor telemetry is ON."),
+            ("activity", "Activity", self.disk_activity_label(), f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", "WRITING is an observed write-gate pulse. Otherwise a spinning disk is shown as READING; OFF means motor telemetry is off. WRITE PULSES and STEPS are cumulative observations since this Monitor connection began, not DOS file-operation counts."),
+            ("physical_header", "Physical Header", header, "CONFIRMED HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER", "This is the newest decoded on-disk GCR header: physical track and sector, not a software estimate. It clears after a seek or motor stop because that old header would no longer describe the current head location."),
+            ("sector_coverage", "Sector Coverage", coverage, f"D{self.live_density} ZONE" if self.live_density is not None else "DENSITY UNKNOWN", "Counts unique sector numbers decoded on the current track observation window. Normal drive activity does not read every sector, so incomplete coverage is not a bad-sector report. Expected sectors are D3=21, D2=19, D1=18, D0=17."),
+            ("capture_health", "Capture Health", capture, f"CAP {self.capture_count} · ROV {ring_overrun} · QOV {queue_overflow}" if self.capture_count is not None else "STATUS PENDING", "CAP is the firmware capture count. ROV is raw capture-ring overrun; QOV is diagnostic queue overflow. DROPS is ROV + QOV since the last local Clear Drops action. Clearing changes only this display baseline, never firmware counters or telemetry."),
+            ("disk_identity", "Disk Identity", self.disk_identity_label(), self.header_validation_detail(), "Disk ID is accepted only after two matching, checksum-valid physical headers. VERIFYING means more evidence is needed; ID MISMATCH means valid headers disagreed. This validates header metadata only and does not inspect the DOS directory or files."),
+            ("density", "Density Zone", f"D{self.live_density}" if self.live_density is not None else "--", f"EXPECTED {sync_expected} SYNC / REV" if sync_expected else "WAITING FOR DENSITY", "Density is inferred from Monitor timing/header telemetry. It selects the expected sector and SYNC geometry used by coverage and RPM calculations: D3=42, D2=38, D1=36, D0=34 SYNC marks per revolution."),
+            ("head", "Head", self.head_var.get(), f"POSITION {self.live_track} · {self.phase_event_count} STEPS", "IN means track/phase evidence moved toward higher tracks; OUT means lower tracks. STALL means the motor is running with no target or phase movement for 0.8 seconds. PARK means motor telemetry is off. Position remains an estimate until a physical header confirms it."),
+            ("header_rate", "Header Rate", f"{header_rate:.1f}/S" if header_rate is not None else "WAITING", "Rate of checksum-decoded physical headers over a rolling five-second window. It is a passive observation rate, not a guarantee of disk health. WAITING means fewer than two valid header timestamps are available."),
+            ("capture_rate", "Capture Rate", f"{self.capture_rate / 1000:.0f}K/S" if self.capture_rate is not None else "WAITING", "Passive firmware capture events per second, calculated from the change in CAP between periodic status records. WAITING means the Monitor has not yet received two usable capture-count samples."),
+            ("sync_rate", "SYNC Rate", f"{self.live_sync_count}/S" if self.live_sync_count is not None else "WAITING", "Raw SYNC pulses counted during the latest one-second capture interval. It feeds the qualified RPM calculation when motor state and density are known. A seek or formatting pass can make one interval partial or mixed."),
+            ("sync_per_rev", "SYNC / Revolution", str(sync_per_rev) if sync_per_rev is not None else "--", f"EST {sync_estimate:.2f}" if sync_estimate is not None else "WAITING FOR SYNC", "Calculated as SYNC/sec × 60 ÷ RPM, then rounded to a physical count. EST is the unrounded ratio. Compare the result with the density expectation; nonstandard or copy-protected media may intentionally differ."),
+            ("mechanism", "Mechanism", f"{self.phase_event_count} STEPS", f"TRACK {self.live_track} · HEAD {self.head_var.get()}", "Cumulative observed phase/step transitions since Monitor connection. It is useful for seeing mechanical activity and repeated seeking, but it does not reset per disk and is not an absolute head-position counter."),
+            ("recent_evidence", "Recent Evidence", history_first, history_second or "PASSIVE EVENT HISTORY", "A compact chronological trace of decoded headers, seek events, write-gate activity, and motor changes. It is passive evidence for what the Monitor observed most recently; DOS errors, retries, and directory activity are not exposed by this telemetry."),
         ]
+        # Control OneROM cards join the same sortable dashboard rather than
+        # living on a separate, dead-end screen.  The desktop preview uses
+        # the same list for layout work, but does not fake a USB connection
+        # or transmit a command.  A physical Control OneROM is still required
+        # before a real control action can be applied.
+        if self.controller_preview_available():
+            if self.controller_rom_enabled.get():
+                cards.append(("startup_rom", "Control OneROM · ROM Selection", self.rom_choice.get(), self.controller_card_detail("startup_rom", "TAP TO CHOOSE STARTUP ROM"), "Selects the startup ROM slot used by the Control OneROM. Choose a slot, then confirm the save. With a connected Control OneROM, the UI sends ROMSET=<slot> and waits for its explicit OK/FAIL reply; preview mode changes only the local display."))
+            if self.controller_iec_enabled.get():
+                cards.append(("boot_iec", "Control OneROM · IEC Address", self.iec_choice.get(), self.controller_card_detail("boot_iec", "TAP TO CHOOSE IEC ADDRESS"), "Selects the IEC device address used at boot. Choose Device 8–11, then confirm the save. With a connected Control OneROM, the UI sends ROMIEC=<address> and waits for an explicit OK/FAIL reply; preview mode sends nothing."))
+            if self.controller_wp_enabled.get():
+                cards.append(("write_protect", "Write Protect Override", "OVERRIDE ON" if self._confirmed_writable else "NORMAL PROTECTION", self.physical_disk_write_status(), "The physical disk sensor reports PROTECTED or WRITABLE. This Control OneROM action can override that sensor through X2 and force writable mode. Confirmation is required; the UI sends ROMWP=ON/OFF and changes state only after a matching verification reply. Preview mode is local only."))
         result = []
-        for card_id, title, value, detail, help_text in cards:
+        # Older saved/custom card definitions used a four-field tuple.  Keep
+        # the dashboard usable if one of those leaks in while a newer build
+        # expects the expanded help field.
+        for card in cards:
+            if len(card) == 4:
+                card_id, title, value, legacy_help = card
+                # The old four-field shape was (id, title, value, help),
+                # not (id, title, value, detail).  Never paint that
+                # long-form help paragraph into the one-line card detail.
+                detail = "STATUS / CALCULATION · TAP ?"
+                help_text = legacy_help
+            else:
+                card_id, title, value, detail, help_text = card
             result.append({"id": card_id, "title": title, "value": value, "detail": detail,
-                           "help": help_text, "priority": self.hud_card_priorities.get(card_id)})
+                           "help": help_text, "priority": self.hud_card_priorities.get(card_id),
+                           "kind": "control" if card_id in {"startup_rom", "boot_iec", "write_protect"} else "telemetry"})
         return sorted(
             result,
             key=lambda card: (
                 (0, int(card["priority"]), str(card["title"]))
-                if card["priority"] is not None else (1, str(card["title"]))
+                if card["priority"] is not None
+                # Unpinned controls deliberately follow all telemetry. This
+                # keeps the two optional setup cards together at the bottom
+                # rather than scattering them through diagnostic readings.
+                else (1, 1 if card["kind"] == "control" else 0, str(card["title"]))
             ),
         )
+
+    def controller_card_detail(self, card_id: str, idle_text: str) -> str:
+        """Return the latest visible Control OneROM outcome for a control card."""
+        return self.controller_card_feedback.get(card_id, idle_text)
+
+    def dashboard_connection_status(self) -> tuple[str, str]:
+        """Describe actual board connections without mistaking preview for USB."""
+        hud = "MONITOR ONEROM: CONNECTED" if self.ub4.get() else "MONITOR ONEROM: OFFLINE"
+        controller = (
+            "CONTROL ONEROM: CONNECTED" if self.ub3.get() else
+            "CONTROL ONEROM: PREVIEW" if self.controller_gui_preview else
+            "CONTROL ONEROM: OFFLINE"
+        )
+        color = ACCENT if self.ub4.get() and self.ub3.get() else MUTED
+        return f"{hud} · {controller}", color
 
     @staticmethod
     def scroll_card_paint_text(card: dict[str, str | int | None]) -> tuple[str, str]:
         """Fit special long-form cards into the shared scrolling row."""
         value, detail = str(card["value"]), str(card["detail"])
+        # The card detail is a single status line.  Help paragraphs belong in
+        # the modal, where they receive a bounded, wrapped text area.
+        def single_line(text: str, limit: int = 58) -> str:
+            text = " ".join(text.split())
+            return text if len(text) <= limit else f"{text[:limit - 3]}..."
+
         if card["id"] == "recent_evidence":
             # Evidence is an event trace, not a primary measurement. Keep a
             # useful leading portion on its own compact line and reserve the
             # lower line for its description.
-            return (value if len(value) <= 64 else f"{value[:61]}...", detail)
-        return value, detail
+            return single_line(value, 64), single_line(detail, 64)
+        return value, single_line(detail)
 
     def cycle_hud_card_priority(self, card_id: str) -> None:
-        """Move one card through P1…P6 then unpinned, swapping occupied slots."""
+        """Move one card through P1…P99, then return it to unpinned."""
         current = self.hud_card_priorities.get(card_id)
-        next_priority = 1 if current is None else (None if current >= 6 else current + 1)
-        if next_priority is not None:
-            for other_id, other_priority in self.hud_card_priorities.items():
-                if other_id != card_id and other_priority == next_priority:
-                    self.hud_card_priorities[other_id] = current
-                    break
+        # Duplicate priorities are intentional: the user can group related
+        # cards, and alphabetical title order breaks those ties consistently.
+        next_priority = 1 if current is None else (None if current >= 99 else current + 1)
         self.hud_card_priorities[card_id] = next_priority
+        self.save_hud_priorities()
         self.hud_scroll_index = 0
+        self.refresh_hud_subscription()
+
+    def load_saved_hud_priorities(self) -> None:
+        """Overlay valid saved priorities without losing defaults for new cards."""
+        for card_id, priority in self.drive_binding.priorities.items():
+            if (
+                isinstance(card_id, str)
+                and (priority is None or (isinstance(priority, int) and not isinstance(priority, bool) and 1 <= priority <= 99))
+            ):
+                self.hud_card_priorities[card_id] = priority
+
+    def save_hud_priorities(self) -> None:
+        """Persist card ordering together with the drive's USB bindings and colors."""
+        self.drive_binding.priorities = dict(self.hud_card_priorities)
+        try:
+            save_binding(self.binding_path, self.drive_binding)
+        except OSError as exc:
+            self.usb_status.set(f"HUD priorities could not be saved: {exc}")
 
     def scroll_hud_by(self, amount: int) -> None:
-        """Move the six-card viewport while retaining a valid final page."""
-        max_start = max(0, len(self.scroll_hud_cards()) - 6)
+        """Move the visible card viewport while retaining a valid final page."""
+        max_start = max(0, len(self.scroll_hud_cards()) - HUD_VISIBLE_CARD_COUNT)
         self.hud_scroll_index = max(0, min(max_start, self.hud_scroll_index + amount))
+        self.refresh_hud_subscription()
 
     def visible_hud_subscription_mask(self) -> int:
-        """Return the firmware telemetry classes needed by the six visible cards."""
+        """Return the firmware telemetry classes needed by the visible cards."""
         core, headers, metadata, rpm, sync = 1, 2, 4, 8, 16
         needed = {
-            "track": core, "rotation": rpm | sync, "activity": core,
+            "track": core, "rotation": core | rpm | sync, "activity": core,
             "physical_header": headers, "sector_coverage": headers,
-            "capture_health": 0, "disk_identity": headers | metadata,
-            "write_protect": core, "density": core, "motor_head": core,
-            "header_rate": headers, "capture_rate": 0, "sync_rate": sync,
+            "capture_health": core, "disk_identity": headers | metadata,
+            "write_protect": core, "density": core, "head": core,
+            "header_rate": headers, "capture_rate": core, "sync_rate": sync,
             "sync_per_rev": sync, "mechanism": core,
             "recent_evidence": core | headers,
         }
         cards = self.scroll_hud_cards()
-        visible = cards[self.hud_scroll_index:self.hud_scroll_index + 6]
+        visible = cards[self.hud_scroll_index:self.hud_scroll_index + HUD_VISIBLE_CARD_COUNT]
         # These are bit flags, not quantities.  Arithmetic addition breaks
         # when two visible cards need the same class: for example two CORE
         # cards made 1 + 1 == 2 (HEADERS), which accidentally turned CORE
         # telemetry off.  Combine each required class exactly once.
-        mask = 0
+        # Keep compact STATUS/core records alive even on a control-only
+        # viewport. They preserve connection state and avoid a transition
+        # from "quiet" to an apparently dead monitor.
+        mask = core
         for card in visible:
             mask |= needed.get(str(card["id"]), 0)
         return mask
 
     def update_hud_subscription(self, link: CdcBoardLink) -> None:
-        """Tell the HUD firmware to emit only telemetry used by this viewport."""
+        """Tell the Monitor firmware to emit only telemetry used by this viewport."""
         mask = self.visible_hud_subscription_mask()
         if mask != self._hud_subscription_mask:
             link.write_command(f"HUDCFG M={mask}")
             self._hud_subscription_mask = mask
+
+    def refresh_hud_subscription(self) -> None:
+        """Apply a changed viewport subscription without disturbing the link."""
+        link = self.usb_links.get("hud")
+        if link is None or not link.connected:
+            return
+        try:
+            self.update_hud_subscription(link)
+        except Exception as exc:
+            # A failed optional configuration write must not tear down a
+            # healthy read-only telemetry session.
+            self._hud_subscription_mask = None
+            self.append_usb_log("SYSTEM", f"Monitor viewport subscription update failed: {exc}")
 
     def request_hud_redraw(self) -> None:
         """Rebuild the visible six cards at a bounded desktop-only cadence."""
@@ -1100,7 +1222,7 @@ class TouchSimulator(tk.Tk):
         self._hud_redraw_after = self.after(150, redraw)
 
     def update_live_hud_fields(self) -> None:
-        """Update existing HUD Canvas items without rebuilding the screen."""
+        """Update existing Monitor Canvas items without rebuilding the screen."""
         if self.preview_page not in ("hud", "diagnostics", "diagnostics_detail"):
             return
         preview = getattr(self, "preview", None)
@@ -1114,51 +1236,27 @@ class TouchSimulator(tk.Tk):
             if self.preview_page == "diagnostics_detail":
                 self.update_system_diagnostics_fields(canvas)
                 return
-            # The scrolling HUD can display any six cards.  Tags for cards
-            # outside the viewport simply match no canvas item, which lets us
-            # refresh the current view without rebuilding it on each sample.
-            for card in self.scroll_hud_cards():
+            # Only configure canvas tags for visible cards. Updating every
+            # hidden card on every CDC batch is pointless work and was one
+            # contributor to the old slow/frozen-looking display behavior.
+            cards = self.scroll_hud_cards()
+            visible = cards[self.hud_scroll_index:self.hud_scroll_index + HUD_VISIBLE_CARD_COUNT]
+            for card in visible:
                 card_id = str(card["id"])
                 value, detail = self.scroll_card_paint_text(card)
                 if card_id != "recent_evidence" and len(value) > 24:
                     value = f"{value[:21]}..."
                 canvas.itemconfigure(f"scroll_{card_id}_value", text=value)
                 canvas.itemconfigure(f"scroll_{card_id}_detail", text=detail)
-            canvas.itemconfigure("hud_head_state", text=self.head_var.get())
-            canvas.itemconfigure(
-                "hud_wp_override",
-                text="W/O",
-                fill=OFFLINE if self._confirmed_writable else ACCENT,
-            )
-            canvas.itemconfigure("hud_disk_status", text=self.physical_disk_write_status())
+                if card_id == "write_protect":
+                    canvas.itemconfigure(
+                        f"scroll_{card_id}_value",
+                        fill=OFFLINE if self._confirmed_writable else TEXT,
+                    )
             # Paint the existing visible rows only.  Recreating the whole
             # Canvas while the CDC stream is active can keep Windows/Tk in a
             # perpetual redraw cycle, making a healthy link look frozen.
             canvas.update_idletasks()
-            return
-            canvas.itemconfigure("hud_track", text=self.live_track)
-            canvas.itemconfigure("hud_motor", text="ON" if self.motor else "OFF")
-            canvas.itemconfigure("hud_head", text=self.head_var.get())
-            canvas.itemconfigure("hud_density", text=f"D{self.live_density}" if self.live_density is not None else "--")
-            displayed_rpm = self.effective_rpm()
-            canvas.itemconfigure("hud_rpm", text=f"{displayed_rpm:.2f}" if displayed_rpm is not None else "0.00")
-            canvas.itemconfigure("hud_rpm_state", text=self.disk_activity_label())
-            canvas.itemconfigure("hud_sector", text=f"{self.live_sector:02d}" if self.live_sector is not None else "--")
-            canvas.itemconfigure("hud_sync", text=str(self.live_sync_count) if self.live_sync_count is not None else "0")
-            canvas.itemconfigure(
-                "hud_fifo",
-                text=" ".join(f"{sector:02d}" for sector in self.recent_sectors) if self.recent_sectors else "— FIFO empty —",
-            )
-            sync_estimate, sync_count_per_rev, sync_expected = self.sync_revolution_reading()
-            canvas.itemconfigure("hud_sync_rev", text=str(sync_count_per_rev) if sync_count_per_rev is not None else "--")
-            estimate_detail = f"EST {sync_estimate:.2f}" if sync_estimate is not None else ""
-            expected_detail = (
-                f"EXPECTED {sync_expected}" if sync_expected is not None else "WAITING FOR SYNC"
-            )
-            canvas.itemconfigure("hud_sync_rev_estimate", text=estimate_detail)
-            canvas.itemconfigure("hud_sync_rev_detail", text=expected_detail)
-            canvas.itemconfigure("hud_wp", text=self.hud_write_protect_label())
-            canvas.itemconfigure("hud_wp_detail", text=self.hud_write_protect_detail())
         except tk.TclError:
             # The screen may have changed between CDC receive and paint.
             pass
@@ -1242,7 +1340,7 @@ class TouchSimulator(tk.Tk):
         """Return effective write permission, not only the passive sensor bit."""
         # X2 overrides the physical sensor.  The HUD continues to read that
         # sensor passively, but the operator needs the state the drive will
-        # actually obey when the Controller has confirmed X2 ON.
+        # actually obey when the Control OneROM has confirmed X2 ON.
         if self._confirmed_writable:
             return "FORCES WRITABLE"
         if self.live_protected is None:
@@ -1252,7 +1350,7 @@ class TouchSimulator(tk.Tk):
     def hud_write_protect_detail(self) -> str:
         """Explain whether the displayed permission is sensor or override led."""
         if self._confirmed_writable:
-            return "CONTROLLER OVERRIDE ACTIVE"
+            return "CONTROL OVERRIDE ACTIVE"
         if self.live_protected is None:
             return "PHYSICAL SENSOR PENDING"
         return "PHYSICAL WRITE-PROTECT SENSOR"
@@ -1270,14 +1368,13 @@ class TouchSimulator(tk.Tk):
         if not self.ub3.get():
             self.writable.set(False)
         self.hud_button.configure(state="normal" if self.ub4.get() else "disabled")
-        self.control_button.configure(state="normal" if self.ub3.get() else "disabled")
         controller_id = self.drive_binding.controller_serial or "Not connected"
         hud_id = self.drive_binding.hud_serial or "Not connected"
-        self.hud_connection.set(f"DriveHUD {hud_id} connected • Passive telemetry running" if self.ub4.get() else "DriveHUD not detected • HUD unavailable")
-        self.control_status.set(f"Controller {controller_id} connected • Ready for controller commands" if self.ub3.get() else "Controller not detected • Control actions unavailable")
+        self.hud_connection.set(f"Monitor OneROM {hud_id} connected • Passive telemetry running" if self.ub4.get() else "Monitor OneROM not detected • Monitor unavailable")
+        self.control_status.set(f"Control OneROM {controller_id} connected • Ready for Control commands" if self.ub3.get() else "Control OneROM not detected • Control actions unavailable")
         state = []
-        state.append(f"Controller: {controller_id}" if self.ub3.get() else "Controller: Not connected")
-        state.append(f"DriveHUD: {hud_id}" if self.ub4.get() else "DriveHUD: Not connected")
+        state.append(f"Control OneROM: {controller_id}" if self.ub3.get() else "Control OneROM: Not connected")
+        state.append(f"Monitor OneROM: {hud_id}" if self.ub4.get() else "Monitor OneROM: Not connected")
         self.status_var.set("   •   ".join(state))
         self.device_summary.set("   •   ".join(state) + "\nBoard roles are assigned by USB serial number; COM ports may change without changing the drive binding.")
         if not initial and self.current_page not in ("settings", "idle"):
@@ -1294,9 +1391,15 @@ class TouchSimulator(tk.Tk):
             slot = int(choice.split()[1])
             self.send_controller_command(f"ROMSET={slot}")
             self.rom_var.set(choice)
-            self.control_status.set(f"Startup ROM slot {slot} sent to the connected Controller.")
+            self._pending_controller_card = "startup_rom"
+            self.controller_card_feedback["startup_rom"] = "SENT · WAITING FOR CONFIRMATION"
+            self.control_status.set(f"Startup ROM slot {slot} sent to the connected Control OneROM.")
         except Exception as exc:
+            self._pending_controller_card = None
+            self.controller_card_feedback["startup_rom"] = "SAVE FAILED"
             self.control_status.set(f"Startup ROM was not changed: {exc}")
+        self._hud_dirty = True
+        self.update_live_hud_fields()
 
     def save_iec(self) -> None:
         choice = self.iec_choice.get()
@@ -1304,9 +1407,38 @@ class TouchSimulator(tk.Tk):
             address = int(choice.split()[-1])
             self.send_controller_command(f"ROMIEC={address}")
             self.iec_var.set(choice)
-            self.control_status.set(f"Boot IEC address {address} sent to the connected Controller.")
+            self._pending_controller_card = "boot_iec"
+            self.controller_card_feedback["boot_iec"] = "SENT · WAITING FOR CONFIRMATION"
+            self.control_status.set(f"Boot IEC address {address} sent to the connected Control OneROM.")
         except Exception as exc:
+            self._pending_controller_card = None
+            self.controller_card_feedback["boot_iec"] = "SAVE FAILED"
             self.control_status.set(f"IEC address was not changed: {exc}")
+        self._hud_dirty = True
+        self.update_live_hud_fields()
+
+    def handle_controller_setting_reply(self, line: str) -> bool:
+        """Paint an explicit Control OneROM OK/FAIL reply onto its source card."""
+        upper = line.upper()
+        card_id = (
+            "startup_rom" if "ROMSET" in upper else
+            "boot_iec" if "ROMIEC" in upper else self._pending_controller_card
+        )
+        if card_id is None:
+            return False
+        if ",OK," in upper or upper.endswith(",OK"):
+            self.controller_card_feedback[card_id] = "CONFIRMED BY CONTROL ONEROM"
+            self.control_status.set(f"Control OneROM confirmed {card_id.replace('_', ' ')}.")
+            self._pending_controller_card = None
+        elif ",FAIL" in upper or ",ERROR," in upper:
+            self.controller_card_feedback[card_id] = "CONTROL ONEROM REJECTED SAVE"
+            self.control_status.set(f"Control OneROM rejected {card_id.replace('_', ' ')}.")
+            self._pending_controller_card = None
+        else:
+            return False
+        self._hud_dirty = True
+        self.update_live_hud_fields()
+        return True
 
     def update_protection(self) -> None:
         desired = self.writable.get()
@@ -1319,12 +1451,12 @@ class TouchSimulator(tk.Tk):
             self.control_status.set(f"Write-protect override was not changed: {exc}")
 
     def request_controller_wp_state(self) -> None:
-        """Ask the Controller to report whether its X2 override is usable."""
+        """Ask the Control OneROM to report whether its X2 override is usable."""
         try:
             self.send_controller_command("ROMWP?")
-            self.append_usb_log("SYSTEM", "Queried Controller X2 write-protect override state.")
+            self.append_usb_log("SYSTEM", "Queried Control OneROM X2 write-protect override state.")
         except Exception as exc:
-            self.append_usb_log("SYSTEM", f"Controller X2 write-protect query was not sent: {exc}")
+            self.append_usb_log("SYSTEM", f"Control OneROM X2 write-protect query was not sent: {exc}")
 
     def handle_controller_wp_reply(self, line: str) -> None:
         """Accept only the prior selector's explicit X2 verification reply."""
@@ -1343,11 +1475,11 @@ class TouchSimulator(tk.Tk):
                 self._confirmed_writable = reported_on
                 self.writable.set(reported_on)
                 self.control_status.set(
-                    "Controller X2 override is ON — forces writable."
-                    if reported_on else "Controller X2 override is OFF — normal protection."
+                    "Control OneROM X2 override is ON — forces writable."
+                    if reported_on else "Control OneROM X2 override is OFF — normal protection."
                 )
             else:
-                self.control_status.set(fields.get("ERROR", "Controller reports X2 write-protect override unavailable."))
+                self.control_status.set(fields.get("ERROR", "Control OneROM reports X2 write-protect override unavailable."))
             self.update_live_hud_fields()
             return
         wanted = self._pending_wp_override
@@ -1356,38 +1488,54 @@ class TouchSimulator(tk.Tk):
             self._confirmed_writable = wanted
             self.writable.set(wanted)
             self.control_status.set(
-                "Controller verified X2 override ON — drive forced writable."
-                if wanted else "Controller verified X2 override OFF — normal protection restored."
+                "Control OneROM verified X2 override ON — drive forced writable."
+                if wanted else "Control OneROM verified X2 override OFF — normal protection restored."
             )
         else:
             self.writable.set(self._confirmed_writable)
-            self.control_status.set(f"Controller did not verify X2 override: {line}")
+            self.control_status.set(f"Control OneROM did not verify X2 override: {line}")
         self._pending_wp_override = None
         self.update_live_hud_fields()
 
     def send_controller_command(self, command: str) -> None:
-        """Send only the documented USB Selector commands to Controller."""
+        """Send only the documented USB Selector commands to Control OneROM."""
         link = self.usb_links.get("controller")
         if link is None or not link.connected:
-            raise RuntimeError("Controller is not connected")
+            raise RuntimeError("Control OneROM is not connected")
         link.write_command(command)
 
     def confirm_write_protect_toggle(self) -> None:
         """Show an in-display confirmation before changing it through UB3."""
-        if not self.ub3.get():
-            self.control_status.set("Write-protect control unavailable: controller is disconnected.")
+        if not self.controller_preview_available():
+            self.control_status.set("Write-protect control unavailable: Control OneROM is disconnected.")
             self.open_size_preview()
             return
         if not self.controller_wp_enabled.get():
-            self.control_status.set("Write-protect control is disabled in this controller build.")
+            self.control_status.set("Write-protect control is disabled in this Control OneROM build.")
             self.open_size_preview()
             return
         self.write_protect_prompt = not self.writable.get()
         self.open_size_preview()
 
+    def apply_write_protect_toggle(self, desired: bool) -> None:
+        """Apply confirmed override, preserving desktop preview isolation."""
+        self.writable.set(desired)
+        if self.ub3.get():
+            self.update_protection()
+        else:
+            # Preview proves the interaction and card state without creating
+            # a serial command or pretending a physical Control OneROM replied.
+            self._confirmed_writable = desired
+            self.control_status.set(
+                "Write-protect override preview enabled." if desired
+                else "Write-protect override preview disabled."
+            )
+            self._hud_dirty = True
+            self.update_live_hud_fields()
+
     def save_preview_rom(self) -> None:
         if not self.ub3.get():
-            self.control_status.set("Save failed: controller connection is unavailable.")
+            self.control_status.set("Save failed: Control OneROM connection is unavailable.")
         elif not self.controller_rom_enabled.get():
             self.control_status.set("Save failed: Startup ROM control is disabled in this build.")
         else:
@@ -1396,35 +1544,79 @@ class TouchSimulator(tk.Tk):
 
     def save_preview_iec(self) -> None:
         if not self.ub3.get():
-            self.control_status.set("Save failed: controller connection is unavailable.")
+            self.control_status.set("Save failed: Control OneROM connection is unavailable.")
         elif not self.controller_iec_enabled.get():
             self.control_status.set("Save failed: IEC address control is disabled in this build.")
         else:
             self.save_iec()
         self.open_size_preview()
 
-    def choose_from_menu(self, event, choices: tuple[str, ...], variable: tk.StringVar, message: str) -> None:
+    def choose_from_menu(self, event, choices: tuple[str, ...], variable: tk.StringVar, message: str,
+                         *, title: str = "Choose value", on_select=None) -> None:
         self.popup_menu = {
             "kind": "choice",
-            "title": "Choose value",
+            "title": title,
             "choices": choices,
             "variable": variable,
             "message": message,
+            "on_select": on_select,
         }
         self.open_size_preview()
+
+    def choose_dashboard_control(self, card_id: str, event) -> None:
+        """Open the appropriate compact menu for a Control OneROM dashboard card."""
+        if card_id == "startup_rom":
+            self.choose_from_menu(
+                event, self.rom_choices, self.rom_choice,
+                "Startup ROM selected: {value}.", title="Startup ROM",
+                on_select=self.request_dashboard_rom_choice,
+            )
+        elif card_id == "boot_iec":
+            self.choose_from_menu(
+                event, self.iec_choices, self.iec_choice,
+                "Boot IEC address selected: {value}.", title="IEC Address",
+                on_select=self.request_dashboard_iec_choice,
+            )
+        elif card_id == "write_protect":
+            self.confirm_write_protect_toggle()
+
+    def request_dashboard_rom_choice(self, choice: str) -> None:
+        """Require confirmation before changing the Control OneROM startup ROM."""
+        self.dashboard_setting_prompt = {"kind": "rom", "choice": choice, "label": "STARTUP ROM"}
+
+    def request_dashboard_iec_choice(self, choice: str) -> None:
+        """Require confirmation before changing the Control OneROM IEC address."""
+        self.dashboard_setting_prompt = {"kind": "iec", "choice": choice, "label": "IEC ADDRESS"}
+
+    def apply_dashboard_setting(self) -> None:
+        """Commit the confirmed dashboard setting, then return to the Monitor."""
+        prompt = self.dashboard_setting_prompt
+        if prompt is None:
+            return
+        choice = prompt["choice"]
+        if prompt["kind"] == "rom":
+            self.rom_choice.set(choice)
+            if self.ub3.get():
+                self.save_rom()
+            else:
+                self.controller_card_feedback["startup_rom"] = "PREVIEW SAVED · NO CONTROL ONEROM"
+                self.control_status.set("Startup ROM preview saved; connect a Control OneROM to apply it.")
+        else:
+            self.iec_choice.set(choice)
+            if self.ub3.get():
+                self.save_iec()
+            else:
+                self.controller_card_feedback["boot_iec"] = "PREVIEW SAVED · NO CONTROL ONEROM"
+                self.control_status.set("IEC address preview saved; connect a Control OneROM to apply it.")
+        self.dashboard_setting_prompt = None
+        self.preview_page = "hud"
 
     def choose_appearance_menu(self, event) -> None:
         """Choose which visual color family to edit from one touch menu."""
         self.popup_menu = {
             "kind": "appearance",
             "title": "Appearance",
-            "choices": (
-                ("Background", "background"),
-                ("Group / Card Boxes", "group"),
-                ("Button", "button"),
-                ("Descriptions", "text1"),
-                ("Values", "text2"),
-            ),
+            "choices": APPEARANCE_CHOICES,
         }
         self.open_size_preview()
 
@@ -1435,13 +1627,7 @@ class TouchSimulator(tk.Tk):
         self.popup_menu = {
             "kind": "appearance",
             "title": "Appearance",
-            "choices": (
-                ("Background", "background"),
-                ("Group / Card Boxes", "group"),
-                ("Button", "button"),
-                ("Descriptions", "text1"),
-                ("Values", "text2"),
-            ),
+            "choices": APPEARANCE_CHOICES,
         }
         self.open_size_preview()
 
@@ -1458,19 +1644,47 @@ class TouchSimulator(tk.Tk):
         self.preview_scale.set(max(25, min(200, self.preview_scale.get() + delta)))
         self.open_size_preview()
 
-    def set_preview_color(self, target: str, color: str) -> None:
-        """Apply one visual preference to the touchscreen preview."""
-        global BG, PANEL, ACCENT, MUTED, TEXT
+    @staticmethod
+    def is_hex_color(color: str) -> bool:
+        return bool(HEX_COLOR_RE.fullmatch(color))
+
+    def apply_preview_color_value(self, target: str, color: str) -> None:
+        """Apply one validated display color without changing persistence."""
+        global BG, PANEL, PANEL_ALT, ACCENT, MUTED, TEXT, WARNING, OFFLINE
         if target == "background":
             BG = color
-        elif target == "group":
+        elif target == "card":
             PANEL = color
-        elif target == "button":
+        elif target == "button_surface":
+            PANEL_ALT = color
+        elif target == "accent":
             ACCENT = color
-        elif target == "text1":
-            MUTED = color
-        elif target == "text2":
+        elif target == "text_primary":
             TEXT = color
+        elif target == "text_secondary":
+            MUTED = color
+        elif target == "warning":
+            WARNING = color
+        elif target == "offline":
+            OFFLINE = color
+
+    def apply_saved_appearance(self) -> None:
+        """Restore valid local display preferences from the drive binding."""
+        for target, color in self.drive_binding.appearance.items():
+            if target in APPEARANCE_TARGETS and isinstance(color, str) and self.is_hex_color(color):
+                self.apply_preview_color_value(target, color.upper())
+
+    def set_preview_color(self, target: str, color: str) -> None:
+        """Apply and persist one touchscreen color alongside the USB bindings."""
+        if target not in APPEARANCE_TARGETS or not self.is_hex_color(color):
+            raise ValueError(f"Invalid appearance color: {target}={color!r}")
+        normalized = color.upper()
+        self.apply_preview_color_value(target, normalized)
+        self.drive_binding.appearance[target] = normalized
+        try:
+            save_binding(self.binding_path, self.drive_binding)
+        except OSError as exc:
+            self.usb_status.set(f"Display preference could not be saved: {exc}")
         self.color_picker = None
         self.hex_keyboard = False
         self.open_size_preview()
@@ -1479,10 +1693,13 @@ class TouchSimulator(tk.Tk):
         """Return the currently active color for one appearance area."""
         return {
             "background": BG,
-            "group": PANEL,
-            "button": ACCENT,
-            "text1": MUTED,
-            "text2": TEXT,
+            "card": PANEL,
+            "button_surface": PANEL_ALT,
+            "accent": ACCENT,
+            "text_primary": TEXT,
+            "text_secondary": MUTED,
+            "warning": WARNING,
+            "offline": OFFLINE,
         }[target]
 
     def toggle_motor(self) -> None:
@@ -1505,12 +1722,20 @@ class TouchSimulator(tk.Tk):
         """Keep the compact UI on a screen supported by installed boards."""
         if self.preview_page in ("settings", "controller_connection", "hud_connection", "log"):
             return
-        if self.preview_page in ("hud", "diagnostics") and not self.ub4.get():
-            self.preview_page = "control" if self.ub3.get() else "setup"
-        elif self.preview_page == "control" and not self.ub3.get():
-            self.preview_page = "hud" if self.ub4.get() else "setup"
-        elif self.preview_page == "setup" and (self.ub3.get() or self.ub4.get()):
-            self.preview_page = "hud" if self.ub4.get() else "control"
+        if self.preview_page == "control":
+            self.preview_page = "hud" if self.hud_preview_available() else "setup"
+        elif self.preview_page in ("hud", "diagnostics") and not self.hud_preview_available():
+            self.preview_page = "setup"
+        elif self.preview_page == "setup" and self.hud_preview_available():
+            self.preview_page = "hud"
+
+    def hud_preview_available(self) -> bool:
+        """Whether the standalone Monitor layout may be rendered in GUI preview."""
+        return self.ub4.get() or self.ub3.get() or self.controller_gui_preview
+
+    def controller_preview_available(self) -> bool:
+        """Whether Control OneROM navigation may be rendered in this GUI only."""
+        return self.ub3.get() or self.controller_gui_preview
 
     def toggle_simulated_board(self, board: str) -> None:
         variable = self.ub3 if board == "ub3" else self.ub4
@@ -1565,9 +1790,10 @@ class TouchSimulator(tk.Tk):
             canvas.delete("all")
         preview.geometry(geometry)
         sx, sy = width / 1280, height / 720
-        def text(x, y, value, size=16, fill=TEXT, bold=False, anchor="w", tag=None):
+        def text(x, y, value, size=16, fill=TEXT, bold=False, anchor="w", tag=None, width=None):
             canvas.create_text(x*sx, y*sy, text=value, fill=fill, anchor=anchor,
-                               font=("Segoe UI Semibold" if bold else "Segoe UI", max(4, round(size*sy)), "normal"), tags=tag)
+                               font=("Segoe UI Semibold" if bold else "Segoe UI", max(4, round(size*sy)), "normal"), tags=tag,
+                               width=width*sx if width is not None else 0)
         def box(x1, y1, x2, y2, label, value="", value_size=28, value_y=None, value_tag=None):
             canvas.create_rectangle(x1*sx, y1*sy, x2*sx, y2*sy, fill=PANEL, outline=PANEL_ALT, width=1)
             # 26 virtual pixels equals roughly 13 physical pixels at the
@@ -1575,25 +1801,26 @@ class TouchSimulator(tk.Tk):
             text(x1+26, y1+30, label.upper(), 18, MUTED, True)
             if value:
                 canvas.create_text((x1+26)*sx, (value_y if value_y is not None else y1+78)*sy, text=value, fill=TEXT, anchor="w", font=("Cascadia Mono", max(7, round(value_size*sy)), "normal"), tags=value_tag)
-        def draw_spinning_disk(phase: float) -> None:
+        def draw_spinning_disk(phase: float, center_y: int) -> None:
             """A tiny 5.25-inch floppy with deliberately subtle motion marks."""
             canvas.delete("disk")
-            # The live motor icon belongs to the dedicated status column.
-            cx, cy, radius = 1190, 173, 35
+            # The platter belongs to the Rotation card: it explains the RPM
+            # reading rather than consuming a redundant standalone card.
+            # With the motor stopped there is deliberately no platter glyph
+            # at all: an empty area is the clearest OFF indication.
+            if not self.motor:
+                return
+            cx, cy, radius = 860, center_y, 28
             canvas.create_oval((cx-radius)*sx, (cy-radius)*sy, (cx+radius)*sx, (cy+radius)*sy,
                                fill="#28343b", outline="#82959b", width=max(1, round(2*sy)), tags="disk")
             canvas.create_oval((cx-15)*sx, (cy-15)*sy, (cx+15)*sx, (cy+15)*sy,
                                fill="#101820", outline="#a9bbc4", width=max(1, round(sy)), tags="disk")
             canvas.create_oval((cx-4)*sx, (cy-4)*sy, (cx+4)*sx, (cy+4)*sy,
                                fill="#d5e5e9", outline="", tags="disk")
-            # A stopped drive is still physically present. Keep the platter
-            # visible, but suppress the motion arrows.
-            if not self.motor:
-                return
             # Three curved arrows orbit the platter only while it is
             # running. Their absence makes a stopped disk unambiguous.
             active = ACCENT if int(phase * 5) % 2 == 0 else "#76ded0"
-            arrow_radius = 47
+            arrow_radius = 39
             arrow_sweep = math.radians(52)
             for offset in (0, 2 * math.pi / 3, 4 * math.pi / 3):
                 start_angle = phase * 2.2 + offset
@@ -1617,7 +1844,7 @@ class TouchSimulator(tk.Tk):
                     (base_x - normal_x * 5)*sx, (base_y - normal_y * 5)*sy,
                     fill=active, outline="", tags="disk",
                 )
-        def draw_head_motion(phase: float) -> None:
+        def draw_head_motion(phase: float, center_x: int, card_top: int) -> None:
             """Use foreshortened chevrons to show head motion in depth."""
             canvas.delete("head")
             # Chevrons represent current physical travel only.  A stalled
@@ -1627,10 +1854,9 @@ class TouchSimulator(tk.Tk):
             # Add one chevron per beat.  Four downward-pointing marks make
             # depth visible without changing the physical direction glyph.
             count = int(phase * (4 / 1.5)) % 4 + 1
-            center_x = 1190
             for index in range(count):
                 if self.head_direction == "IN":
-                    y = 280 + index * 22
+                    y = card_top + 28 + index * 17
                     # IN approaches: small at the top, large at the bottom.
                     scale = (0.45, 0.63, 0.81, 1.0)[index]
                     points = (
@@ -1641,7 +1867,7 @@ class TouchSimulator(tk.Tk):
                 else:
                     # OUT leaves: a large upward chevron begins at the
                     # bottom and shrinks as it moves upward into distance.
-                    y = 348 - index * 22
+                    y = card_top + 82 - index * 17
                     scale = (1.0, 0.81, 0.63, 0.45)[index]
                     points = (
                         (center_x - 20 * scale, y + 11 * scale),
@@ -1651,89 +1877,109 @@ class TouchSimulator(tk.Tk):
                 canvas.create_line(*(coordinate * (sx if pos % 2 == 0 else sy) for pos, coordinate in enumerate(sum((list(point) for point in points), []))),
                                    fill=ACCENT, width=max(1, round((2 + 3 * scale)*sy)), joinstyle="round", tags="head")
         text(26, 34, f"1541 OneROM {APP_VERSION}", 22, TEXT, True)
-        # Setup and Hardware Setup both provide explicit navigation.  Keep
-        # the header gear only on the operational/status screens.
-        if self.preview_page not in ("setup", "settings", "log"):
-            # Center the larger options gear between the frame top and the
-            # aligned HUD/Controller card grid, whose top edge is y=96.
-            text(1254, 48, "⚙", 38, ACCENT, True, "e")
-        if self.preview_page == "control" and self.ub4.get():
-            canvas.create_rectangle(990*sx, 18*sy, 1170*sx, 66*sy, fill=PANEL_ALT, outline=ACCENT)
-            text(1080, 42, "HUD", 15, TEXT, True, "center")
+        # Context-aware top navigation.  Show destinations, never an icon
+        # for the screen already open: Monitor list (☷), log (▤), setup (⚙).
+        # Each icon sits inside a 56-pixel touch target even though the
+        # glyph itself remains pleasantly compact.
+        def top_icon(x1, glyph):
+            canvas.create_rectangle(x1*sx, 14*sy, (x1 + 56)*sx, 70*sy, fill=PANEL_ALT, outline=ACCENT)
+            text(x1 + 28, 42, glyph, 28, ACCENT, True, "center")
         if self.preview_page == "hud":
-            text(26, 76, "DriveHUD · passive measurements · tap P# to set display priority", 16, MUTED)
+            top_icon(1136, "▤")
+            top_icon(1200, "⚙")
+        elif self.preview_page == "settings":
+            top_icon(1136, "▤")
+            top_icon(1200, "☷")
+        elif self.preview_page == "log":
+            # Log-specific actions come first; navigation remains at the
+            # far right. ⌫ clears the local display history, ⧉ copies it.
+            top_icon(1008, "⌫")
+            top_icon(1072, "⧉")
+            top_icon(1136, "☷")
+            top_icon(1200, "⚙")
+        elif self.preview_page in ("controller_connection", "hud_connection"):
+            top_icon(1136, "☷")
+            top_icon(1200, "⚙")
+        if self.preview_page == "hud":
+            text(26, 76, "Monitor · passive measurements · tap P# to set display priority", 16, MUTED)
             # A compact list leaves a dedicated right-hand status column.
             cards = self.scroll_hud_cards()
-            max_start = max(0, len(cards) - 6)
+            max_start = max(0, len(cards) - HUD_VISIBLE_CARD_COUNT)
             self.hud_scroll_index = min(self.hud_scroll_index, max_start)
-            visible = cards[self.hud_scroll_index:self.hud_scroll_index + 6]
+            visible = cards[self.hud_scroll_index:self.hud_scroll_index + HUD_VISIBLE_CARD_COUNT]
             for index, card in enumerate(visible):
-                # Preserve a clean gap below the subtitle while slightly
-                # compressing each row so the footer retains its margin.
-                y1 = 100 + index * 96
-                y2 = y1 + 92
-                canvas.create_rectangle(24*sx, y1*sy, 920*sx, y2*sy, fill=PANEL, outline=ACCENT, width=1)
-                text(48, y1 + 19, str(card["title"]).upper(), 14, MUTED, True)
+                # Five compact rows retain large touch targets while exposing
+                # one more operating measurement in the default viewport.
+                y1 = HUD_CARD_TOP + index * HUD_CARD_PITCH
+                y2 = y1 + HUD_CARD_HEIGHT
+                canvas.create_rectangle(24*sx, y1*sy, HUD_CARD_RIGHT*sx, y2*sy, fill=PANEL, outline=ACCENT, width=1)
+                text(48, y1 + 20, str(card["title"]).upper(), 14, MUTED, True)
                 value, detail = self.scroll_card_paint_text(card)
                 display_value = value if len(value) <= 24 else f"{value[:21]}..."
                 # Values retain a consistent visual weight across every
                 # card.  Supporting text begins well to their right.
                 if card["id"] == "recent_evidence":
-                    text(48, y1 + 52, value, 15, TEXT, True, tag=f"scroll_{card['id']}_value")
-                    text(48, y1 + 78, detail, 15, TEXT, True, tag=f"scroll_{card['id']}_detail")
+                    text(48, y1 + 50, value, 15, TEXT, True, tag=f"scroll_{card['id']}_value")
+                    text(48, y1 + 80, detail, 15, TEXT, True, tag=f"scroll_{card['id']}_detail")
                 else:
-                    text(48, y1 + 60, display_value, 24, TEXT, True, tag=f"scroll_{card['id']}_value")
-                    text(400, y1 + 60, detail, 14, MUTED, True, tag=f"scroll_{card['id']}_detail")
+                    value_color = OFFLINE if card["id"] == "write_protect" and self._confirmed_writable else TEXT
+                    text(48, y1 + 64, display_value, 24, value_color, True, tag=f"scroll_{card['id']}_value")
+                    text(400, y1 + 64, detail, 14, MUTED, True, tag=f"scroll_{card['id']}_detail")
                 priority = card["priority"]
                 # Help precedes the display priority, matching the natural
                 # left-to-right reading order: what it means, then its rank.
                 # Large, finger-friendly actions occupy the right edge of
                 # every card without reducing the primary value area.
-                canvas.create_rectangle(746*sx, (y1 + 14)*sy, 818*sx, (y1 + 78)*sy, fill=PANEL_ALT, outline=ACCENT)
-                text(782, y1 + 50, "?", 25, ACCENT, True, "center")
-                canvas.create_rectangle(826*sx, (y1 + 14)*sy, 908*sx, (y1 + 78)*sy, fill=PANEL_ALT, outline=ACCENT)
-                text(867, y1 + 50, f"P{priority}" if priority else "P–", 18, TEXT, True, "center")
+                canvas.create_rectangle(HUD_HELP_LEFT*sx, (y1 + 23)*sy, HUD_HELP_RIGHT*sx, (y1 + 87)*sy, fill=PANEL_ALT, outline=ACCENT)
+                text((HUD_HELP_LEFT + HUD_HELP_RIGHT) / 2, y1 + 55, "?", 25, ACCENT, True, "center")
+                canvas.create_rectangle(HUD_PRIORITY_LEFT*sx, (y1 + 23)*sy, HUD_PRIORITY_RIGHT*sx, (y1 + 87)*sy, fill=PANEL_ALT, outline=ACCENT)
+                text((HUD_PRIORITY_LEFT + HUD_PRIORITY_RIGHT) / 2, y1 + 55, f"P{priority}" if priority else "P–", 18, TEXT, True, "center")
+                if card["id"] == "write_protect":
+                    # This is a deliberately explicit action rather than a
+                    # hidden whole-card gesture: write protection matters.
+                    action = "DISABLE OVERRIDE" if self._confirmed_writable else "ENABLE OVERRIDE"
+                    action_color = OFFLINE if self._confirmed_writable else ACCENT
+                    canvas.create_rectangle(HUD_OVERRIDE_LEFT*sx, (y1 + 23)*sy, HUD_OVERRIDE_RIGHT*sx, (y1 + 87)*sy, fill=PANEL_ALT, outline=action_color)
+                    text((HUD_OVERRIDE_LEFT + HUD_OVERRIDE_RIGHT) / 2, y1 + 55, action, 13, action_color, True, "center")
+                elif card["id"] == "capture_health":
+                    # Health reset is local to the diagnostic window and is
+                    # safe to expose as a direct, finger-sized card action.
+                    canvas.create_rectangle(HUD_OVERRIDE_LEFT*sx, (y1 + 23)*sy, HUD_OVERRIDE_RIGHT*sx, (y1 + 87)*sy, fill=PANEL_ALT, outline=ACCENT)
+                    text((HUD_OVERRIDE_LEFT + HUD_OVERRIDE_RIGHT) / 2, y1 + 55, "CLEAR DROPS", 14, ACCENT, True, "center")
             # Four finger-sized scrolling controls. The symbols intentionally
             # omit their former 5/1 labels: direction alone is clearer.
             for y1, label in ((100, "⇑"), (244, "↑"), (388, "↓"), (532, "⇓")):
-                canvas.create_rectangle(934*sx, y1*sy, 1006*sx, (y1 + 140)*sy, fill=PANEL_ALT, outline=ACCENT)
-                text(970, y1 + 70, label, 38, TEXT, True, "center")
-            # Persistent, centered status cards live at the far right.
-            status_cards = ((100, 240, "MOTOR"), (244, 384, "HEAD"), (388, 528, "WRITE PROTECT"), (532, 672, "CONTROLLER"))
-            for y1, y2, label in status_cards:
-                canvas.create_rectangle(1020*sx, y1*sy, 1256*sx, y2*sy, fill=PANEL, outline=ACCENT, width=1)
-                text(1044, y1 + 20, label, 14, MUTED, True)
-            draw_spinning_disk(time.monotonic())
-            # HUD values share one consistent type scale; the labels and
-            # icons remain visually distinct without looking like data.
-            text(1100, 173, "ON" if self.motor else "OFF", 24, TEXT, True, "center")
-            head_state = self.head_var.get()
-            # Keep the state label left and the animated motion cue right so
-            # IN/OUT remains readable alongside the working chevrons.
-            text(1044, 317, head_state, 24, TEXT, True, "w", tag="hud_head_state")
-            if head_state in ("IN", "OUT"):
-                draw_head_motion(time.monotonic())
-            # Red W/O is reserved for the active Controller override. The
-            # line below continues to report the physical disk sensor state.
-            wp_color = OFFLINE if self._confirmed_writable else ACCENT
-            text(1138, 460, "W/O", 24, wp_color, True, "center", tag="hud_wp_override")
-            text(1138, 504, self.physical_disk_write_status(), 14, TEXT, True, "center", tag="hud_disk_status")
-            text(1133, 608, "▶", 58, ACCENT if self.ub3.get() else MUTED, True, "center")
+                canvas.create_rectangle(HUD_SCROLL_LEFT*sx, y1*sy, HUD_SCROLL_RIGHT*sx, (y1 + 140)*sy, fill=PANEL_ALT, outline=ACCENT)
+                text((HUD_SCROLL_LEFT + HUD_SCROLL_RIGHT) / 2, y1 + 70, label, 38, TEXT, True, "center")
+            rotation_index = next((index for index, card in enumerate(visible) if card["id"] == "rotation"), None)
+            if rotation_index is not None:
+                draw_spinning_disk(time.monotonic(), HUD_CARD_TOP + rotation_index * HUD_CARD_PITCH + 55)
+            head_index = next((index for index, card in enumerate(visible) if card["id"] == "head"), None)
+            if head_index is not None:
+                draw_head_motion(time.monotonic(), 860, HUD_CARD_TOP + head_index * HUD_CARD_PITCH)
             telemetry_label = "TELEMETRY ON" if self._hud_telemetry_enabled else "TELEMETRY WAITING"
-            text(24, 698, f"SHOWING {self.hud_scroll_index + 1}–{min(self.hud_scroll_index + 6, len(cards))} OF {len(cards)} · {telemetry_label} · P1–P6 PINNED · ? HELP", 14, ACCENT, True)
+            text(24, 698, f"SHOWING {self.hud_scroll_index + 1}–{min(self.hud_scroll_index + HUD_VISIBLE_CARD_COUNT, len(cards))} OF {len(cards)} · {telemetry_label} · ? HELP", 14, ACCENT, True)
+            connection_status, connection_color = self.dashboard_connection_status()
+            text(1256, 698, connection_status, 14, connection_color, True, "e")
             if self.hud_help_card:
                 card = next((entry for entry in cards if entry["id"] == self.hud_help_card), None)
                 if card:
-                    canvas.create_rectangle(120*sx, 218*sy, 1090*sx, 486*sy, fill=BG, outline=ACCENT, width=max(1, round(2*sy)))
-                    text(156, 260, str(card["title"]).upper(), 24, TEXT, True)
-                    text(156, 310, str(card["help"]), 18, MUTED, False)
-                    text(156, 386, "SOURCE: PASSIVE DRIVEHUD TELEMETRY · TAP ANYWHERE TO CLOSE", 15, ACCENT, True)
-                    if card["id"] == "capture_health":
-                        # Health counters are displayed relative to a local
-                        # baseline, so Clear starts a fresh diagnostic window
-                        # without transmitting anything to the drive.
-                        canvas.create_rectangle(888*sx, 430*sy, 1054*sx, 466*sy, fill=PANEL_ALT, outline=ACCENT)
-                        text(971, 448, "CLEAR DROPS", 14, TEXT, True, "center")
+                    # Help is a real reference panel: current reading, state,
+                    # calculation/qualification notes, and provenance all fit
+                    # inside one opaque boundary.
+                    canvas.create_rectangle(88*sx, 112*sy, 1192*sx, 608*sy, fill=BG, outline=ACCENT, width=max(1, round(2*sy)))
+                    text(128, 154, str(card["title"]).upper(), 24, TEXT, True)
+                    text(128, 194, f"CURRENT: {card['value']}", 18, TEXT, True)
+                    text(128, 224, f"STATUS: {card['detail']}", 15, MUTED, True)
+                    # Fixed inner width prevents detailed calculations from
+                    # painting through the popup boundary.
+                    text(128, 266, str(card["help"]), 15, MUTED, False, "nw", width=1015)
+                    source = (
+                        "SOURCE: CONTROL ONEROM SETTINGS · TAP ANYWHERE TO CLOSE"
+                        if card.get("kind") == "control" else
+                        "SOURCE: PASSIVE MONITOR TELEMETRY · TAP ANYWHERE TO CLOSE"
+                    )
+                    text(128, 570, source, 15, ACCENT, True)
             if self.priority_prompt_card:
                 card = next((entry for entry in cards if entry["id"] == self.priority_prompt_card), None)
                 canvas.create_rectangle(330*sx, 152*sy, 950*sx, 570*sy, fill=BG, outline=ACCENT, width=max(1, round(2*sy)))
@@ -1787,7 +2033,7 @@ class TouchSimulator(tk.Tk):
             box(840, 260, 1256, 408, "Disk ID / System")
             text(866, 336, self.disk_identity_label(), 35, TEXT, True, tag="diag_media")
             text(866, 384, "TAP FOR SYSTEM DIAGNOSTICS", 14, ACCENT, True)
-            box(24, 424, 420, 572, "HUD Health")
+            box(24, 424, 420, 572, "Monitor Health")
             capture, capture_color = self.capture_health_detail()
             text(50, 500, capture, 27, capture_color, True, tag="diag_capture")
             # Keep the local diagnostic reset in the header band so it does
@@ -1839,113 +2085,88 @@ class TouchSimulator(tk.Tk):
             text(466, 516, history_second, 17, TEXT, True, tag="sys_history_2")
             text(466, 548, "HEADER/RPM/STEP DATA FROM UB4 PASSIVE CAPTURE", 13, MUTED)
             text(28, 612, self.hud_connection.get(), 16, ACCENT if self.ub4.get() else OFFLINE)
-        elif self.preview_page == "control":
-            text(26, 76, "OneROM Controller", 16, MUTED)
-            if self.controller_rom_enabled.get():
-                box(24, 96, 760, 318, "Startup ROM", self.rom_choice.get())
-                canvas.create_polygon(
-                    696*sx, 120*sy,
-                    736*sx, 120*sy,
-                    716*sx, 150*sy,
-                    fill=ACCENT,
-                    outline="",
-                )
-                text(50, 232, f"Saved: {self.rom_var.get()}", 15, MUTED)
-                canvas.create_rectangle(454*sx, 251*sy, 732*sx, 303*sy, fill=ACCENT, outline="")
-                text(593, 277, "SAVE ROM", 17, BG, True, "center")
-                text(50, 292, "MENU", 14, MUTED, True)
-            else:
-                box(24, 96, 760, 318, "Startup ROM", "NOT ENABLED")
-                text(50, 232, "Enable in Settings / controller JSON build.", 15, MUTED)
-            if self.controller_iec_enabled.get():
-                box(784, 96, 1256, 318, "Boot IEC Address", self.iec_choice.get())
-                canvas.create_polygon(
-                    1192*sx, 120*sy,
-                    1232*sx, 120*sy,
-                    1212*sx, 150*sy,
-                    fill=ACCENT,
-                    outline="",
-                )
-                text(810, 232, f"Saved: {self.iec_var.get()}", 15, MUTED)
-                canvas.create_rectangle(1010*sx, 251*sy, 1228*sx, 303*sy, fill=ACCENT, outline="")
-                text(1119, 277, "SAVE IEC", 17, BG, True, "center")
-                text(810, 292, "MENU", 14, MUTED, True)
-            else:
-                box(784, 96, 1256, 318, "Boot IEC Address", "NOT ENABLED")
-                text(810, 232, "Enable in Settings / controller JSON build.", 15, MUTED)
-            if self.controller_wp_enabled.get():
-                box(24, 344, 760, 566, "Write-Protect Override", "FORCES WRITABLE" if self.writable.get() else "NORMAL PROTECTION")
-                action = "Disable override" if self.writable.get() else "Enable writable override"
-                canvas.create_rectangle(342*sx, 499*sy, 732*sx, 551*sy, fill=OFFLINE if self.writable.get() else ACCENT, outline="")
-                text(537, 525, action.upper(), 17, BG, True, "center")
-            else:
-                box(24, 344, 760, 566, "Write-Protect Override", "NOT ENABLED")
-                text(50, 486, "Enable in Settings / controller JSON build.", 15, MUTED)
-            # Reserved blank card for future controller status content.
-            canvas.create_rectangle(784*sx, 344*sy, 1256*sx, 566*sy, fill=PANEL, outline=PANEL_ALT, width=1)
-            text(28, 612, self.control_status.get(), 16, ACCENT if self.ub3.get() else OFFLINE)
         elif self.preview_page == "settings":
             text(26, 76, "Settings", 16, MUTED)
-            canvas.create_rectangle(24*sx, 96*sy, 620*sx, 214*sy, fill=PANEL, outline=PANEL_ALT, width=1)
-            canvas.create_rectangle(660*sx, 96*sy, 1256*sx, 214*sy, fill=PANEL, outline=PANEL_ALT, width=1)
-            text(50, 126, "CONTROLLER-ROLE ONEROM", 18, MUTED, True)
-            text(50, 172, "CONNECTED" if self.ub3.get() else "NOT CONNECTED", 26, ACCENT if self.ub3.get() else OFFLINE, True)
-            text(686, 126, "HUD-ROLE ONEROM", 18, MUTED, True)
-            text(686, 172, "CONNECTED" if self.ub4.get() else "NOT CONNECTED", 26, ACCENT if self.ub4.get() else OFFLINE, True)
-            text(50, 202, "Tap to open Controller connection setup", 13, MUTED)
-            text(686, 202, "Tap to open DriveHUD connection setup", 13, MUTED)
-            text(26, 246, "Either physical OneROM can be assigned as Controller or DriveHUD for this drive.", 14, MUTED)
-            # Controller choices are a left-hand stack, exactly aligned with
-            # the Controller-role status card. Appearance choices mirror it
-            # on the right, aligned with the HUD-role status card.
-            text(24, 274, "Controller options", 16, MUTED, True)
-            text(660, 274, "Appearance", 16, MUTED, True)
-            for y1, label, variable in (
-                (294, "Startup ROM", self.controller_rom_enabled),
-                (360, "IEC address", self.controller_iec_enabled),
-                (426, "Write-protect", self.controller_wp_enabled),
-            ):
-                canvas.create_rectangle(24*sx, y1*sy, 620*sx, (y1+56)*sy, fill=PANEL, outline=PANEL_ALT)
-                canvas.create_rectangle(46*sx, (y1+12)*sy, 78*sx, (y1+44)*sy,
-                                        fill=ACCENT if variable.get() else PANEL_ALT, outline=ACCENT)
-                if variable.get():
-                    text(62, y1+28, "✓", 19, BG, True, "center")
-                text(96, y1+28, label, 18, TEXT, True)
-            box(660, 294, 1256, 482, "Appearance")
-            # The small triangle is the touch affordance for this menu card.
-            canvas.create_polygon(
-                1202*sx, 318*sy,
-                1238*sx, 318*sy,
-                1220*sx, 344*sy,
-                fill=ACCENT,
-                outline="",
+            # Setup uses five full-width rows, matching the dashboard list.
+            # Control OneROM feature previews share their own row so this
+            # remains a complete no-scroll setup screen.
+            setup_rows = (
+                (100, "CONTROL ONEROM", "CONNECTED" if self.ub3.get() else "NOT CONNECTED", "TAP TO ASSIGN CONTROL ONEROM", ACCENT if self.ub3.get() else OFFLINE),
+                (215.2, "MONITOR ONEROM", "CONNECTED" if self.ub4.get() else "NOT CONNECTED", "TAP TO ASSIGN MONITOR ONEROM", ACCENT if self.ub4.get() else OFFLINE),
             )
-            text(686, 456, "MENU", 14, MUTED, True)
-            text(24, 514, "Controller feature availability mirrors the configuration JSON used when the board is compiled.", 13, MUTED)
-            # Kept available for the Windows simulator, but tucked below the
-            # configuration grid so it will not dominate the fixed 7-inch UI.
-            canvas.create_rectangle(24*sx, 540*sy, 1256*sx, 624*sy, fill=PANEL, outline=PANEL_ALT)
-            text(44, 562, "DISPLAY SCALE", 14, MUTED, True)
-            text(44, 590, f"{self.preview_scale.get()}%", 20, TEXT, True)
-            # Keep the scale control in the open space between its label and
-            # the adjustment buttons, rather than low against the footer.
-            text(200, 574, "25%", 14, MUTED, False, "center")
-            text(860, 574, "200%", 14, MUTED, False, "center")
-            canvas.create_line(200*sx, 594*sy, 860*sx, 594*sy, fill=MUTED, width=max(1, round(5*sy)))
-            knob_x = 200 + (self.preview_scale.get() - 25) / 175 * 660
-            canvas.create_oval((knob_x-12)*sx, 582*sy, (knob_x+12)*sx, 606*sy, fill=ACCENT, outline="")
-            canvas.create_rectangle(900*sx, 556*sy, 1060*sx, 608*sy, fill=PANEL_ALT, outline="")
-            canvas.create_rectangle(1080*sx, 556*sy, 1240*sx, 608*sy, fill=ACCENT, outline="")
-            text(980, 582, "− 1%", 17, TEXT, True, "center")
-            text(1160, 582, "+ 1%", 17, BG, True, "center")
+            for y1, title, value, detail, color in setup_rows:
+                canvas.create_rectangle(24*sx, y1*sy, 1256*sx, (y1 + HUD_CARD_HEIGHT)*sy, fill=PANEL, outline=ACCENT, width=1)
+                text(50, y1 + 20, title, 14, MUTED, True)
+                text(50, y1 + 64, value, 24, color, True)
+                text(400, y1 + 64, detail, 14, MUTED, True)
+
+            y1 = 330.4
+            canvas.create_rectangle(24*sx, y1*sy, 1256*sx, (y1 + HUD_CARD_HEIGHT)*sy, fill=PANEL, outline=ACCENT, width=1)
+            text(50, y1 + 20, "CONTROL ONEROM FEATURES · GUI PREVIEW", 14, MUTED, True)
+            # Fit each control to its *rendered* label, with the same 24px
+            # right inset. That makes the trailing whitespace consistent,
+            # even though the three labels are radically different lengths.
+            option_font = tkfont.Font(family="Segoe UI Semibold", size=max(4, round(14*sy)))
+            self.settings_option_bounds: dict[str, tuple[float, float]] = {}
+            for option_id, x1, label, variable in (
+                ("rom", 350, "ROM SELECT", self.controller_rom_enabled),
+                ("iec", 620, "IEC ADDRESS", self.controller_iec_enabled),
+                ("wp", 890, "WRITE PROTECT OVERRIDE", self.controller_wp_enabled),
+            ):
+                # Same 52-pixel action-button height and 20-pixel gaps as
+                # the Control/Monitor setup actions; these need finger room.
+                button_width = 58 + option_font.measure(label) / sx + 24
+                self.settings_option_bounds[option_id] = (x1, x1 + button_width)
+                # Leave the row title its own band; the feature actions sit
+                # below it with a clear visual and touch margin.
+                canvas.create_rectangle(x1*sx, (y1 + 48)*sy, (x1 + button_width)*sx, (y1 + 100)*sy, fill=PANEL_ALT, outline=ACCENT)
+                canvas.create_rectangle((x1 + 14)*sx, (y1 + 60)*sy, (x1 + 42)*sx, (y1 + 88)*sy, fill=ACCENT if variable.get() else PANEL, outline=ACCENT)
+                if variable.get():
+                    text(x1 + 28, y1 + 74, "✓", 17, BG, True, "center")
+                text(x1 + 58, y1 + 74, label, 14, TEXT, True)
+
+            y1 = 445.6
+            canvas.create_rectangle(24*sx, y1*sy, 1256*sx, (y1 + HUD_CARD_HEIGHT)*sy, fill=PANEL, outline=ACCENT, width=1)
+            text(50, y1 + 20, "APPEARANCE", 14, MUTED, True)
+            text(50, y1 + 64, "CUSTOMIZE DISPLAY", 24, TEXT, True)
+            text(400, y1 + 64, "COLORS · CARD STYLE · TEXT · TAP TO OPEN MENU", 14, MUTED, True)
+            canvas.create_polygon(1192*sx, (y1 + 36)*sy, 1232*sx, (y1 + 36)*sy, 1212*sx, (y1 + 66)*sy, fill=ACCENT, outline="")
+
+            y1 = 560.8
+            canvas.create_rectangle(24*sx, y1*sy, 1256*sx, (y1 + HUD_CARD_HEIGHT)*sy, fill=PANEL, outline=ACCENT, width=1)
+            text(50, y1 + 20, "DISPLAY SCALE", 14, MUTED, True)
+            text(50, y1 + 64, f"{self.preview_scale.get()}%", 24, TEXT, True)
+            text(270, y1 + 45, "25%", 14, MUTED, False, "center")
+            text(830, y1 + 45, "200%", 14, MUTED, False, "center")
+            canvas.create_line(270*sx, (y1 + 66)*sy, 830*sx, (y1 + 66)*sy, fill=MUTED, width=max(1, round(5*sy)))
+            # Slider is narrower than its older full-screen version so the
+            # step controls remain inside this single dashboard-height row.
+            knob_x = 270 + (self.preview_scale.get() - 25) / 175 * 560
+            canvas.create_oval((knob_x-12)*sx, (y1 + 54)*sy, (knob_x+12)*sx, (y1 + 78)*sy, fill=ACCENT, outline="")
+            canvas.create_rectangle(900*sx, (y1 + 31)*sy, 1060*sx, (y1 + 83)*sy, fill=PANEL_ALT, outline=ACCENT)
+            canvas.create_rectangle(1080*sx, (y1 + 31)*sy, 1240*sx, (y1 + 83)*sy, fill=ACCENT, outline=ACCENT)
+            text(980, y1 + 57, "− 1%", 17, TEXT, True, "center")
+            text(1160, y1 + 57, "+ 1%", 17, BG, True, "center")
         elif self.preview_page in ("controller_connection", "hud_connection"):
             role = "controller" if self.preview_page == "controller_connection" else "hud"
-            role_title = "CONTROLLER" if role == "controller" else "DRIVEHUD"
+            role_title = "CONTROL ONEROM" if role == "controller" else "MONITOR ONEROM"
             serial_var = self.controller_serial if role == "controller" else self.hud_serial
-            text(26, 76, f"{role_title.title()} OneROM Communication Setup", 16, MUTED)
-            box(24, 96, 1256, 188, f"{role_title} ROLE", serial_var.get() or "NO ONEROM SELECTED", value_size=23, value_y=158)
-            canvas.create_rectangle(24*sx, 210*sy, 342*sx, 262*sy, fill=PANEL_ALT, outline="")
-            text(183, 236, "REFRESH USB DEVICES", 17, TEXT, True, "center")
+            text(26, 76, "Control OneROM Setup" if role == "controller" else "Monitor OneROM Setup", 16, MUTED)
+            canvas.create_rectangle(24*sx, 100*sy, 1256*sx, 211*sy, fill=PANEL, outline=ACCENT)
+            text(50, 120, role_title, 14, MUTED, True)
+            text(50, 164, serial_var.get() or "NO ONEROM SELECTED", 24, TEXT if serial_var.get() else OFFLINE, True)
+            role_detail = (
+                "SELECT THE ONEROM THAT CONTROLS ROM, IEC, AND WRITE PROTECT"
+                if role == "controller" else
+                "SELECT THE ONEROM THAT PROVIDES PASSIVE DRIVE TELEMETRY"
+            )
+            text(400, 164, role_detail, 14, MUTED, True)
+            text(50, 197, "ASSIGNMENT IS SAVED BY USB SERIAL NUMBER", 13, MUTED, True)
+            # Keep discovery results in an obvious, dedicated list box.
+            # Refresh joins the bottom action row, rather than impersonating
+            # a heading above an otherwise unexplained empty region.
+            canvas.create_rectangle(24*sx, 235*sy, 1256*sx, 566*sy, fill=PANEL, outline=ACCENT)
+            text(50, 258, "AVAILABLE ONEROM DEVICES", 16, MUTED, True)
             # Assigned serials remain visible in the role card above, but are
             # intentionally removed from every picker list.  Releasing the
             # role makes the physical board available again.
@@ -1957,37 +2178,33 @@ class TouchSimulator(tk.Tk):
             }
             boards = [board for board in self.usb_boards.values() if board.serial_number not in assigned_serials]
             if boards:
-                text(24, 290, "UNASSIGNED ONEROM USB DEVICES", 16, MUTED, True)
                 for index, board in enumerate(boards[:4]):
-                    y = 310 + index * 62
+                    y = 278 + index * 60
                     selected = board.serial_number == serial_var.get()
-                    canvas.create_rectangle(24*sx, y*sy, 1256*sx, (y+52)*sy,
-                                            fill=ACCENT if selected else PANEL, outline=PANEL_ALT)
-                    text(48, y+26, board.serial_number, 18, BG if selected else TEXT, True)
-                    text(1228, y+26, board.port, 16, BG if selected else MUTED, False, "e")
+                    canvas.create_rectangle(40*sx, y*sy, 1240*sx, (y+52)*sy, fill=ACCENT if selected else PANEL_ALT, outline=ACCENT)
+                    text(50, y+26, board.serial_number, 18, BG if selected else TEXT, True)
+                    text(1220, y+26, board.port, 16, BG if selected else MUTED, False, "e")
             else:
-                box(24, 290, 1256, 434, "USB DEVICES", "NO UNASSIGNED ONEROM FOUND", value_size=24)
-                text(50, 394, "Connect a new board, or release an existing binding.", 16, MUTED)
-            canvas.create_rectangle(24*sx, 548*sy, 350*sx, 600*sy, fill=PANEL_ALT, outline="")
-            text(187, 574, "← BACK TO SETTINGS", 17, TEXT, True, "center")
-            canvas.create_rectangle(386*sx, 548*sy, 812*sx, 600*sy, fill=OFFLINE, outline="")
-            text(599, 574, f"RELEASE {role_title} BINDING", 17, BG, True, "center")
-            canvas.create_rectangle(900*sx, 548*sy, 1228*sx, 600*sy, fill=ACCENT, outline="")
-            text(1064, 574, f"CONNECT {role_title}", 17, BG, True, "center")
-            text(24, 470, self.usb_status.get(), 18, ACCENT if boards else MUTED)
+                text(50, 306, "NO UNASSIGNED ONEROM FOUND", 22, TEXT, True)
+                text(50, 346, "Connect a board, then tap REFRESH DEVICES — discovered serials appear here.", 16, MUTED)
+            text(24, 592, self.usb_status.get(), 16, ACCENT if boards else MUTED)
+            # Four equal, evenly spaced actions make the connection workflow
+            # clear: return, scan, release the assigned role, or connect.
+            canvas.create_rectangle(24*sx, 620*sy, 314*sx, 672*sy, fill=PANEL_ALT, outline=ACCENT)
+            text(169, 646, "BACK", 15, TEXT, True, "center")
+            for x1, label, color in (
+                (338, "REFRESH DEVICES", ACCENT),
+                (652, f"RELEASE {role_title}", OFFLINE),
+                (966, f"CONNECT {role_title}", ACCENT),
+            ):
+                canvas.create_rectangle(x1*sx, 620*sy, (x1 + 290)*sx, 672*sy, fill=PANEL_ALT, outline=color)
+                text(x1 + 145, 646, label, 15, color, True, "center")
         elif self.preview_page == "log":
             text(26, 70, "USB Communications Log", 16, MUTED)
-            # Match the top elevation of the main HUD and Controller cards.
-            canvas.create_rectangle(24*sx, 96*sy, 1256*sx, 616*sy, fill=PANEL, outline=PANEL_ALT)
+            # The log uses the same right-edge scrolling lane as the HUD.
+            canvas.create_rectangle(24*sx, 96*sy, HUD_CARD_RIGHT*sx, 672*sy, fill=PANEL, outline=PANEL_ALT)
             text(48, 112, "LIVE CDC / CONNECTION HISTORY", 16, MUTED, True)
-            # Use the same 300 x 52 touch-button standard as the footer and
-            # Controller actions, with all right-side actions aligned.
-            # The copy action lives in the right-aligned header band.
-            canvas.create_rectangle(636*sx, 22*sy, 936*sx, 74*sy, fill=OFFLINE, outline="")
-            text(786, 48, "CLEAR LOG", 17, BG, True, "center")
-            canvas.create_rectangle(956*sx, 22*sy, 1256*sx, 74*sy, fill=ACCENT, outline="")
-            text(1106, 48, "COPY LOG", 17, BG, True, "center")
-            visible_lines = 20
+            visible_lines = 23
             max_scroll = max(0, len(self.usb_log_lines) - visible_lines)
             self.log_scroll = max(0, min(self.log_scroll, max_scroll))
             start = max(0, len(self.usb_log_lines) - visible_lines - self.log_scroll)
@@ -1999,49 +2216,30 @@ class TouchSimulator(tk.Tk):
                 for index, line in enumerate(lines):
                     color = OFFLINE if "interrupted" in line or "failed" in line or "ERROR" in line else TEXT
                     text(48, 150 + index * 22, line[:136], 15, color)
-            text(48, 590, f"{len(self.usb_log_lines)} entries · scroll {self.log_scroll}/{max_scroll}", 14, MUTED)
+            text(48, 650, f"{len(self.usb_log_lines)} entries · scroll {self.log_scroll}/{max_scroll}", 14, MUTED)
+            for y1, label in ((100, "⇤"), (244, "↑"), (388, "↓"), (532, "⇥")):
+                canvas.create_rectangle(HUD_SCROLL_LEFT*sx, y1*sy, HUD_SCROLL_RIGHT*sx, (y1 + 140)*sy, fill=PANEL_ALT, outline=ACCENT)
+                text((HUD_SCROLL_LEFT + HUD_SCROLL_RIGHT) / 2, y1 + 70, label, 38, TEXT, True, "center")
         else:
             text(26, 76, "OneROM Setup", 16, MUTED)
             box(24, 120, 1256, 410, "No OneROM role configured", "OPEN SETTINGS")
-            text(50, 330, "Open Settings to connect the Controller and DriveHUD OneROMs for this drive.", 18, MUTED)
-        if self.preview_page not in ("hud", "control"):
+            text(50, 330, "Open Settings to connect the Control and Monitor OneROMs for this drive.", 18, MUTED)
+        # Settings shares the HUD/log's slim y=672…720 footer instead of
+        # reserving a separate button bar beneath its content.
+        if self.preview_page not in ("hud", "log", "settings", "controller_connection", "hud_connection"):
             canvas.create_rectangle(24*sx, 632*sy, 1256*sx, 710*sy, fill=PANEL_ALT, outline="")
         # Deliberately large touch targets.  Only offer a destination that is
         # actually installed: the compact UI should never expose a dead tab.
         if self.preview_page == "diagnostics":
-            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
-            text(184, 671, "HUD", 17, TEXT, True, "center")
-            if self.ub3.get():
-                canvas.create_rectangle(346*sx, 645*sy, 646*sx, 697*sy, fill=PANEL, outline="")
-                text(496, 671, "CONTROL", 17, TEXT, True, "center")
+            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL_ALT, outline=ACCENT)
+            text(184, 671, "MONITOR", 17, TEXT, True, "center")
         elif self.preview_page == "diagnostics_detail":
-            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
-            text(184, 671, "HUD", 17, TEXT, True, "center")
-            canvas.create_rectangle(346*sx, 645*sy, 646*sx, 697*sy, fill=PANEL, outline="")
+            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL_ALT, outline=ACCENT)
+            text(184, 671, "MONITOR", 17, TEXT, True, "center")
+            canvas.create_rectangle(346*sx, 645*sy, 646*sx, 697*sy, fill=PANEL_ALT, outline=ACCENT)
             text(496, 671, "DIAGNOSTICS", 17, TEXT, True, "center")
-        elif self.preview_page == "control" and self.ub4.get():
-            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
-            text(184, 671, "HUD", 17, TEXT, True, "center")
-        elif self.preview_page == "settings":
-            if self.ub4.get():
-                canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
-                text(184, 671, "HUD", 17, TEXT, True, "center")
-            if self.ub3.get():
-                x1, x2 = (346, 646) if self.ub4.get() else (34, 334)
-                canvas.create_rectangle(x1*sx, 645*sy, x2*sx, 697*sy, fill=PANEL, outline="")
-                text((x1+x2)/2, 671, "CONTROL", 17, TEXT, True, "center")
-        # USB diagnostics belong on Hardware Setup, not on the normal HUD or
-        # Controller operator screens.
-        if self.preview_page == "settings":
-            canvas.create_rectangle(658*sx, 645*sy, 958*sx, 697*sy, fill=PANEL, outline="")
-            text(808, 671, "LOG", 17, TEXT, True, "center")
-        elif self.preview_page == "log":
-            canvas.create_rectangle(34*sx, 645*sy, 334*sx, 697*sy, fill=PANEL, outline="")
-            text(184, 671, "← BACK", 17, TEXT, True, "center")
-            canvas.create_rectangle(346*sx, 645*sy, 646*sx, 697*sy, fill=PANEL, outline="")
-            canvas.create_rectangle(658*sx, 645*sy, 958*sx, 697*sy, fill=PANEL, outline="")
-            text(496, 671, "▲ OLDER", 17, TEXT, True, "center")
-            text(808, 671, "▼ NEWER", 17, TEXT, True, "center")
+        # USB diagnostics belong on Hardware Setup, not on the normal Monitor
+        # or Control OneROM operator screens.
         if self.preview_page in ("diagnostics", "diagnostics_detail"):
             # The status at the far right needs its own stable space.  Keep
             # this deliberately short so it never encroaches on navigation.
@@ -2049,29 +2247,30 @@ class TouchSimulator(tk.Tk):
             # lane immediately after Control, instead of floating mid-lane.
             text(668, 680, "PASSIVE LIVE DATA", 15, MUTED, True)
         if self.preview_page == "hud":
-            footer_status = "● DriveHUD connected"
-        elif self.preview_page == "control":
-            footer_status = "● Controller connected"
+            footer_status = "● Monitor connected"
         elif self.preview_page == "diagnostics":
-            footer_status = "● DriveHUD diagnostics"
+            footer_status = "● Monitor diagnostics"
         elif self.preview_page == "diagnostics_detail":
-            footer_status = "● DriveHUD system diagnostics"
+            footer_status = "● Monitor system diagnostics"
         elif self.preview_page == "settings":
             footer_status = "● Hardware setup"
         elif self.preview_page in ("controller_connection", "hud_connection"):
             controller_state = "connected" if self.ub3.get() else "unassigned"
             hud_state = "connected" if self.ub4.get() else "unassigned"
-            footer_status = f"● Controller {controller_state} · DriveHUD {hud_state}"
+            footer_status = f"● Control {controller_state} · Monitor {hud_state}"
         elif self.preview_page == "log":
             footer_status = "● USB Log"
         else:
             footer_status = "● No boards configured"
-        if self.preview_page not in ("hud", "control"):
+        if self.preview_page not in ("hud", "log", "settings", "controller_connection", "hud_connection"):
             diagnostic = self.serial_last_error.get()
             if diagnostic:
                 text(1240, 680, f"USB ERROR: {diagnostic[:88]}", 14, OFFLINE, True, "e")
             else:
                 text(1240, 680, footer_status, 20, ACCENT if self.preview_page != "setup" else MUTED, True, "e")
+        if self.preview_page in ("settings", "log", "controller_connection", "hud_connection"):
+            connection_status, connection_color = self.dashboard_connection_status()
+            text(1256, 698, connection_status, 14, connection_color, True, "e")
         if self.popup_menu is not None:
             if self.hex_entry is not None and self.hex_entry.winfo_exists():
                 self.hex_entry.destroy()
@@ -2087,9 +2286,16 @@ class TouchSimulator(tk.Tk):
                 label = choice[0] if self.popup_menu["kind"] == "appearance" else choice
                 row_y = rows_y + index * row_height
                 canvas.create_rectangle((x1+16)*sx, (row_y+4)*sy, (x2-16)*sx, (row_y+row_height-4)*sy,
-                                        fill=PANEL_ALT, outline="")
+                                        fill=PANEL_ALT, outline=ACCENT)
                 text(x1+42, row_y + row_height / 2, label, 17, TEXT, True)
-            canvas.create_rectangle((x2-182)*sx, (y1+20)*sy, (x2-24)*sx, (y1+72)*sy, fill=BG, outline="")
+                if self.popup_menu["kind"] == "appearance":
+                    # A live swatch makes it clear which exact style is
+                    # being edited before the color picker opens.
+                    target = choice[1]
+                    current = self.preview_color(target)
+                    canvas.create_rectangle((x2-92)*sx, (row_y+14)*sy, (x2-42)*sx, (row_y+46)*sy,
+                                            fill=current, outline=TEXT)
+            canvas.create_rectangle((x2-182)*sx, (y1+20)*sy, (x2-24)*sx, (y1+72)*sy, fill=PANEL_ALT, outline=ACCENT)
             text(x2-103, y1+46, "CANCEL", 17, TEXT, True, "center")
         if self.color_picker is not None:
             if self.hex_entry is not None and self.hex_entry.winfo_exists():
@@ -2100,7 +2306,7 @@ class TouchSimulator(tk.Tk):
             canvas.create_rectangle(0, 0, width, height, fill="#081017", outline="")
             text(32, 40, f"Custom Color - {picker_title.title()}", 28, TEXT, True)
             text(32, 70, "Tap a color to apply it immediately.", 17, MUTED)
-            canvas.create_rectangle(1050*sx, 30*sy, 1248*sx, 82*sy, fill=PANEL_ALT, outline="")
+            canvas.create_rectangle(1050*sx, 30*sy, 1248*sx, 82*sy, fill=PANEL_ALT, outline=ACCENT)
             text(1149, 56, "CANCEL", 17, TEXT, True, "center")
             text(770, 56, "HEX", 13, MUTED, True, "e")
 
@@ -2167,7 +2373,7 @@ class TouchSimulator(tk.Tk):
                     for column, key in enumerate(row):
                         x1, key_width = 220 + column * 210, 190
                         fill = ACCENT if key == "APPLY" else PANEL_ALT
-                        canvas.create_rectangle(x1*sx, y1*sy, (x1+key_width)*sx, (y1+52)*sy, fill=fill, outline="")
+                        canvas.create_rectangle(x1*sx, y1*sy, (x1+key_width)*sx, (y1+52)*sy, fill=fill, outline=ACCENT)
                         text(x1+key_width/2, y1+26, key, 17, BG if key == "APPLY" else TEXT, True, "center")
         if self.write_protect_prompt is not None:
             enabling = self.write_protect_prompt
@@ -2180,10 +2386,32 @@ class TouchSimulator(tk.Tk):
             prompt_detail = "This will force the drive writable." if enabling else "This will restore normal write protection."
             text(640, 310, f"Do you want to {prompt_action}?", 21, TEXT, False, "center")
             text(640, 350, prompt_detail, 18, MUTED, False, "center")
-            canvas.create_rectangle(340*sx, 414*sy, 600*sx, 466*sy, fill=PANEL_ALT, outline="")
-            canvas.create_rectangle(680*sx, 414*sy, 940*sx, 466*sy, fill=WARNING if enabling else ACCENT, outline="")
+            canvas.create_rectangle(340*sx, 414*sy, 600*sx, 466*sy, fill=PANEL_ALT, outline=ACCENT)
+            canvas.create_rectangle(680*sx, 414*sy, 940*sx, 466*sy, fill=WARNING if enabling else ACCENT, outline=WARNING if enabling else ACCENT)
             text(470, 440, "CANCEL", 17, TEXT, True, "center")
-            text(810, 440, "CONFIRM", 17, BG, True, "center")
+            text(810, 440, "YES — APPLY", 17, BG, True, "center")
+        if self.dashboard_setting_prompt is not None:
+            prompt = self.dashboard_setting_prompt
+            canvas.create_rectangle(0, 0, width, height, fill="#081017", outline="")
+            canvas.create_rectangle(196*sx, 190*sy, 1084*sx, 510*sy, fill=PANEL, outline=ACCENT, width=max(1, round(2*sy)))
+            text(640, 250, "Confirm setting", 34, TEXT, True, "center")
+            text(640, 304, prompt["label"], 17, MUTED, True, "center")
+            text(640, 346, prompt["choice"], 24, ACCENT, True, "center")
+            text(640, 382, "Save this selection to the Control OneROM?", 18, MUTED, False, "center")
+            canvas.create_rectangle(340*sx, 426*sy, 600*sx, 478*sy, fill=PANEL_ALT, outline=ACCENT)
+            canvas.create_rectangle(680*sx, 426*sy, 940*sx, 478*sy, fill=ACCENT, outline=ACCENT)
+            text(470, 452, "CANCEL", 17, TEXT, True, "center")
+            text(810, 452, "YES — SAVE", 17, BG, True, "center")
+        if self.clear_drops_prompt:
+            canvas.create_rectangle(0, 0, width, height, fill="#081017", outline="")
+            canvas.create_rectangle(196*sx, 190*sy, 1084*sx, 510*sy, fill=PANEL, outline=ACCENT, width=max(1, round(2*sy)))
+            text(640, 250, "Clear Capture Drops?", 34, TEXT, True, "center")
+            text(640, 310, "Reset the local ROV and QOV diagnostic window?", 21, TEXT, False, "center")
+            text(640, 350, "The Monitor capture counters and telemetry will not be changed.", 18, MUTED, False, "center")
+            canvas.create_rectangle(340*sx, 414*sy, 600*sx, 466*sy, fill=PANEL_ALT, outline=ACCENT)
+            canvas.create_rectangle(680*sx, 414*sy, 940*sx, 466*sy, fill=ACCENT, outline=ACCENT)
+            text(470, 440, "CANCEL", 17, TEXT, True, "center")
+            text(810, 440, "YES — CLEAR", 17, BG, True, "center")
         def clicked(event):
             x, y = event.x / sx, event.y / sy
             if self.popup_menu is not None:
@@ -2204,8 +2432,12 @@ class TouchSimulator(tk.Tk):
                             self.color_picker = f"gradient:{self.appearance_target}"
                             self.hex_keyboard = False
                         else:
-                            self.popup_menu["variable"].set(choice)
-                            self.control_status.set(self.popup_menu["message"].format(value=choice))
+                            on_select = self.popup_menu.get("on_select")
+                            if on_select is not None:
+                                on_select(choice)
+                            else:
+                                self.popup_menu["variable"].set(choice)
+                                self.control_status.set(self.popup_menu["message"].format(value=choice))
                         self.popup_menu = None
                         self.open_size_preview()
                         return
@@ -2253,11 +2485,23 @@ class TouchSimulator(tk.Tk):
                     self.set_preview_color(picker_target, f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}")
                     return
                 return
+            if self.dashboard_setting_prompt is not None:
+                if 680 <= x <= 940 and 426 <= y <= 478:
+                    self.apply_dashboard_setting()
+                elif 340 <= x <= 600 and 426 <= y <= 478:
+                    self.dashboard_setting_prompt = None
+                self.open_size_preview()
+                return
+            if self.clear_drops_prompt:
+                if 680 <= x <= 940 and 414 <= y <= 466:
+                    self.clear_diagnostic_drops()
+                self.clear_drops_prompt = False
+                self.open_size_preview()
+                return
             if self.write_protect_prompt is not None:
                 if 680 <= x <= 940 and 414 <= y <= 466:
-                    self.writable.set(self.write_protect_prompt)
+                    self.apply_write_protect_toggle(self.write_protect_prompt)
                     self.write_protect_prompt = None
-                    self.update_protection()
                 elif 340 <= x <= 600 and 414 <= y <= 466:
                     self.write_protect_prompt = None
                 self.open_size_preview()
@@ -2279,110 +2523,126 @@ class TouchSimulator(tk.Tk):
                     self.priority_prompt_card = None
                     self.priority_prompt_value = ""
                 elif 724 <= x <= 856 and 522 <= y <= 558:
-                    if self.priority_prompt_value:
-                        self.hud_card_priorities[self.priority_prompt_card] = int(self.priority_prompt_value)
-                        self.hud_scroll_index = 0
+                    # Clear + Enter explicitly removes a display priority;
+                    # 0 is a convenient keypad synonym for the same result.
+                    priority = int(self.priority_prompt_value) if self.priority_prompt_value else None
+                    self.hud_card_priorities[self.priority_prompt_card] = priority or None
+                    self.save_hud_priorities()
+                    self.hud_scroll_index = 0
+                    self.refresh_hud_subscription()
                     self.priority_prompt_card = None
                     self.priority_prompt_value = ""
                 self.open_size_preview()
                 return
             if self.preview_page == "hud" and self.hud_help_card is not None:
-                if self.hud_help_card == "capture_health" and 888 <= x <= 1054 and 430 <= y <= 466:
-                    self.clear_diagnostic_drops()
                 self.hud_help_card = None
                 self.open_size_preview()
                 return
-            if self.preview_page not in ("setup", "settings", "log") and y < 76 and x > 1180:
-                self.preview_page = "settings"
-            elif self.preview_page == "log":
-                if 636 <= x <= 936 and 22 <= y <= 74:
+            if self.preview_page in ("hud", "settings", "log", "controller_connection", "hud_connection") and 14 <= y <= 70:
+                if self.preview_page == "log" and 1008 <= x <= 1064:
                     self.clear_usb_log()
+                    self.open_size_preview()
                     return
-                if 956 <= x <= 1256 and 22 <= y <= 74:
+                if self.preview_page == "log" and 1072 <= x <= 1128:
                     self.copy_usb_log()
                     return
-                if 346 <= x <= 646 and 645 <= y <= 697:
-                    self.log_scroll = min(max(0, len(self.usb_log_lines) - 20), self.log_scroll + 10)
-                elif 658 <= x <= 958 and 645 <= y <= 697:
-                    self.log_scroll = max(0, self.log_scroll - 10)
-                elif 12 <= x <= 370 and 630 <= y <= 710:
-                    self.preview_page = self.log_return_page
+                if 1136 <= x <= 1192:
+                    self.preview_page = "log" if self.preview_page not in ("log", "controller_connection", "hud_connection") else "hud"
+                elif 1200 <= x <= 1256:
+                    self.preview_page = "hud" if self.preview_page == "settings" else "settings"
+                else:
+                    return
                 self.open_size_preview()
                 return
-            elif self.preview_page == "settings" and 640 <= x <= 976 and 630 <= y <= 710:
-                self.open_usb_log()
+            elif self.preview_page == "log":
+                visible_lines = 23
+                max_scroll = max(0, len(self.usb_log_lines) - visible_lines)
+                if HUD_SCROLL_LEFT <= x <= HUD_SCROLL_RIGHT:
+                    if 100 <= y <= 240:
+                        self.log_scroll = max_scroll
+                    elif 244 <= y <= 384:
+                        self.log_scroll = min(max_scroll, self.log_scroll + visible_lines)
+                    elif 388 <= y <= 528:
+                        self.log_scroll = max(0, self.log_scroll - visible_lines)
+                    elif 532 <= y <= 672:
+                        self.log_scroll = 0
+                self.open_size_preview()
                 return
             elif self.preview_page in ("controller_connection", "hud_connection"):
                 role = "controller" if self.preview_page == "controller_connection" else "hud"
                 serial_var = self.controller_serial if role == "controller" else self.hud_serial
-                if 24 <= x <= 342 and 210 <= y <= 262:
-                    self.refresh_usb_boards()
-                elif 12 <= x <= 370 and 520 <= y <= 620:
+                if 24 <= x <= 314 and 620 <= y <= 672:
                     # This screen is a fixed physical 7-inch workflow.  Do
                     # not carry an accidental preview-scale adjustment back
                     # into the main settings layout.
                     self.preview_scale.set(100)
                     self.preview_page = "settings"
-                elif 370 <= x <= 830 and 520 <= y <= 620:
+                elif 338 <= x <= 628 and 620 <= y <= 672:
+                    self.refresh_usb_boards()
+                elif 652 <= x <= 942 and 620 <= y <= 672:
                     self.release_role_binding(role)
-                elif 880 <= x <= 1248 and 520 <= y <= 620:
+                elif 966 <= x <= 1256 and 620 <= y <= 672:
                     self.connect_assigned_boards(role)
-                elif 24 <= x <= 1256 and 310 <= y <= 548:
-                    index = int((y - 310) // 62)
+                elif 40 <= x <= 1240 and 278 <= y <= 510:
+                    index = int((y - 278) // 60)
                     assigned_serials = {
                         serial for serial in (self.drive_binding.controller_serial, self.drive_binding.hud_serial) if serial
                     }
                     boards = [board for board in self.usb_boards.values() if board.serial_number not in assigned_serials]
-                    if 0 <= index < len(boards) and y <= 310 + index * 62 + 52:
+                    if 0 <= index < len(boards) and y <= 278 + index * 60 + 52:
                         serial_var.set(boards[index].serial_number)
-                        self.usb_status.set(f"Selected {boards[index].serial_number}. Tap CONNECT {role.upper()} to save and open the link.")
+                        role_name = "CONTROL ONEROM" if role == "controller" else "MONITOR ONEROM"
+                        self.usb_status.set(f"Selected {boards[index].serial_number}. Tap CONNECT {role_name} to save and open the link.")
                 self.open_size_preview()
                 return
             elif self.preview_page == "setup" and 24 <= x <= 1256 and 120 <= y <= 410:
                 self.preview_page = "settings"
-            elif self.preview_page == "settings" and 24 <= x <= 620 and 96 <= y <= 214:
+            elif self.preview_page == "settings" and 24 <= x <= 1256 and 100 <= y <= 211:
                 self.open_desktop_connection_setup("controller")
                 return
-            elif self.preview_page == "settings" and 660 <= x <= 1256 and 96 <= y <= 214:
+            elif self.preview_page == "settings" and 24 <= x <= 1256 and 215 <= y <= 326:
                 self.open_desktop_connection_setup("hud")
                 return
-            elif self.preview_page == "settings" and 660 <= x <= 1256 and 294 <= y <= 482:
+            elif self.preview_page == "settings" and 24 <= x <= 1256 and 445 <= y <= 556:
                 self.choose_appearance_menu(event)
                 return
-            elif self.preview_page == "hud" and self.ub3.get() and 990 <= x <= 1170 and 18 <= y <= 66:
-                self.preview_page = "control"
-                self.open_size_preview()
-                return
-            elif self.preview_page == "hud" and 1020 <= x <= 1256 and 532 <= y <= 672:
-                if self.ub3.get():
-                    self.preview_page = "control"
-                else:
-                    self.usb_status.set("Controller is not connected.")
-                self.open_size_preview()
-                return
-            elif self.preview_page == "hud" and 934 <= x <= 1006:
+            elif self.preview_page == "hud" and HUD_SCROLL_LEFT <= x <= HUD_SCROLL_RIGHT:
                 if 100 <= y <= 240:
-                    self.scroll_hud_by(-5)
+                    self.scroll_hud_by(-HUD_VISIBLE_CARD_COUNT)
                 elif 244 <= y <= 384:
                     self.scroll_hud_by(-1)
                 elif 388 <= y <= 528:
                     self.scroll_hud_by(1)
                 elif 532 <= y <= 672:
-                    self.scroll_hud_by(5)
+                    self.scroll_hud_by(HUD_VISIBLE_CARD_COUNT)
                 self.open_size_preview()
                 return
-            elif self.preview_page == "hud" and 24 <= x <= 920 and 100 <= y <= 672:
-                visible = self.scroll_hud_cards()[self.hud_scroll_index:self.hud_scroll_index + 6]
-                index = int((y - 100) // 96)
+            elif self.preview_page == "hud" and 24 <= x <= HUD_CARD_RIGHT and 100 <= y <= 672:
+                visible = self.scroll_hud_cards()[self.hud_scroll_index:self.hud_scroll_index + HUD_VISIBLE_CARD_COUNT]
+                index = int((y - HUD_CARD_TOP) // HUD_CARD_PITCH)
                 if 0 <= index < len(visible):
                     card = visible[index]
-                    row_y = 100 + index * 96
-                    if 746 <= x <= 818 and row_y + 14 <= y <= row_y + 78:
+                    row_y = HUD_CARD_TOP + index * HUD_CARD_PITCH
+                    # Do not let the narrow visual gap between cards act as
+                    # part of the preceding row's touch target.
+                    if y > row_y + HUD_CARD_HEIGHT:
+                        self.open_size_preview()
+                        return
+                    # Help and priority remain available on every card.
+                    # Elsewhere, a control card is its own touch target and
+                    # opens its focused configuration popup.
+                    if HUD_HELP_LEFT <= x <= HUD_HELP_RIGHT and row_y + 23 <= y <= row_y + 87:
                         self.hud_help_card = str(card["id"])
-                    elif 826 <= x <= 908 and row_y + 14 <= y <= row_y + 78:
+                    elif HUD_PRIORITY_LEFT <= x <= HUD_PRIORITY_RIGHT and row_y + 23 <= y <= row_y + 87:
                         self.priority_prompt_card = str(card["id"])
                         priority = card["priority"]
                         self.priority_prompt_value = str(priority) if priority is not None else ""
+                    elif card["id"] == "write_protect" and HUD_OVERRIDE_LEFT <= x <= HUD_OVERRIDE_RIGHT and row_y + 23 <= y <= row_y + 87:
+                        self.confirm_write_protect_toggle()
+                    elif card["id"] == "capture_health" and HUD_OVERRIDE_LEFT <= x <= HUD_OVERRIDE_RIGHT and row_y + 23 <= y <= row_y + 87:
+                        self.confirm_clear_diagnostic_drops()
+                    elif card.get("kind") == "control" and card["id"] != "write_protect":
+                        self.choose_dashboard_control(str(card["id"]), event)
                     self.open_size_preview()
                     return
             elif self.preview_page == "diagnostics" and 284 <= x <= 396 and 434 <= y <= 466:
@@ -2394,53 +2654,30 @@ class TouchSimulator(tk.Tk):
                 return
             elif self.preview_page == "diagnostics" and 645 <= y <= 697 and 34 <= x <= 334:
                 self.preview_page = "hud"
-            elif self.preview_page == "diagnostics" and self.ub3.get() and 645 <= y <= 697 and 346 <= x <= 646:
-                self.preview_page = "control"
             elif self.preview_page == "diagnostics_detail" and 645 <= y <= 697 and 34 <= x <= 334:
                 self.preview_page = "hud"
             elif self.preview_page == "diagnostics_detail" and 645 <= y <= 697 and 346 <= x <= 646:
                 self.preview_page = "diagnostics"
-            elif self.preview_page == "control" and self.ub4.get() and 990 <= x <= 1170 and 18 <= y <= 66:
-                self.preview_page = "hud"
-            elif self.preview_page == "control" and self.ub4.get() and 645 <= y <= 697 and 34 <= x <= 334:
-                self.preview_page = "hud"
-            elif self.preview_page == "settings" and self.ub4.get() and 645 <= y <= 697 and 34 <= x <= 334:
-                self.preview_page = "hud"
-            elif self.preview_page == "settings" and self.ub3.get() and 645 <= y <= 697 and ((self.ub4.get() and 346 <= x <= 646) or (not self.ub4.get() and 34 <= x <= 334)):
-                self.preview_page = "control"
-            elif self.preview_page == "control" and self.controller_rom_enabled.get() and 454 <= x <= 732 and 251 <= y <= 303:
-                self.save_preview_rom()
-                return
-            elif self.preview_page == "control" and self.controller_iec_enabled.get() and 1010 <= x <= 1228 and 251 <= y <= 303:
-                self.save_preview_iec()
-                return
-            elif self.preview_page == "control" and self.controller_rom_enabled.get() and 24 <= x <= 760 and 96 <= y <= 318:
-                self.choose_from_menu(event, self.rom_choices, self.rom_choice, "Startup ROM selected: {value}. Save applies it to the connected controller.")
-                return
-            elif self.preview_page == "control" and self.controller_iec_enabled.get() and 784 <= x <= 1256 and 96 <= y <= 318:
-                self.choose_from_menu(event, self.iec_choices, self.iec_choice, "Boot IEC address selected: {value}. Save applies it to the connected controller.")
-                return
-            elif self.preview_page == "control" and self.controller_wp_enabled.get() and 342 <= x <= 732 and 499 <= y <= 551:
-                self.confirm_write_protect_toggle()
-                return
-            elif self.preview_page == "settings" and 200 <= x <= 860 and 578 <= y <= 610:
-                self.preview_scale.set(max(25, min(200, round(25 + ((x - 200) / 660) * 175))))
+            elif self.preview_page == "settings" and 270 <= x <= 830 and 614 <= y <= 639:
+                self.preview_scale.set(max(25, min(200, round(25 + ((x - 270) / 560) * 175))))
                 self.open_size_preview()
                 return
-            elif self.preview_page == "settings" and 900 <= x <= 1060 and 556 <= y <= 608:
+            elif self.preview_page == "settings" and 900 <= x <= 1060 and 591 <= y <= 644:
                 self.change_preview_scale(-1)
                 return
-            elif self.preview_page == "settings" and 1080 <= x <= 1240 and 556 <= y <= 608:
+            elif self.preview_page == "settings" and 1080 <= x <= 1240 and 591 <= y <= 644:
                 self.change_preview_scale(1)
                 return
-            elif self.preview_page == "settings" and 24 <= x <= 620 and 294 <= y <= 350:
-                self.controller_rom_enabled.set(not self.controller_rom_enabled.get())
-            elif self.preview_page == "settings" and 24 <= x <= 620 and 360 <= y <= 416:
-                self.controller_iec_enabled.set(not self.controller_iec_enabled.get())
-            elif self.preview_page == "settings" and 24 <= x <= 620 and 426 <= y <= 482:
-                self.controller_wp_enabled.set(not self.controller_wp_enabled.get())
-                if not self.controller_wp_enabled.get():
-                    self.writable.set(False)
+            elif self.preview_page == "settings" and 378 <= y <= 430:
+                option_bounds = getattr(self, "settings_option_bounds", {})
+                if option_bounds.get("rom", (0, 0))[0] <= x <= option_bounds.get("rom", (0, 0))[1]:
+                    self.controller_rom_enabled.set(not self.controller_rom_enabled.get())
+                elif option_bounds.get("iec", (0, 0))[0] <= x <= option_bounds.get("iec", (0, 0))[1]:
+                    self.controller_iec_enabled.set(not self.controller_iec_enabled.get())
+                elif option_bounds.get("wp", (0, 0))[0] <= x <= option_bounds.get("wp", (0, 0))[1]:
+                    self.controller_wp_enabled.set(not self.controller_wp_enabled.get())
+                    if not self.controller_wp_enabled.get():
+                        self.writable.set(False)
             self.open_size_preview()
         # Bind directly to the drawing surface.  On some Windows/Tk builds a
         # Canvas does not reliably forward touch/mouse events to its Toplevel.
@@ -2457,12 +2694,36 @@ class TouchSimulator(tk.Tk):
         if self.preview_page == "hud":
             def animate_disk() -> None:
                 if self.preview is preview and preview.winfo_exists() and self.preview_page == "hud":
-                    # A modal must remain the topmost graphic.  Pause the
-                    # decorative HUD animations until it is dismissed.
-                    if self.write_protect_prompt is None:
-                        if self.motor:
-                            draw_spinning_disk(time.monotonic())
-                        draw_head_motion(time.monotonic())
+                    # A modal must remain the topmost graphic.  Stop and
+                    # erase decorative HUD animation for every popup type;
+                    # otherwise a later animation tick can draw over a
+                    # perfectly good dialog. Naturally Tk will happily do
+                    # exactly that unless we tell it otherwise.
+                    modal_open = any((
+                        self.hud_help_card is not None,
+                        self.priority_prompt_card is not None,
+                        self.write_protect_prompt is not None,
+                        self.clear_drops_prompt,
+                        self.dashboard_setting_prompt is not None,
+                        self.popup_menu is not None,
+                        self.color_picker is not None,
+                    ))
+                    if not modal_open:
+                        cards = self.scroll_hud_cards()
+                        visible = cards[self.hud_scroll_index:self.hud_scroll_index + HUD_VISIBLE_CARD_COUNT]
+                        rotation_index = next((index for index, card in enumerate(visible) if card["id"] == "rotation"), None)
+                        if rotation_index is not None:
+                            draw_spinning_disk(time.monotonic(), HUD_CARD_TOP + rotation_index * HUD_CARD_PITCH + 55)
+                        else:
+                            canvas.delete("disk")
+                        head_index = next((index for index, card in enumerate(visible) if card["id"] == "head"), None)
+                        if head_index is not None:
+                            draw_head_motion(time.monotonic(), 860, HUD_CARD_TOP + head_index * HUD_CARD_PITCH)
+                        else:
+                            canvas.delete("head")
+                    else:
+                        canvas.delete("disk")
+                        canvas.delete("head")
                     self._preview_animation_id = preview.after(180, animate_disk)
             self._preview_animation_id = preview.after(180, animate_disk)
 
@@ -2480,7 +2741,7 @@ class TouchSimulator(tk.Tk):
         self.after(100, self.tick)
 
     def poll_serial_loop(self) -> None:
-        """Drain the HUD CDC FIFO at the proven desktop-GUI cadence."""
+        """Drain the Monitor CDC FIFO at the proven desktop-GUI cadence."""
         self.poll_usb_telemetry()
         self.poll_controller_feedback()
         self.after(20, self.poll_serial_loop)

@@ -2,12 +2,12 @@
 
 The UI never identifies a board by COM number.  COM ports are transient; the
 OneROM USB serial is the stable identifier which is stored against a drive and
-role.  The CDC handling follows the proven DriveHUD GUI sequence: open with
+role.  The CDC handling follows the proven Monitor GUI sequence: open with
 DTR low, then assert DTR after the device has observed a fresh attach.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 import re
@@ -22,6 +22,10 @@ except ImportError:  # Keep the simulator usable before pyserial is installed.
 
 
 BAUD_RATE = 115200
+# A healthy OneROM CDC record is a short newline-terminated ASCII line.  A
+# finite cap prevents a disconnected/malformed device that never terminates a
+# record from accumulating an unbounded Python string in the GUI process.
+MAX_RX_BUFFER_BYTES = 16 * 1024
 STATE_RE = re.compile(r"STATE\s+([A-Za-z][0-9.]+)")
 STATUS_RE = re.compile(r"STATUS\s+([A-Za-z][0-9.]+)")
 MOTOR_RE = re.compile(r"MOTOR\s+state=(\d+)")
@@ -67,15 +71,21 @@ class BoardDescriptor:
 
 @dataclass
 class DriveBinding:
-    """The two optional OneROM roles attached to one physical drive."""
+    """One drive's OneROM role bindings and local display preferences."""
 
     drive_id: str = "1541 Drive"
     controller_serial: str = ""
     hud_serial: str = ""
+    appearance: dict[str, str] = field(default_factory=dict)
+    priorities: dict[str, int | None] = field(default_factory=dict)
 
     def validate(self) -> None:
         if self.controller_serial and self.controller_serial == self.hud_serial:
             raise ValueError("A OneROM serial can be assigned to only one role on a drive.")
+        if not isinstance(self.appearance, dict):
+            raise ValueError("Display appearance preferences must be a mapping.")
+        if not isinstance(self.priorities, dict):
+            raise ValueError("HUD priorities must be a mapping.")
 
 
 @dataclass
@@ -184,6 +194,11 @@ class CdcBoardLink:
         payload = self.device.read(4096)
         if payload:
             self._buffer += payload.decode("ascii", errors="ignore")
+            if len(self._buffer) > MAX_RX_BUFFER_BYTES:
+                # There is no valid record to preserve once an unterminated
+                # line has exceeded this cap. Drop it and let the next
+                # newline-terminated CDC record re-establish framing.
+                self._buffer = ""
         lines: list[str] = []
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
@@ -213,7 +228,7 @@ class CdcBoardLink:
 
 
 class DriveTelemetryParser:
-    """Parser for the hardware-tested DriveHUD CDC telemetry grammar."""
+    """Parser for the hardware-tested Monitor CDC telemetry grammar."""
 
     def __init__(self) -> None:
         self.state = TelemetryState()

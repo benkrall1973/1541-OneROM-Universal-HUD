@@ -1,9 +1,26 @@
-"""Regression tests for DriveHUD head-state telemetry."""
+"""Regression tests for Monitor head-state telemetry."""
 
 import unittest
 from unittest.mock import patch
+from pathlib import Path
 
-from onerom_usb import DriveTelemetryParser
+from onerom_usb import (
+    BoardDescriptor, CdcBoardLink, DriveBinding, DriveTelemetryParser,
+    MAX_RX_BUFFER_BYTES, load_binding, save_binding,
+)
+
+
+class _FakeCdcDevice:
+    """Minimal serial-device double for receive-buffer tests."""
+
+    is_open = True
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    def read(self, _size: int) -> bytes:
+        payload, self.payload = self.payload, b""
+        return payload
 
 
 class DriveTelemetryParserHeadStateTests(unittest.TestCase):
@@ -77,6 +94,44 @@ class DriveTelemetryParserHeadStateTests(unittest.TestCase):
         parser.state.head = "OUT"
         parser.process("MOTOR state=0")
         self.assertEqual(parser.state.head, "PARK")
+
+
+class CdcBoardLinkTests(unittest.TestCase):
+    def test_unterminated_receive_data_cannot_grow_the_buffer_forever(self) -> None:
+        link = CdcBoardLink(BoardDescriptor("TEST", "COM1", "Test device"))
+        link.device = _FakeCdcDevice(b"xx")
+        link._buffer = "x" * (MAX_RX_BUFFER_BYTES - 1)
+
+        self.assertEqual(link.read_lines(), [])
+        self.assertEqual(link._buffer, "")
+
+
+class DriveBindingPersistenceTests(unittest.TestCase):
+    def test_serial_bindings_and_appearance_share_one_json_file(self) -> None:
+        path = Path("onerom_drive_bindings.json")
+        binding = DriveBinding(
+            controller_serial="CONTROL-123",
+            hud_serial="MONITOR-456",
+            appearance={"background": "#112233", "accent": "#AABBCC"},
+            priorities={"track": 1, "capture_health": None, "sync_rate": 12},
+        )
+        # Exercise the actual JSON payload without creating an artifact in a
+        # test environment that intentionally blocks Python file writes.
+        with patch.object(Path, "write_text") as write_text:
+            save_binding(path, DriveBinding(
+                controller_serial=binding.controller_serial,
+                hud_serial=binding.hud_serial,
+                appearance=binding.appearance,
+                priorities=binding.priorities,
+            ))
+        payload = write_text.call_args.args[0]
+        with patch.object(Path, "read_text", return_value=payload):
+            loaded = load_binding(path)
+
+        self.assertEqual(loaded.controller_serial, "CONTROL-123")
+        self.assertEqual(loaded.hud_serial, "MONITOR-456")
+        self.assertEqual(loaded.appearance, {"background": "#112233", "accent": "#AABBCC"})
+        self.assertEqual(loaded.priorities, {"track": 1, "capture_health": None, "sync_rate": 12})
 
 
 if __name__ == "__main__":

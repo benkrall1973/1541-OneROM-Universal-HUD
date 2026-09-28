@@ -1,8 +1,8 @@
-# DriveHUD follow-ups
+# Monitor follow-ups
 
 ## Validate and improve `SYNC / REV`
 
-The current HUD reports raw physical SYNC edge counts once per second and
+The current Monitor reports raw physical SYNC edge counts once per second and
 derives a live rate. Before presenting a whole-number `SYNC / REV` as a
 physical disk fact, validate the capture path against a known standard 1541
 disk.

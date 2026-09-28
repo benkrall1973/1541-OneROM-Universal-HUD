@@ -1,4 +1,4 @@
-# HUD RPM display note
+# Monitor RPM display note
 
 ## Why the display uses sync-derived RPM
 
@@ -11,7 +11,7 @@ D3 has 42 syncs per revolution, so the sync measurement implies:
 210 syncs/sec ÷ 42 syncs/rev × 60 sec/min = 300 RPM
 ```
 
-The HUD therefore uses the density-specific sync geometry for its primary RPM
+The Monitor therefore uses the density-specific sync geometry for its primary RPM
 value whenever motor, density, and sync data are valid:
 
 ```text
@@ -25,5 +25,5 @@ single bad raw sample to make the main RPM display misleading.
 
 During formatting or a seek, a one-second SYNC window can be partial or mixed
 between tracks. The derived RPM must be in a physically plausible 240–360 RPM
-range; otherwise the window is rejected and the HUD holds the last qualified
+range; otherwise the window is rejected and the Monitor holds the last qualified
 RPM until a valid measurement arrives or the motor stops.

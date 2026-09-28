@@ -1,14 +1,15 @@
-# 1541 OneROM Desktop HUD V0.0.5 baseline
+# 1541 OneROM Desktop Monitor V0.0.5 baseline
 
-The desktop HUD is a Python/Tkinter monitor for the passive UB4 1541HUD
-firmware. It never controls the 1541 drive through UB4; UB3 continues to own
+The desktop Monitor is a Python/Tkinter display for the passive Monitor OneROM
+firmware. It never controls the 1541 drive through the Monitor OneROM; the
+Control OneROM continues to own
 ROM, IEC-address, and write-protect controls.
 
 ## Active source set
 
 | File | Purpose |
 |---|---|
-| `1541_touchscreen_simulator.py` | Fixed 7-inch HUD/Diagnostics UI, rendering, USB connection workflow, and diagnostic window controls. |
+| `1541_touchscreen_simulator.py` | Fixed 7-inch Monitor/Diagnostics UI, rendering, USB connection workflow, and diagnostic window controls. |
 | `onerom_usb.py` | CDC board discovery, serial link, telemetry parser, and the compact health-status parser. |
 | `capture_ub4_serial.py` | Optional raw CDC capture helper for bench diagnostics. |
 | `Run-1541-Touchscreen-Simulator.cmd` | Windows launcher. |
@@ -38,7 +39,7 @@ record is:
 STATUS T0.0.16 C=<capture_count> R=<ring_overrun> Q=<queue_overflow>
 ```
 
-Run the HUD on Windows with:
+Run the Monitor on Windows with:
 
 ```powershell
 python .\1541_touchscreen_simulator.py
