@@ -1,4 +1,4 @@
-# 1541 OneROM Desktop Monitor V0.0.11 baseline
+# 1541 OneROM Desktop Monitor V0.0.12 baseline
 
 The desktop Monitor is a Python/Tkinter display for the passive Monitor OneROM
 firmware. It never controls the 1541 drive through the Monitor OneROM; the
@@ -48,6 +48,16 @@ The shared `onerom_drive_bindings.json` stores the binding schema version,
 Control and Monitor USB serials, appearance colors, HUD card priorities, and
 Control-card visibility preferences. Priorities are saved as a number or
 `null` (`P–` in the UI); only the default seven cards begin pinned.
+
+The same JSON file stores the last normal desktop window client size. The
+Windows test window may be resized, maximized, or toggled fullscreen with
+`F11`; its rendered HUD remains centered at the fixed 16:9 Pi aspect ratio,
+using black letterbox margins instead of stretching touch geometry.
+
+The application checks attached USB serials every two seconds. If a saved
+Control or Monitor OneROM disappears, its cards become offline immediately
+and normal serial-based reconnect polling begins. This local enumeration does
+not send a command to either board.
 Unknown future JSON fields are ignored when loading so a newer preference file
 does not discard a usable role assignment.
 
@@ -56,7 +66,7 @@ timeout after three seconds.
 
 ## Matching firmware baseline
 
-Desktop V0.0.11 uses the 1541HUD firmware V1.0.6 telemetry baseline. The firmware sends all
+Desktop V0.0.12 uses the 1541HUD firmware V1.0.6 telemetry baseline. The firmware sends all
 physical header events for responsive Recent Sectors while sampling RPM and
 disk-ID metadata to keep the USB diagnostic queue healthy. Its compact health
 record is:

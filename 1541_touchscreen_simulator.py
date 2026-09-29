@@ -314,7 +314,7 @@ class DriveTelemetryParser:
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.11"
+APP_VERSION = "V0.0.12"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
