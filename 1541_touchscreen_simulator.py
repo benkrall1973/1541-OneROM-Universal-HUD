@@ -21,7 +21,7 @@ from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discove
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.9"
+APP_VERSION = "V0.0.10"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -87,6 +87,7 @@ DEFAULT_HUD_CARD_PRIORITIES = {
     # makes P– an explicit user-editable state rather than an absent setting.
     "physical_header": None,
     "sector_coverage": None,
+    "sector_fifo": None,
     "capture_health": None,
     "disk_identity": None,
     "header_rate": None,
@@ -96,6 +97,35 @@ DEFAULT_HUD_CARD_PRIORITIES = {
     "recent_evidence": None,
     "startup_rom": None,
     "boot_iec": None,
+}
+DEFAULT_CONTROL_FEATURES = {
+    "rom_select": True,
+    "iec_address": False,
+    "write_protect_override": False,
+}
+
+# Help text is intentionally concise enough for the fixed touchscreen modal,
+# but specific enough to explain provenance, calculation, and limitations.
+DETAILED_CARD_HELP = {
+    "track": "Estimated head position in whole/half tracks. Source: target-track writes plus phase transitions. A decoded physical header corrects the estimate. HEADER Δ = estimated track − latest header track; it is unavailable until a valid header arrives.",
+    "rotation": "Qualified spindle speed. RPM = SYNC pulses/second × 60 ÷ expected marks/revolution: D3=42, D2=38, D1=36, D0=34. Only 240–360 RPM is accepted; FW is the firmware's independent RPM report. The disk graphic appears only when motor telemetry is ON.",
+    "activity": "READING means motor ON with no recent write-gate pulse; WRITING means a write-gate pulse was observed; OFF means motor OFF. WRITE PULSES and STEPS are cumulative Monitor-session observations, not DOS file-operation counts.",
+    "physical_header": "Newest checksum-decoded on-disk GCR header: physical track and sector. It is stronger evidence than an estimated position. It clears after a seek or motor stop so the HUD never claims an old header describes the current head location.",
+    "sector_coverage": "Unique physical sector numbers seen on the current track window. Expected sectors are D3=21, D2=19, D1=18, D0=17. SEEN x/y is coverage, not a bad-sector test: normal drive activity may never encounter every sector.",
+    "sector_fifo": "Chronological FIFO of checksum-decoded HDRPHY sector values. It stores 31 real S## observations from one track, including repeats. It clears on seek, track change, or motor stop so sectors from different tracks are never combined.",
+    "capture_health": "CAP is the firmware capture counter. ROV is raw capture-ring overrun; any increase means raw events were lost. QOV is diagnostic queue overflow; it can drop display records while raw capture continues. DROPS = (ROV−baseline) + (QOV−baseline). Clear Drops changes only the local baseline.",
+    "disk_identity": "Disk ID comes from GCR header metadata. The HUD accepts it only after two checksum-valid headers agree. VERIFYING needs more evidence; ID CONFLICT means valid headers disagree. This checks header metadata only—not directory, DOS errors, files, or media quality.",
+    "density": "1541 GCR density zone inferred from Monitor timing/header telemetry. It selects the geometry used elsewhere: sectors/track D3=21, D2=19, D1=18, D0=17; SYNC marks/revolution D3=42, D2=38, D1=36, D0=34.",
+    "head": "IN = observed target/phase movement toward higher tracks; OUT = toward lower tracks. STALL = motor ON with no target or phase movement for 0.8 seconds. PARK = motor OFF. Position remains an estimate until a physical header confirms it.",
+    "header_rate": "Rolling physical-header decode rate. Calculation: valid decoded headers observed during the last five seconds ÷ elapsed window seconds. It measures what the passive Monitor sees, not guaranteed disk health or a DOS read rate.",
+    "capture_rate": "Passive capture-event throughput. Calculation: change in CAP ÷ time between usable STATUS records. The card uses K/S for thousands per second. It measures firmware observation work, not spindle RPM, bytes read, or DOS transfer speed.",
+    "sync_rate": "Raw SYNC pulses counted in the latest approximately one-second capture interval. It feeds RPM only when motor state and density geometry are known. A seek, motor transition, or formatting pass can produce a partial interval.",
+    "sync_per_rev": "Physical SYNC-mark estimate. Calculation: SYNC/second × 60 ÷ firmware RPM; EST is the unrounded value and the main value is rounded. Compare it with the density expectation. Nonstandard or copy-protected media can intentionally differ.",
+    "mechanism": "Cumulative observed phase/step transitions since this Monitor connection. It helps reveal seeking or repeated mechanical activity, but is neither an absolute head-position counter nor a per-disk counter. Reconnect the Monitor to reset it.",
+    "recent_evidence": "Compact chronological evidence: decoded headers, seek direction, motor changes, and write-gate activity. It is a passive Monitor trace of what actually arrived over telemetry. DOS errors, retries, directory operations, and file names are not exposed.",
+    "startup_rom": "Selects the Control OneROM startup ROM slot. After confirmation the desktop sends ROMSET=<slot> and waits for the firmware's $ROMTEST,SET,OK or FAIL reply. A confirmed save changes boot selection; it does not hot-swap the ROM currently executing.",
+    "boot_iec": "Selects the Control OneROM boot IEC device number, 8 through 11. After confirmation the desktop sends ROMIEC=<address> and requires $ROMTEST,IEC,OK with matching ADDRESS and VERIFY fields. The new address is verified by rebooting the drive.",
+    "write_protect": "Shows the physical disk-notch sensor and optionally controls the Control OneROM X2 writable override. ENABLE sends ROMWP=ON; DISABLE sends ROMWP=OFF. The card changes only after a matching $ROMTEST,WP verification reply. Override changes permission, not disk contents.",
 }
 
 
@@ -123,9 +153,9 @@ class TouchSimulator(tk.Tk):
         # These mirror the optional Control OneROM capabilities selected in
         # the board's configuration JSON at compile time.  The touchscreen may
         # show only the controls the finished Control OneROM actually supports.
-        self.controller_rom_enabled = tk.BooleanVar(value=True)
-        self.controller_iec_enabled = tk.BooleanVar(value=True)
-        self.controller_wp_enabled = tk.BooleanVar(value=True)
+        self.controller_rom_enabled = tk.BooleanVar(value=DEFAULT_CONTROL_FEATURES["rom_select"])
+        self.controller_iec_enabled = tk.BooleanVar(value=DEFAULT_CONTROL_FEATURES["iec_address"])
+        self.controller_wp_enabled = tk.BooleanVar(value=DEFAULT_CONTROL_FEATURES["write_protect_override"])
         self.startup = tk.StringVar(value="Automatic")
         self.idle_seconds = tk.IntVar(value=300)
         self.preview_ppi = tk.DoubleVar(value=102.4)
@@ -173,6 +203,7 @@ class TouchSimulator(tk.Tk):
             # Never carry a corrupt historical duplicate assignment forward.
             self.drive_binding = DriveBinding(drive_id="1541 Drive")
         self.apply_saved_appearance()
+        self.load_saved_control_features()
         self.controller_serial = tk.StringVar(value=self.drive_binding.controller_serial)
         self.hud_serial = tk.StringVar(value=self.drive_binding.hud_serial)
         self.usb_boards = {}
@@ -229,6 +260,7 @@ class TouchSimulator(tk.Tk):
         self._wp_after_id: str | None = None
         self._reconnect_after: dict[str, str] = {}
         self._reconnect_delay_ms = {"controller": 1000, "hud": 1000}
+        self._release_pending_role: str | None = None
         self.usb_log_lines: list[str] = []
         self.log_scroll = 0
         self.log_return_page = "settings"
@@ -245,6 +277,7 @@ class TouchSimulator(tk.Tk):
         self.hud_card_priorities: dict[str, int | None] = dict(DEFAULT_HUD_CARD_PRIORITIES)
         self.load_saved_hud_priorities()
         self.save_hud_priorities()
+        self.save_control_features()
 
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -439,8 +472,9 @@ class TouchSimulator(tk.Tk):
         self.append_usb_log("SYSTEM", self.usb_status.get())
 
     def append_usb_log(self, role: str, message: str) -> None:
-        """Keep a bounded, timestamped communications history for the UI."""
-        timestamp = time.strftime("%H:%M:%S")
+        """Keep a bounded communications history with millisecond timing."""
+        now = time.time()
+        timestamp = f"{time.strftime('%H:%M:%S', time.localtime(now))}.{int((now % 1) * 1000):03d}"
         self.usb_log_lines.append(f"{timestamp} [{role}] {message}")
         del self.usb_log_lines[:-500]
 
@@ -474,6 +508,7 @@ class TouchSimulator(tk.Tk):
             hud_serial=self.hud_serial.get().strip(),
             appearance=dict(self.drive_binding.appearance),
             priorities=dict(self.drive_binding.priorities),
+            control_features=dict(self.drive_binding.control_features),
         )
         try:
             if selected_role == "controller" and binding.controller_serial and binding.controller_serial == binding.hud_serial:
@@ -541,13 +576,40 @@ class TouchSimulator(tk.Tk):
         except Exception as exc:
             self.append_usb_log("SYSTEM", f"Monitor telemetry setup failed: {exc}")
 
+    def request_release_role_binding(self, role: str) -> None:
+        """Paint a release notice before Windows starts its slow CDC teardown."""
+        if self._release_pending_role is not None:
+            return
+        self._release_pending_role = role
+        role_name = "Control OneROM" if role == "controller" else "Monitor OneROM"
+        self.usb_status.set(f"Releasing {role_name}… Windows may take a few seconds to close its USB port.")
+        self.append_usb_log("SYSTEM", f"{role_name} release notice displayed; waiting briefly to paint it.")
+        self.open_size_preview()
+        self.after(80, lambda current=role: self.finish_requested_release(current))
+
+    def finish_requested_release(self, role: str) -> None:
+        try:
+            self.release_role_binding(role)
+        finally:
+            self._release_pending_role = None
+            self.open_size_preview()
+
     def release_role_binding(self, role: str) -> None:
         """Release one persisted role without touching the other OneROM."""
         if role not in ("controller", "hud"):
             raise ValueError(f"Unknown OneROM role: {role}")
+        started = time.perf_counter()
+        role_name = "Control OneROM" if role == "controller" else "Monitor OneROM"
+        self.append_usb_log("SYSTEM", f"{role_name} release requested.")
         link = self.usb_links.pop(role, None)
         if link is not None:
             link.close()
+        close_elapsed_ms = (time.perf_counter() - started) * 1000
+        close_detail = (
+            f"DTR/read cancel {link.last_close_dtr_ms:.0f} ms; handle close {link.last_close_handle_ms:.0f} ms"
+            if link is not None else "no active CDC link"
+        )
+        self.append_usb_log("SYSTEM", f"{role_name} CDC close completed in {close_elapsed_ms:.0f} ms ({close_detail}).")
         if role == "hud":
             self.reset_monitor_state()
         if role == "controller":
@@ -560,12 +622,16 @@ class TouchSimulator(tk.Tk):
             hud_serial=self.hud_serial.get().strip(),
             appearance=dict(self.drive_binding.appearance),
             priorities=dict(self.drive_binding.priorities),
+            control_features=dict(self.drive_binding.control_features),
         )
+        save_started = time.perf_counter()
         save_binding(self.binding_path, self.drive_binding)
+        save_elapsed_ms = (time.perf_counter() - save_started) * 1000
+        self.append_usb_log("SYSTEM", f"{role_name} JSON save completed in {save_elapsed_ms:.0f} ms.")
         self.ub3.set("controller" in self.usb_links)
         self.ub4.set("hud" in self.usb_links)
-        role_name = "Control OneROM" if role == "controller" else "Monitor OneROM"
-        self.usb_status.set(f"{role_name} binding released. The other OneROM role was left unchanged.")
+        total_elapsed_ms = (time.perf_counter() - started) * 1000
+        self.usb_status.set(f"{role_name} binding released in {total_elapsed_ms:.0f} ms. The other OneROM role was left unchanged.")
         self.append_usb_log("SYSTEM", self.usb_status.get())
         self.apply_device_state()
 
@@ -979,6 +1045,15 @@ class TouchSimulator(tk.Tk):
         self.recent_sectors.append(sector)
         del self.recent_sectors[:-RECENT_SECTOR_FIFO_SIZE]
 
+    def sector_fifo_lines(self) -> tuple[str, str]:
+        """Return the current track's decoded sectors in chronological FIFO order."""
+        if self._fifo_track is None or not self.recent_sectors:
+            return "WAITING FOR PHYSICAL HEADERS", "FIFO RESETS AFTER SEEK OR MOTOR STOP"
+        entries = [f"S{sector:02d}" for sector in self.recent_sectors]
+        # Fifteen values fit on each compact HUD row with a deliberate right
+        # margin before the Help and Priority controls.
+        return " · ".join(entries[:15]), " · ".join(entries[15:])
+
     def sync_revolution_reading(self) -> tuple[float | None, int | None, int | None]:
         """Return the measured ratio, its physical-count display, and zone target."""
         expected_by_density = {3: 42, 2: 38, 1: 36, 0: 34}
@@ -1114,12 +1189,14 @@ class TouchSimulator(tk.Tk):
         sync_estimate, sync_per_rev, sync_expected = self.sync_revolution_reading()
         header_rate = self.header_rate()
         history_first, history_second = self.diagnostic_history_lines()
+        fifo_first, fifo_second = self.sector_fifo_lines()
         cards = [
             ("track", "Track / Position", self.live_track, f"HEADER Δ {offset:+.1f}" if offset is not None else "POSITION ESTIMATE · HEADER WAITING", "Position is estimated from observed target-track writes and phase transitions. A decoded physical header corrects that estimate. HEADER Δ is estimated position minus the latest physical header track; WAITING means no usable header has been decoded yet."),
             ("rotation", "Motor Status", f"{rpm:.2f}" if rpm is not None else "--.--", self.rpm_quality_detail(), "Primary RPM is SYNC-derived: pulses per second × 60 ÷ expected SYNC marks per revolution. Expected marks are D3=42, D2=38, D1=36, D0=34. FW is the firmware-reported RPM used independently by SYNC / Revolution. Readings outside 240–360 RPM are rejected; the platter arrows appear only while motor telemetry is ON."),
             ("activity", "Activity", self.disk_activity_label(), f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", "WRITING is an observed write-gate pulse. Otherwise a spinning disk is shown as READING; OFF means motor telemetry is off. WRITE PULSES and STEPS are cumulative observations since this Monitor connection began, not DOS file-operation counts."),
             ("physical_header", "Physical Header", header, "CONFIRMED HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER", "This is the newest decoded on-disk GCR header: physical track and sector, not a software estimate. It clears after a seek or motor stop because that old header would no longer describe the current head location."),
             ("sector_coverage", "Sector Coverage", coverage, f"D{self.live_density} ZONE" if self.live_density is not None else "DENSITY UNKNOWN", "Counts unique sector numbers decoded on the current track observation window. Normal drive activity does not read every sector, so incomplete coverage is not a bad-sector report. Expected sectors are D3=21, D2=19, D1=18, D0=17."),
+            ("sector_fifo", "Sector FIFO", fifo_first, fifo_second, "Chronological FIFO of the most recent checksum-decoded physical sector headers on one track. Values are not invented from track geometry: each S## arrived in an HDRPHY record. The FIFO holds 31 entries and clears after a seek, track change, or motor stop so it never mixes different tracks."),
             ("capture_health", "Capture Health", capture, f"CAP {self.capture_count} · ROV {ring_overrun} · QOV {queue_overflow}" if self.capture_count is not None else "STATUS PENDING", "CAP is the firmware capture count. ROV is raw capture-ring overrun; QOV is diagnostic queue overflow. DROPS is ROV + QOV since the last local Clear Drops action. Clearing changes only this display baseline, never firmware counters or telemetry."),
             ("disk_identity", "Disk Identity", self.disk_identity_label(), self.header_validation_detail(), "Disk ID is accepted only after two matching, checksum-valid physical headers. VERIFYING means more evidence is needed; ID CONFLICT means valid headers disagreed. This validates header metadata only and does not inspect the DOS directory or files."),
             ("density", "Density Zone", f"D{self.live_density}" if self.live_density is not None else "--", f"EXPECTED {sync_expected} SYNC / REV" if sync_expected else "WAITING FOR DENSITY", "Density is inferred from Monitor timing/header telemetry. It selects the expected sector and SYNC geometry used by coverage and RPM calculations: D3=42, D2=38, D1=36, D0=34 SYNC marks per revolution."),
@@ -1131,12 +1208,17 @@ class TouchSimulator(tk.Tk):
             ("mechanism", "Mechanism", f"{self.phase_event_count} STEPS", f"TRACK {self.live_track} · HEAD {self.head_var.get()}", "Cumulative observed phase/step transitions since Monitor connection. It is useful for seeing mechanical activity and repeated seeking, but it does not reset per disk and is not an absolute head-position counter."),
             ("recent_evidence", "Recent Evidence", history_first, history_second or "PASSIVE EVENT HISTORY", "A compact chronological trace of decoded headers, seek events, write-gate activity, and motor changes. It is passive evidence for what the Monitor observed most recently; DOS errors, retries, and directory activity are not exposed by this telemetry."),
         ]
+        # Passive cards require a real Monitor OneROM session.  The dashboard
+        # can still open with only Control connected, but it must not present
+        # stale or invented Monitor measurements as if that board existed.
+        if not self.ub4.get():
+            cards = []
         # Control OneROM cards join the same sortable dashboard rather than
         # living on a separate, dead-end screen.  The desktop preview uses
         # the same list for layout work, but does not fake a USB connection
         # or transmit a command.  A physical Control OneROM is still required
         # before a real control action can be applied.
-        if self.controller_preview_available():
+        if self.ub3.get():
             if self.controller_rom_enabled.get():
                 cards.append(("startup_rom", "Control OneROM · ROM Selection", self.rom_choice.get(), self.controller_card_detail("startup_rom", "TAP TO CHOOSE STARTUP ROM"), "Selects the startup ROM slot used by the Control OneROM. Choose a slot, then confirm the save. With a connected Control OneROM, the UI sends ROMSET=<slot> and waits for its explicit OK/FAIL reply; preview mode changes only the local display."))
             if self.controller_iec_enabled.get():
@@ -1157,6 +1239,7 @@ class TouchSimulator(tk.Tk):
                 help_text = legacy_help
             else:
                 card_id, title, value, detail, help_text = card
+            help_text = DETAILED_CARD_HELP.get(card_id, help_text)
             result.append({"id": card_id, "title": title, "value": value, "detail": detail,
                            "help": help_text, "priority": self.hud_card_priorities.get(card_id),
                            "kind": "control" if card_id in {"startup_rom", "boot_iec", "write_protect"} else "telemetry"})
@@ -1202,11 +1285,11 @@ class TouchSimulator(tk.Tk):
             text = " ".join(text.split())
             return text if len(text) <= limit else f"{text[:limit - 3]}..."
 
-        if card["id"] == "recent_evidence":
+        if card["id"] in {"recent_evidence", "sector_fifo"}:
             # Evidence is an event trace, not a primary measurement. Keep a
             # useful leading portion on its own compact line and reserve the
             # lower line for its description.
-            return single_line(value, 64), single_line(detail, 64)
+            return single_line(value, 90), single_line(detail, 90)
         return value, single_line(detail)
 
     def cycle_hud_card_priority(self, card_id: str) -> None:
@@ -1237,6 +1320,25 @@ class TouchSimulator(tk.Tk):
         except OSError as exc:
             self.usb_status.set(f"HUD priorities could not be saved: {exc}")
 
+    def load_saved_control_features(self) -> None:
+        """Restore local Control-card visibility preferences from the binding."""
+        features = self.drive_binding.control_features
+        self.controller_rom_enabled.set(features.get("rom_select", DEFAULT_CONTROL_FEATURES["rom_select"]))
+        self.controller_iec_enabled.set(features.get("iec_address", DEFAULT_CONTROL_FEATURES["iec_address"]))
+        self.controller_wp_enabled.set(features.get("write_protect_override", DEFAULT_CONTROL_FEATURES["write_protect_override"]))
+
+    def save_control_features(self) -> None:
+        """Persist the three Control-card visibility settings with this drive."""
+        self.drive_binding.control_features = {
+            "rom_select": self.controller_rom_enabled.get(),
+            "iec_address": self.controller_iec_enabled.get(),
+            "write_protect_override": self.controller_wp_enabled.get(),
+        }
+        try:
+            save_binding(self.binding_path, self.drive_binding)
+        except OSError as exc:
+            self.usb_status.set(f"Control feature preferences could not be saved: {exc}")
+
     def scroll_hud_by(self, amount: int) -> None:
         """Move the visible card viewport while retaining a valid final page."""
         max_start = max(0, len(self.scroll_hud_cards()) - HUD_VISIBLE_CARD_COUNT)
@@ -1248,7 +1350,7 @@ class TouchSimulator(tk.Tk):
         core, headers, metadata, rpm, sync = 1, 2, 4, 8, 16
         needed = {
             "track": core, "rotation": core | rpm | sync, "activity": core,
-            "physical_header": headers, "sector_coverage": headers,
+            "physical_header": headers, "sector_coverage": headers, "sector_fifo": headers,
             "capture_health": core, "disk_identity": headers | metadata,
             "write_protect": core, "density": core, "head": core,
             "header_rate": headers, "capture_rate": core, "sync_rate": sync,
@@ -1305,8 +1407,8 @@ class TouchSimulator(tk.Tk):
         """Return the plain-language label for a hovered canvas icon."""
         if 14 <= y <= 70:
             top_icons = {
-                "hud": ((1136, 1192, "Open USB log"), (1200, 1256, "Open settings")),
-                "settings": ((1136, 1192, "Open USB log"), (1200, 1256, "Open Monitor list")),
+                "hud": ((1136, 1192, "Open OneROM Activity Log"), (1200, 1256, "Open settings")),
+                "settings": ((1136, 1192, "Open OneROM Activity Log"), (1200, 1256, "Open Monitor list")),
                 "log": (
                     (1008, 1064, "Clear log entries"),
                     (1072, 1128, "Copy log entries"),
@@ -1388,6 +1490,13 @@ class TouchSimulator(tk.Tk):
                     canvas.itemconfigure(
                         f"scroll_{card_id}_value",
                         fill=OFFLINE if self._confirmed_writable else TEXT,
+                    )
+                    action_color = OFFLINE if self._confirmed_writable else ACCENT
+                    canvas.itemconfigure(f"scroll_{card_id}_action_box", outline=action_color)
+                    canvas.itemconfigure(
+                        f"scroll_{card_id}_action_text",
+                        text="DISABLE OVERRIDE" if self._confirmed_writable else "ENABLE OVERRIDE",
+                        fill=action_color,
                     )
             # Paint the existing visible rows only.  Recreating the whole
             # Canvas while the CDC stream is active can keep Windows/Tk in a
@@ -1504,9 +1613,13 @@ class TouchSimulator(tk.Tk):
     def handle_controller_setting_reply(self, line: str) -> bool:
         """Paint an explicit Control OneROM OK/FAIL reply onto its source card."""
         upper = line.upper()
+        # Commands intentionally use the terse CDC command names (ROMSET and
+        # ROMIEC), while the firmware replies with its stable record types:
+        # $ROMTEST,SET,... and $ROMTEST,IEC,....  Treating the command text as
+        # the reply discriminator made a verified IEC save look like a timeout.
         card_id = (
-            "startup_rom" if "ROMSET" in upper else
-            "boot_iec" if "ROMIEC" in upper else None
+            "startup_rom" if ",SET," in upper or "ROMSET" in upper else
+            "boot_iec" if ",IEC," in upper or "ROMIEC" in upper else None
         )
         if card_id is None or card_id not in self._controller_transactions:
             return False
@@ -2033,6 +2146,10 @@ class TouchSimulator(tk.Tk):
             max_start = max(0, len(cards) - HUD_VISIBLE_CARD_COUNT)
             self.hud_scroll_index = min(self.hud_scroll_index, max_start)
             visible = cards[self.hud_scroll_index:self.hud_scroll_index + HUD_VISIBLE_CARD_COUNT]
+            if not cards:
+                canvas.create_rectangle(24*sx, HUD_CARD_TOP*sy, HUD_CARD_RIGHT*sx, 672*sy, fill=PANEL, outline=ACCENT)
+                text(48, 364, "NO ONEROM CARDS AVAILABLE", 24, TEXT, True)
+                text(48, 402, "Connect a Monitor OneROM for telemetry or a Control OneROM for setup cards.", 16, MUTED)
             for index, card in enumerate(visible):
                 # Five compact rows retain large touch targets while exposing
                 # one more operating measurement in the default viewport.
@@ -2044,7 +2161,7 @@ class TouchSimulator(tk.Tk):
                 display_value = value if len(value) <= 24 else f"{value[:21]}..."
                 # Values retain a consistent visual weight across every
                 # card.  Supporting text begins well to their right.
-                if card["id"] == "recent_evidence":
+                if card["id"] in {"recent_evidence", "sector_fifo"}:
                     text(48, y1 + 50, value, 15, TEXT, True, tag=f"scroll_{card['id']}_value")
                     text(48, y1 + 80, detail, 15, TEXT, True, tag=f"scroll_{card['id']}_detail")
                 else:
@@ -2065,8 +2182,8 @@ class TouchSimulator(tk.Tk):
                     # hidden whole-card gesture: write protection matters.
                     action = "DISABLE OVERRIDE" if self._confirmed_writable else "ENABLE OVERRIDE"
                     action_color = OFFLINE if self._confirmed_writable else ACCENT
-                    canvas.create_rectangle(HUD_OVERRIDE_LEFT*sx, (y1 + 23)*sy, HUD_OVERRIDE_RIGHT*sx, (y1 + 87)*sy, fill=PANEL_ALT, outline=action_color)
-                    text((HUD_OVERRIDE_LEFT + HUD_OVERRIDE_RIGHT) / 2, y1 + 55, action, 13, action_color, True, "center")
+                    canvas.create_rectangle(HUD_OVERRIDE_LEFT*sx, (y1 + 23)*sy, HUD_OVERRIDE_RIGHT*sx, (y1 + 87)*sy, fill=PANEL_ALT, outline=action_color, tags=f"scroll_{card['id']}_action_box")
+                    text((HUD_OVERRIDE_LEFT + HUD_OVERRIDE_RIGHT) / 2, y1 + 55, action, 13, action_color, True, "center", tag=f"scroll_{card['id']}_action_text")
                 elif card["id"] == "capture_health":
                     # Health reset is local to the diagnostic window and is
                     # safe to expose as a direct, finger-sized card action.
@@ -2074,9 +2191,10 @@ class TouchSimulator(tk.Tk):
                     text((HUD_OVERRIDE_LEFT + HUD_OVERRIDE_RIGHT) / 2, y1 + 55, "CLEAR DROPS", 14, ACCENT, True, "center")
             # Four finger-sized scrolling controls. The symbols intentionally
             # omit their former 5/1 labels: direction alone is clearer.
-            for y1, label in ((100, "⇑"), (244, "↑"), (388, "↓"), (532, "⇓")):
-                canvas.create_rectangle(HUD_SCROLL_LEFT*sx, y1*sy, HUD_SCROLL_RIGHT*sx, (y1 + 140)*sy, fill=PANEL_ALT, outline=ACCENT)
-                text((HUD_SCROLL_LEFT + HUD_SCROLL_RIGHT) / 2, y1 + 70, label, 38, TEXT, True, "center")
+            if cards:
+                for y1, label in ((100, "⇑"), (244, "↑"), (388, "↓"), (532, "⇓")):
+                    canvas.create_rectangle(HUD_SCROLL_LEFT*sx, y1*sy, HUD_SCROLL_RIGHT*sx, (y1 + 140)*sy, fill=PANEL_ALT, outline=ACCENT)
+                    text((HUD_SCROLL_LEFT + HUD_SCROLL_RIGHT) / 2, y1 + 70, label, 38, TEXT, True, "center")
             rotation_index = next((index for index, card in enumerate(visible) if card["id"] == "rotation"), None)
             if rotation_index is not None:
                 draw_spinning_disk(time.monotonic(), HUD_CARD_TOP + rotation_index * HUD_CARD_PITCH + 55)
@@ -2084,7 +2202,8 @@ class TouchSimulator(tk.Tk):
             if head_index is not None:
                 draw_head_motion(time.monotonic(), 860, HUD_CARD_TOP + head_index * HUD_CARD_PITCH)
             telemetry_label = "TELEMETRY ON" if self._hud_telemetry_enabled else "TELEMETRY WAITING"
-            text(24, 698, f"SHOWING {self.hud_scroll_index + 1}–{min(self.hud_scroll_index + HUD_VISIBLE_CARD_COUNT, len(cards))} OF {len(cards)} · {telemetry_label} · ? HELP", 14, ACCENT, True)
+            list_status = (f"SHOWING {self.hud_scroll_index + 1}–{min(self.hud_scroll_index + HUD_VISIBLE_CARD_COUNT, len(cards))} OF {len(cards)}" if cards else "NO ACTIVE CARDS")
+            text(24, 698, f"{list_status} · {telemetry_label} · ? HELP", 14, ACCENT, True)
             connection_status, connection_color = self.dashboard_connection_status()
             text(1256, 698, connection_status, 14, connection_color, True, "e")
             if self.hud_help_card:
@@ -2233,7 +2352,9 @@ class TouchSimulator(tk.Tk):
             else:
                 text(50, 306, "NO UNASSIGNED ONEROM FOUND", 22, TEXT, True)
                 text(50, 346, "Connect a board, then tap REFRESH DEVICES — discovered serials appear here.", 16, MUTED)
-            text(24, 592, self.usb_status.get(), 16, ACCENT if boards else MUTED)
+            release_notice = self._release_pending_role is not None
+            text(24, 592, self.usb_status.get(), 17 if release_notice else 16,
+                 TEXT if release_notice else (ACCENT if boards else MUTED), release_notice)
             # Four equal, evenly spaced actions make the connection workflow
             # clear: return, scan, release the assigned role, or connect.
             canvas.create_rectangle(24*sx, 620*sy, 314*sx, 672*sy, fill=PANEL_ALT, outline=ACCENT)
@@ -2248,10 +2369,10 @@ class TouchSimulator(tk.Tk):
                 canvas.create_rectangle(x1*sx, 620*sy, (x1 + 290)*sx, 672*sy, fill=PANEL_ALT, outline=color)
                 text(x1 + 145, 646, label, 15, color, True, "center")
         elif self.preview_page == "log":
-            text(26, 70, "USB Communications Log", 16, MUTED)
+            text(26, 70, "OneROM Activity Log", 16, MUTED)
             # The log uses the same right-edge scrolling lane as the HUD.
             canvas.create_rectangle(24*sx, 96*sy, HUD_CARD_RIGHT*sx, 672*sy, fill=PANEL, outline=PANEL_ALT)
-            text(48, 112, "LIVE CDC / CONNECTION HISTORY", 16, MUTED, True)
+            text(48, 112, "USB COMMUNICATIONS · HARDWARE TELEMETRY · SYSTEM EVENTS", 16, MUTED, True)
             visible_lines = 23
             max_scroll = max(0, len(self.usb_log_lines) - visible_lines)
             self.log_scroll = max(0, min(self.log_scroll, max_scroll))
@@ -2604,7 +2725,7 @@ class TouchSimulator(tk.Tk):
                 elif 338 <= x <= 628 and 620 <= y <= 672:
                     self.refresh_usb_boards()
                 elif 652 <= x <= 942 and 620 <= y <= 672:
-                    self.release_role_binding(role)
+                    self.request_release_role_binding(role)
                 elif 966 <= x <= 1256 and 620 <= y <= 672:
                     self.connect_assigned_boards(role)
                 elif 40 <= x <= 1240 and 278 <= y <= 510:
@@ -2689,6 +2810,7 @@ class TouchSimulator(tk.Tk):
                     self.controller_wp_enabled.set(not self.controller_wp_enabled.get())
                     if not self.controller_wp_enabled.get():
                         self.writable.set(False)
+                self.save_control_features()
             self.open_size_preview()
         # Bind directly to the drawing surface.  On some Windows/Tk builds a
         # Canvas does not reliably forward touch/mouse events to its Toplevel.

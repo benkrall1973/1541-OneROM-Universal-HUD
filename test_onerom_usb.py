@@ -3,11 +3,46 @@
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+from importlib import import_module
 
+TouchSimulator = import_module("1541_touchscreen_simulator").TouchSimulator
 from onerom_usb import (
     BoardDescriptor, CdcBoardLink, DriveBinding, DriveTelemetryParser,
     MAX_RX_BUFFER_BYTES, load_binding, save_binding,
 )
+
+
+class ControllerReplyProtocolTests(unittest.TestCase):
+    """Firmware reply records must settle the matching HUD transaction."""
+
+    def reply_target(self, card_id: str):
+        target = TouchSimulator.__new__(TouchSimulator)
+        target._controller_transactions = {card_id: "timer"}
+        target.controller_card_feedback = {}
+        target._pending_controller_card = card_id
+        target._hud_dirty = False
+        target.finish_controller_transaction = lambda current: target._controller_transactions.pop(current, None)
+        target.update_live_hud_fields = lambda: None
+
+        class Status:
+            def set(self, _value: str) -> None:
+                pass
+
+        target.control_status = Status()
+        return target
+
+    def test_iec_reply_record_confirms_boot_iec_transaction(self) -> None:
+        target = self.reply_target("boot_iec")
+        reply = "$ROMTEST,IEC,OK,ADDRESS=11,VERIFY=11,SAVED_SLOT=1,VALID=1"
+        self.assertTrue(target.handle_controller_setting_reply(reply))
+        self.assertEqual(target.controller_card_feedback["boot_iec"], "CONFIRMED BY CONTROL ONEROM")
+        self.assertFalse(target._controller_transactions)
+
+    def test_set_reply_record_confirms_startup_rom_transaction(self) -> None:
+        target = self.reply_target("startup_rom")
+        self.assertTrue(target.handle_controller_setting_reply("$ROMTEST,SET,OK,SLOT=2"))
+        self.assertEqual(target.controller_card_feedback["startup_rom"], "CONFIRMED BY CONTROL ONEROM")
+        self.assertFalse(target._controller_transactions)
 
 
 class _FakeCdcDevice:
@@ -114,6 +149,7 @@ class DriveBindingPersistenceTests(unittest.TestCase):
             hud_serial="MONITOR-456",
             appearance={"background": "#112233", "accent": "#AABBCC"},
             priorities={"track": 1, "capture_health": None, "sync_rate": 12},
+            control_features={"rom_select": True, "iec_address": False, "write_protect_override": False},
         )
         # Exercise the actual JSON payload without creating an artifact in a
         # test environment that intentionally blocks Python file writes.
@@ -123,6 +159,7 @@ class DriveBindingPersistenceTests(unittest.TestCase):
                 hud_serial=binding.hud_serial,
                 appearance=binding.appearance,
                 priorities=binding.priorities,
+                control_features=binding.control_features,
             ))
         payload = write_text.call_args.args[0]
         with patch.object(Path, "read_text", return_value=payload):
@@ -132,6 +169,7 @@ class DriveBindingPersistenceTests(unittest.TestCase):
         self.assertEqual(loaded.hud_serial, "MONITOR-456")
         self.assertEqual(loaded.appearance, {"background": "#112233", "accent": "#AABBCC"})
         self.assertEqual(loaded.priorities, {"track": 1, "capture_health": None, "sync_rate": 12})
+        self.assertEqual(loaded.control_features, {"rom_select": True, "iec_address": False, "write_protect_override": False})
 
     def test_unknown_config_fields_do_not_discard_known_settings(self) -> None:
         path = Path("onerom_drive_bindings.json")

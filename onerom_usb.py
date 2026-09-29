@@ -79,6 +79,7 @@ class DriveBinding:
     hud_serial: str = ""
     appearance: dict[str, str] = field(default_factory=dict)
     priorities: dict[str, int | None] = field(default_factory=dict)
+    control_features: dict[str, bool] = field(default_factory=dict)
 
     def validate(self) -> None:
         if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version < 1:
@@ -89,6 +90,11 @@ class DriveBinding:
             raise ValueError("Display appearance preferences must be a mapping.")
         if not isinstance(self.priorities, dict):
             raise ValueError("HUD priorities must be a mapping.")
+        if not isinstance(self.control_features, dict) or not all(
+            isinstance(name, str) and isinstance(enabled, bool)
+            for name, enabled in self.control_features.items()
+        ):
+            raise ValueError("Control feature preferences must be a boolean mapping.")
 
 
 @dataclass
@@ -158,6 +164,7 @@ def load_binding(path: Path) -> DriveBinding:
             hud_serial=raw.get("hud_serial", ""),
             appearance=raw.get("appearance", {}),
             priorities=raw.get("priorities", {}),
+            control_features=raw.get("control_features", {}),
         )
         binding.validate()
         return binding
@@ -178,6 +185,8 @@ class CdcBoardLink:
         self.device = None
         self._buffer = ""
         self.opened_at = 0.0
+        self.last_close_dtr_ms = 0.0
+        self.last_close_handle_ms = 0.0
 
     @property
     def connected(self) -> bool:
@@ -234,11 +243,26 @@ class CdcBoardLink:
 
     def close(self) -> None:
         if self.device is not None:
+            device = self.device
+            dtr_started = time.perf_counter()
             try:
-                self.device.dtr = False
-                self.device.close()
+                # Explicitly cancel any outstanding Win32 overlapped read
+                # before changing the line state or closing the handle.
+                # pyserial also does this internally, but making it explicit
+                # lets release timing identify a driver that is stuck here.
+                cancel_read = getattr(device, "cancel_read", None)
+                if callable(cancel_read):
+                    cancel_read()
+                device.dtr = False
             except Exception:
                 pass
+            self.last_close_dtr_ms = (time.perf_counter() - dtr_started) * 1000
+            handle_started = time.perf_counter()
+            try:
+                device.close()
+            except Exception:
+                pass
+            self.last_close_handle_ms = (time.perf_counter() - handle_started) * 1000
         self.device = None
 
 
