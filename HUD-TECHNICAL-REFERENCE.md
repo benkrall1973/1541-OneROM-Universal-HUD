@@ -1,4 +1,4 @@
-# 1541 OneROM Desktop Monitor V0.0.12 baseline
+# 1541 OneROM Desktop Monitor V0.0.13 baseline
 
 The desktop Monitor is a Python/Tkinter display for the passive Monitor OneROM
 firmware. It never controls the 1541 drive through the Monitor OneROM; the
@@ -55,9 +55,10 @@ Windows test window may be resized, maximized, or toggled fullscreen with
 using black letterbox margins instead of stretching touch geometry.
 
 The application checks attached USB serials every two seconds. If a saved
-Control or Monitor OneROM disappears, its cards become offline immediately
-and normal serial-based reconnect polling begins. This local enumeration does
-not send a command to either board.
+Control or Monitor OneROM disappears—or its CDC link raises a Windows
+disconnect error—its cards become offline immediately, the active Canvas is
+redrawn, and normal serial-based reconnect polling begins. This local
+enumeration does not send a command to either board.
 Unknown future JSON fields are ignored when loading so a newer preference file
 does not discard a usable role assignment.
 
@@ -66,7 +67,7 @@ timeout after three seconds.
 
 ## Matching firmware baseline
 
-Desktop V0.0.12 uses the 1541HUD firmware V1.0.6 telemetry baseline. The firmware sends all
+Desktop V0.0.13 uses the 1541HUD firmware V1.0.6 telemetry baseline. The firmware sends all
 physical header events for responsive Recent Sectors while sampling RPM and
 disk-ID metadata to keep the USB diagnostic queue healthy. Its compact health
 record is:

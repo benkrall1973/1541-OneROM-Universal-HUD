@@ -314,7 +314,7 @@ class DriveTelemetryParser:
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.12"
+APP_VERSION = "V0.0.13"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -570,6 +570,7 @@ class TouchSimulator(tk.Tk):
         self._hud_subscription_mask: int | None = None
         self._hud_telemetry_enabled = False
         self._hud_redraw_after: str | None = None
+        self._preview_redraw_after: str | None = None
         self.hud_card_priorities: dict[str, int | None] = dict(DEFAULT_HUD_CARD_PRIORITIES)
         self.load_saved_hud_priorities()
         self.save_hud_priorities()
@@ -1118,13 +1119,16 @@ class TouchSimulator(tk.Tk):
             self._hud_subscription_mask = None
             self.reset_monitor_state()
             self.record_serial_diagnostic("Monitor", link, exc)
-            link.close()
+            # A removed Windows CDC handle may block in close().  Clear and
+            # paint the role first; otherwise this exception path leaves the
+            # visible dashboard claiming that Monitor is still connected.
             self.usb_links.pop("hud", None)
             self.ub4.set(False)
             self.usb_status.set(f"Monitor link interrupted; reconnecting automatically: {exc}")
             self.append_usb_log("MONITOR", self.usb_status.get())
             self.apply_device_state()
-            self.schedule_role_reconnect("hud")
+            self.request_preview_redraw()
+            self.after(80, lambda stale_link=link: self.finish_unplugged_role("hud", stale_link))
 
     def poll_controller_feedback(self) -> None:
         """Drain Control OneROM CDC output so its USB log/reply FIFO cannot back up."""
@@ -1149,13 +1153,15 @@ class TouchSimulator(tk.Tk):
                             self.control_status.set(f"Control OneROM rejected request: {line}")
         except Exception as exc:
             self.record_serial_diagnostic("Control OneROM", link, exc)
-            link.close()
+            # See the Monitor failure path above: close() can block after a
+            # USB pull, so state and Canvas redraw must happen before it.
             self.usb_links.pop("controller", None)
             self.ub3.set(False)
             self.usb_status.set(f"Control OneROM serial link interrupted; reconnecting automatically: {exc}")
             self.append_usb_log("CONTROL", self.usb_status.get())
             self.apply_device_state()
-            self.schedule_role_reconnect("controller")
+            self.request_preview_redraw()
+            self.after(80, lambda stale_link=link: self.finish_unplugged_role("controller", stale_link))
 
     def schedule_role_reconnect(self, role: str) -> None:
         """Retry one role with backoff after a transient Windows CDC failure."""
@@ -1187,12 +1193,32 @@ class TouchSimulator(tk.Tk):
             self.usb_status.set(f"{role_name} unplugged; waiting for its saved USB serial to reappear.")
             self.append_usb_log("SYSTEM", self.usb_status.get())
             self.apply_device_state()
-            self.open_size_preview()
+            self.request_preview_redraw()
             self.after(80, lambda current=role, stale_link=link: self.finish_unplugged_role(current, stale_link))
 
+    def request_preview_redraw(self) -> None:
+        """Rebuild the visible Canvas after the current USB callback returns."""
+        if self._preview_redraw_after is not None:
+            return
+
+        def redraw() -> None:
+            self._preview_redraw_after = None
+            preview = getattr(self, "preview", None)
+            if preview is not None and preview.winfo_exists():
+                self.open_size_preview()
+
+        # Rebuilding/destroying Canvas items inside the CDC callback itself
+        # can leave the existing surface on screen until another input event.
+        # Tk's idle turn is the correct hand-off from transport state to UI.
+        self._preview_redraw_after = self.after_idle(redraw)
+
     def finish_unplugged_role(self, role: str, link: CdcBoardLink) -> None:
-        """Close a removed handle after the offline state has painted."""
+        """Close a removed handle, then confirm the offline layout is painted."""
         link.close()
+        # Closing a vanished Windows CDC handle can take several seconds. The
+        # role state was cleared before that wait, but repaint once more after
+        # teardown so the active Canvas cannot retain an old card layout.
+        self.request_preview_redraw()
         self.schedule_role_reconnect(role)
 
     def restore_saved_role_connections(self) -> None:
@@ -3294,10 +3320,6 @@ class TouchSimulator(tk.Tk):
         self.last_input = time.monotonic()
 
     def tick(self) -> None:
-        now = time.monotonic()
-        if now >= self._next_usb_presence_check:
-            self._next_usb_presence_check = now + 2.0
-            self.check_connected_board_presence()
         if self.ub4.get() and self.motor:
             self.sector = self.sector % 17 + 1
             self.sector_var.set(f"{self.sector:02d}")
@@ -3306,9 +3328,18 @@ class TouchSimulator(tk.Tk):
         self.after(100, self.tick)
 
     def poll_serial_loop(self) -> None:
-        """Drain the Monitor CDC FIFO at the proven desktop-GUI cadence."""
+        """Service CDC data and the physical-device presence check.
+
+        This callback remains active while the Canvas preview owns the visible
+        UI.  Keeping the two-second enumeration check here avoids relying on
+        the independent animation/idle timer to notice a USB removal.
+        """
         self.poll_usb_telemetry()
         self.poll_controller_feedback()
+        now = time.monotonic()
+        if now >= self._next_usb_presence_check:
+            self._next_usb_presence_check = now + 2.0
+            self.check_connected_board_presence()
         self.after(20, self.poll_serial_loop)
 
 
