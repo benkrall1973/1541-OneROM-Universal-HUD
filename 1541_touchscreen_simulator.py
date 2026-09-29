@@ -10,18 +10,311 @@ from __future__ import annotations
 import time
 import math
 import colorsys
+from dataclasses import asdict, dataclass, field
+import json
 import re
 import os
+import sys
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
 from tkinter import font as tkfont
 
-from onerom_usb import CdcBoardLink, DriveBinding, DriveTelemetryParser, discover_cdc_boards, load_binding, save_binding
+try:
+    import serial
+    from serial.tools import list_ports
+except ImportError:  # Keep GUI layout work usable before pyserial is installed.
+    serial = None
+    list_ports = None
+
+
+# The CDC transport, parser, and persistent binding schema live here rather
+# than in a companion module.  That makes this one file the complete desktop
+# application; its USB protocol behavior remains the same as the tested
+# standalone implementation it replaced.
+BAUD_RATE = 115200
+MAX_RX_BUFFER_BYTES = 16 * 1024
+HEAD_STALL_TIMEOUT = 0.8
+STATE_RE = re.compile(r"STATE\s+([A-Za-z][0-9.]+)")
+STATUS_RE = re.compile(r"STATUS\s+([A-Za-z][0-9.]+)")
+MOTOR_RE = re.compile(r"MOTOR\s+state=(\d+)")
+PHASE_RE = re.compile(r"PHASE\s+old=(\d+)\s+new=(\d+)\s+delta=(\d+)\s+motor=(\d+)")
+TRACK_RE = re.compile(r"TRACK_WRITE\s+addr=\$0022\s+data=\$[0-9A-Fa-f]+\s+\((\d+)\)")
+DENSITY_RE = re.compile(r"DENSITY\s+state=(\d+)")
+WRITE_PROTECT_RE = re.compile(r"WRITE_PROTECT\s+state=(\d+)")
+WRITE_GATE_RE = re.compile(r"WRITE_GATE\s+state=(\d+)")
+STATUS_WP_RE = re.compile(r"\bWPV=(\d+)\s+WP=(\d+)")
+STATUS_TRACK_RE = re.compile(r"\bTV=(\d+)\s+T=(\d+)")
+STATUS_POSITION_RE = re.compile(r"\bTPV=(\d+)\s+TP2=(\d+)")
+STATUS_DENSITY_RE = re.compile(r"\bDV=(\d+)\s+D=(\d+)")
+STATUS_MOTOR_RE = re.compile(r"\bM=(\d+)")
+STATUS_WRITE_GATE_RE = re.compile(r"\bWGV=(\d+)\s+WG=(\d+)")
+STATUS_CAPTURE_RE = re.compile(r"\bCAP=(\d+)\s+PROD=(\d+)\s+CONS=(\d+)\s+ROV=(\d+)\s+QOV=(\d+)")
+STATUS_CAPTURE_COMPACT_RE = re.compile(r"\bC=(\d+)\s+R=(\d+)\s+Q=(\d+)")
+HDRPHY_RE = re.compile(r"\bHDRPHY\b.*?\bT=(\d+)\s+S=(\d+)")
+HDRMETA_RE = re.compile(r"\bHDRMETA\b.*?\bID1=\$([0-9A-Fa-f]{2})\s+ID2=\$([0-9A-Fa-f]{2})\s+CHK=\$([0-9A-Fa-f]{2})\s+OK=([01])")
+RPM_RE = re.compile(r"\bRPM\b.*?\bRPM=([0-9]+(?:\.[0-9]+)?)")
+SYNC_RE = re.compile(r"\bSYNC\b.*?\bCOUNT=(\d+)\s+LEVEL=(\d+)")
+
+
+@dataclass(frozen=True)
+class BoardDescriptor:
+    serial_number: str
+    port: str
+    description: str
+    vid: int | None = None
+    pid: int | None = None
+
+    @property
+    def label(self) -> str:
+        return f"{self.serial_number}  —  {self.port}"
+
+
+@dataclass
+class DriveBinding:
+    version: int = 2
+    drive_id: str = "1541 Drive"
+    controller_serial: str = ""
+    hud_serial: str = ""
+    appearance: dict[str, str] = field(default_factory=dict)
+    priorities: dict[str, int | None] = field(default_factory=dict)
+    control_features: dict[str, bool] = field(default_factory=dict)
+    window_size: dict[str, int] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version < 1:
+            raise ValueError("Binding configuration version must be a positive integer.")
+        if self.controller_serial and self.controller_serial == self.hud_serial:
+            raise ValueError("A OneROM serial can be assigned to only one role on a drive.")
+        if not isinstance(self.appearance, dict) or not isinstance(self.priorities, dict):
+            raise ValueError("Display preferences must be mappings.")
+        if not isinstance(self.control_features, dict) or not all(isinstance(k, str) and isinstance(v, bool) for k, v in self.control_features.items()):
+            raise ValueError("Control feature preferences must be a boolean mapping.")
+        if not isinstance(self.window_size, dict) or not all(
+            name in {"width", "height"} and isinstance(value, int) and not isinstance(value, bool)
+            for name, value in self.window_size.items()
+        ):
+            raise ValueError("Window size must be an integer width/height mapping.")
+
+
+@dataclass
+class TelemetryState:
+    firmware: str = ""
+    motor: bool | None = None
+    protected: bool | None = None
+    writing: bool | None = None
+    density: int | None = None
+    position_half_tracks: int | None = None
+    head: str = "PARK"
+    rpm: float | None = None
+    sector: int | None = None
+    sync_count: int | None = None
+    sync_level: int | None = None
+    header_track: int | None = None
+    header_id1: int | None = None
+    header_id2: int | None = None
+    header_checksum: int | None = None
+    header_checksum_valid: bool | None = None
+    capture_count: int | None = None
+    produced_total: int | None = None
+    consumed_total: int | None = None
+    ring_overrun: int | None = None
+    queue_overflow: int | None = None
+
+    @property
+    def track(self) -> str:
+        if self.position_half_tracks is None:
+            return "--.-"
+        return f"{self.position_half_tracks // 2:02d}{'.5' if self.position_half_tracks & 1 else '.0'}"
+
+
+def discover_cdc_boards() -> list[BoardDescriptor]:
+    if list_ports is None:
+        return []
+    boards = [BoardDescriptor(str(p.serial_number), str(p.device), str(p.description or "USB Serial Device"), p.vid, p.pid)
+              for p in list_ports.comports() if p.serial_number]
+    return sorted(boards, key=lambda board: (board.serial_number, board.port))
+
+
+def load_binding(path: Path) -> DriveBinding:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("Binding configuration must be an object.")
+        binding = DriveBinding(version=raw.get("version", 1), drive_id=raw.get("drive_id", "1541 Drive"),
+                               controller_serial=raw.get("controller_serial", ""), hud_serial=raw.get("hud_serial", ""),
+                               appearance=raw.get("appearance", {}), priorities=raw.get("priorities", {}),
+                               control_features=raw.get("control_features", {}), window_size=raw.get("window_size", {}))
+        binding.validate()
+        return binding
+    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        return DriveBinding()
+
+
+def save_binding(path: Path, binding: DriveBinding) -> None:
+    binding.validate()
+    path.write_text(json.dumps(asdict(binding), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+class CdcBoardLink:
+    def __init__(self, board: BoardDescriptor):
+        self.board, self.device, self._buffer, self.opened_at = board, None, "", 0.0
+        self.last_close_dtr_ms = self.last_close_handle_ms = 0.0
+
+    @property
+    def connected(self) -> bool:
+        return self.device is not None and bool(getattr(self.device, "is_open", False))
+
+    def open(self) -> None:
+        if serial is None:
+            raise RuntimeError("pyserial is not installed")
+        self.close()
+        device = serial.Serial()
+        device.port, device.baudrate, device.timeout = self.board.port, BAUD_RATE, 0
+        device.dtr = device.rts = False
+        device.open()
+        self.device, self._buffer, self.opened_at = device, "", time.monotonic()
+
+    def assert_dtr(self) -> None:
+        if self.connected:
+            self.device.dtr = True
+
+    def read_lines(self) -> list[str]:
+        if not self.connected:
+            return []
+        payload = self.device.read(4096)
+        if payload:
+            self._buffer += payload.decode("ascii", errors="ignore")
+            if len(self._buffer) > MAX_RX_BUFFER_BYTES:
+                self._buffer = ""
+        lines: list[str] = []
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line.strip():
+                lines.append(line.strip())
+        return lines
+
+    def write_command(self, command: str) -> None:
+        if not self.connected:
+            raise RuntimeError("OneROM USB serial link is not connected")
+        line = command.strip()
+        if not line:
+            raise ValueError("OneROM command cannot be empty")
+        self.device.write((line + "\r\n").encode("ascii"))
+        self.device.flush()
+
+    def close(self) -> None:
+        if self.device is not None:
+            device, started = self.device, time.perf_counter()
+            try:
+                cancel_read = getattr(device, "cancel_read", None)
+                if callable(cancel_read):
+                    cancel_read()
+                device.dtr = False
+            except Exception:
+                pass
+            self.last_close_dtr_ms = (time.perf_counter() - started) * 1000
+            started = time.perf_counter()
+            try:
+                device.close()
+            except Exception:
+                pass
+            self.last_close_handle_ms = (time.perf_counter() - started) * 1000
+        self.device = None
+
+
+class DriveTelemetryParser:
+    def __init__(self) -> None:
+        self.state, self._last_motion = TelemetryState(), 0.0
+        self._last_requested_track: int | None = None
+        self._last_direction: str | None = None
+
+    def process(self, line: str) -> TelemetryState:
+        self._refresh_head_state()
+        state_match = STATE_RE.search(line) or STATUS_RE.search(line)
+        if state_match:
+            self.state.firmware = state_match.group(1); self._state_snapshot(line); return self.state
+        for matcher, setter in ((DENSITY_RE, lambda m: setattr(self.state, "density", int(m.group(1)) & 3)),
+                                (WRITE_PROTECT_RE, lambda m: setattr(self.state, "protected", not bool(int(m.group(1))))),
+                                (WRITE_GATE_RE, lambda m: setattr(self.state, "writing", bool(int(m.group(1)))))):
+            match = matcher.search(line)
+            if match:
+                setter(match); return self.state
+        match = MOTOR_RE.search(line)
+        if match: self._set_motor(bool(int(match.group(1)))); return self.state
+        match = TRACK_RE.search(line)
+        if match: self._set_track(int(match.group(1))); return self.state
+        match = PHASE_RE.search(line)
+        if match: self._phase(int(match.group(3))); return self.state
+        match = HDRPHY_RE.search(line)
+        if match: self.state.header_track, self.state.sector = int(match.group(1)), int(match.group(2)); return self.state
+        match = HDRMETA_RE.search(line)
+        if match:
+            self.state.header_id1, self.state.header_id2, self.state.header_checksum = int(match.group(1), 16), int(match.group(2), 16), int(match.group(3), 16)
+            self.state.header_checksum_valid = bool(int(match.group(4))); return self.state
+        match = RPM_RE.search(line)
+        if match: self.state.rpm = float(match.group(1)); return self.state
+        match = SYNC_RE.search(line)
+        if match: self.state.sync_count, self.state.sync_level = int(match.group(1)), int(match.group(2))
+        return self.state
+
+    def refresh(self) -> TelemetryState:
+        self._refresh_head_state(); return self.state
+
+    def _state_snapshot(self, line: str) -> None:
+        match = STATUS_WP_RE.search(line)
+        if match and int(match.group(1)): self.state.protected = not bool(int(match.group(2)))
+        match = STATUS_DENSITY_RE.search(line)
+        if match and int(match.group(1)): self.state.density = int(match.group(2)) & 3
+        match = STATUS_MOTOR_RE.search(line)
+        if match: self._set_motor(bool(int(match.group(1))))
+        match = STATUS_WRITE_GATE_RE.search(line)
+        if match and int(match.group(1)): self.state.writing = bool(int(match.group(2)))
+        match = STATUS_CAPTURE_RE.search(line)
+        if match:
+            self.state.capture_count, self.state.produced_total, self.state.consumed_total, self.state.ring_overrun, self.state.queue_overflow = map(int, match.groups())
+        else:
+            match = STATUS_CAPTURE_COMPACT_RE.search(line)
+            if match: self.state.capture_count, self.state.ring_overrun, self.state.queue_overflow = map(int, match.groups())
+        match = STATUS_POSITION_RE.search(line)
+        if match and int(match.group(1)): self.state.position_half_tracks = max(2, int(match.group(2)))
+        else:
+            match = STATUS_TRACK_RE.search(line)
+            if match and int(match.group(1)): self._set_track(int(match.group(2)))
+
+    def _set_motor(self, motor: bool) -> None:
+        self.state.motor = motor
+        if not motor: self.state.head, self.state.rpm = "PARK", 0.0
+        elif self._last_motion <= 0: self._last_motion = time.monotonic()
+
+    def _refresh_head_state(self) -> None:
+        if not self.state.motor: self.state.head = "PARK"
+        elif self._last_motion and time.monotonic() - self._last_motion >= HEAD_STALL_TIMEOUT: self.state.head = "STALL"
+
+    def _set_track(self, track: int) -> None:
+        if self.state.position_half_tracks is None: self.state.position_half_tracks = max(2, track * 2)
+        previous, self._last_requested_track = self._last_requested_track, track
+        if not self.state.motor: self.state.head = "PARK"; return
+        if previous is None: self._last_motion = time.monotonic(); return
+        if track == previous: return
+        self._last_motion, self._last_direction = time.monotonic(), "IN" if track > previous else "OUT"
+        self.state.head = self._last_direction
+
+    def _phase(self, delta: int) -> None:
+        if self.state.motor: self._last_motion = time.monotonic()
+        if delta == 1:
+            if self.state.position_half_tracks is not None: self.state.position_half_tracks += 1
+            self.state.head = "IN" if self.state.motor else "PARK"
+            if self.state.motor: self._last_direction = "IN"
+        elif delta == 3:
+            if self.state.position_half_tracks is not None: self.state.position_half_tracks = max(2, self.state.position_half_tracks - 1)
+            self.state.head = "OUT" if self.state.motor else "PARK"
+            if self.state.motor: self._last_direction = "OUT"
+        elif self.state.motor and self._last_direction is not None: self.state.head = self._last_direction
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.10"
+APP_VERSION = "V0.0.11"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -34,6 +327,9 @@ HUD_PRIORITY_LEFT, HUD_PRIORITY_RIGHT = 1036, 1110
 # The override action uses the same 10-pixel gap before Help as Help uses
 # before Priority, while remaining wide enough for its full safety label.
 HUD_OVERRIDE_LEFT, HUD_OVERRIDE_RIGHT = 720, 944
+# Refresh is deliberately compact so its feedback can remain visible in the
+# detail lane. It preserves the 10-pixel gap before Help.
+HUD_REFRESH_LEFT, HUD_REFRESH_RIGHT = 810, 944
 HUD_SCROLL_LEFT, HUD_SCROLL_RIGHT = 1150, 1256
 CONTROL_REPLY_TIMEOUT_MS = 3000
 # The FIFO has 1,026 virtual pixels from x=230 to the card's right edge.
@@ -159,7 +455,6 @@ class TouchSimulator(tk.Tk):
         self.startup = tk.StringVar(value="Automatic")
         self.idle_seconds = tk.IntVar(value=300)
         self.preview_ppi = tk.DoubleVar(value=102.4)
-        self.preview_scale = tk.IntVar(value=100)
         # Slot 0 is the OneROM bootloader and deliberately not selectable.
         # Present every selectable startup slot, exactly as the real UB3
         # firmware reports them.
@@ -260,6 +555,7 @@ class TouchSimulator(tk.Tk):
         self._wp_after_id: str | None = None
         self._reconnect_after: dict[str, str] = {}
         self._reconnect_delay_ms = {"controller": 1000, "hud": 1000}
+        self._next_usb_presence_check = 0.0
         self._release_pending_role: str | None = None
         self.usb_log_lines: list[str] = []
         self.log_scroll = 0
@@ -384,8 +680,6 @@ class TouchSimulator(tk.Tk):
         ttk.Button(startup, text="PREVIEW IDLE SCREEN", command=self.show_idle).grid(row=2, column=2, padx=8, pady=(12, 0))
         ttk.Label(startup, text="Monitor PPI (V226HQL is 102.4):", style="Panel.TLabel").grid(row=3, column=0, sticky="w", pady=(16, 0))
         ttk.Spinbox(startup, from_=70, to=240, increment=0.1, textvariable=self.preview_ppi, width=9, font=("Segoe UI", 11)).grid(row=3, column=1, sticky="w", padx=12, pady=(16, 0))
-        ttk.Label(startup, text="Preview scale (%):", style="Panel.TLabel").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Spinbox(startup, from_=25, to=200, textvariable=self.preview_scale, width=9, font=("Segoe UI", 11)).grid(row=4, column=1, sticky="w", padx=12, pady=(8, 0))
         ttk.Button(startup, text="OPEN / APPLY 7-INCH PREVIEW", command=self.open_size_preview).grid(row=4, column=2, padx=8, pady=(8, 0))
         ttk.Button(page, text="← RETURN", style="Nav.TButton", command=lambda: self.show_page(self.default_page())).pack(anchor="w", pady=16)
 
@@ -509,6 +803,7 @@ class TouchSimulator(tk.Tk):
             appearance=dict(self.drive_binding.appearance),
             priorities=dict(self.drive_binding.priorities),
             control_features=dict(self.drive_binding.control_features),
+            window_size=dict(self.drive_binding.window_size),
         )
         try:
             if selected_role == "controller" and binding.controller_serial and binding.controller_serial == binding.hud_serial:
@@ -623,6 +918,7 @@ class TouchSimulator(tk.Tk):
             appearance=dict(self.drive_binding.appearance),
             priorities=dict(self.drive_binding.priorities),
             control_features=dict(self.drive_binding.control_features),
+            window_size=dict(self.drive_binding.window_size),
         )
         save_started = time.perf_counter()
         save_binding(self.binding_path, self.drive_binding)
@@ -843,6 +1139,8 @@ class TouchSimulator(tk.Tk):
                 if line.startswith("$ROMTEST,"):
                     if line.startswith("$ROMTEST,WP,"):
                         self.handle_controller_wp_reply(line)
+                    elif line.startswith("$ROMTEST,SAVED,"):
+                        self.handle_controller_settings_refresh_reply(line)
                     elif ",OK," in line or line.endswith(",OK"):
                         if not self.handle_controller_setting_reply(line):
                             self.control_status.set(f"Control OneROM verified: {line}")
@@ -866,6 +1164,36 @@ class TouchSimulator(tk.Tk):
         delay = self._reconnect_delay_ms[role]
         self._reconnect_after[role] = self.after(delay, lambda current=role: self.attempt_role_reconnect(current))
         self._reconnect_delay_ms[role] = min(delay * 2, 8000)
+
+    def check_connected_board_presence(self) -> None:
+        """Detect USB removal even when Windows leaves a CDC handle open."""
+        boards = discover_cdc_boards()
+        self.usb_boards = {board.serial_number: board for board in boards}
+        present_serials = set(self.usb_boards)
+        for role, link in tuple(self.usb_links.items()):
+            if link.board.serial_number in present_serials:
+                continue
+            # Remove the role from live state before close(). On Windows a
+            # vanished CDC handle can take several seconds to close, but the
+            # dashboard must stop claiming that its hardware is present now.
+            self.usb_links.pop(role, None)
+            role_name = "Control OneROM" if role == "controller" else "Monitor OneROM"
+            if role == "controller":
+                self.ub3.set(False)
+                self.writable.set(False)
+            else:
+                self.ub4.set(False)
+                self.reset_monitor_state()
+            self.usb_status.set(f"{role_name} unplugged; waiting for its saved USB serial to reappear.")
+            self.append_usb_log("SYSTEM", self.usb_status.get())
+            self.apply_device_state()
+            self.open_size_preview()
+            self.after(80, lambda current=role, stale_link=link: self.finish_unplugged_role(current, stale_link))
+
+    def finish_unplugged_role(self, role: str, link: CdcBoardLink) -> None:
+        """Close a removed handle after the offline state has painted."""
+        link.close()
+        self.schedule_role_reconnect(role)
 
     def restore_saved_role_connections(self) -> None:
         """Immediately reconnect every saved role after program startup."""
@@ -1610,6 +1938,47 @@ class TouchSimulator(tk.Tk):
         self._hud_dirty = True
         self.update_live_hud_fields()
 
+    def refresh_control_startup_settings(self) -> None:
+        """Read the saved ROM slot and boot IEC address without changing either."""
+        if self._controller_transactions:
+            self.control_status.set("Waiting for the prior Control OneROM response.")
+            return
+        try:
+            self.send_controller_command("ROMGET")
+            self.begin_controller_transaction("settings_refresh")
+            self.controller_card_feedback["startup_rom"] = "REFRESHING FROM CONTROL ONEROM"
+            self.controller_card_feedback["boot_iec"] = "REFRESHING FROM CONTROL ONEROM"
+            self.control_status.set("Reading saved ROM slot and boot IEC address from Control OneROM.")
+        except Exception as exc:
+            self.controller_card_feedback["startup_rom"] = "REFRESH FAILED"
+            self.controller_card_feedback["boot_iec"] = "REFRESH FAILED"
+            self.control_status.set(f"Control settings were not refreshed: {exc}")
+        self._hud_dirty = True
+        self.update_live_hud_fields()
+
+    def handle_controller_settings_refresh_reply(self, line: str) -> bool:
+        """Apply the firmware's read-only ROMGET response to both cards."""
+        if "settings_refresh" not in self._controller_transactions:
+            return False
+        slot_match = re.search(r"\bSLOT=(\d+)", line, re.IGNORECASE)
+        iec_match = re.search(r"\bBOOT_IEC=(\d+)", line, re.IGNORECASE)
+        if slot_match is None or iec_match is None:
+            return False
+        slot, address = int(slot_match.group(1)), int(iec_match.group(1))
+        if not 1 <= slot <= len(self.rom_choices) or not 8 <= address <= 11:
+            return False
+        self.rom_choice.set(self.rom_choices[slot - 1])
+        self.rom_var.set(self.rom_choice.get())
+        self.iec_choice.set(f"Device {address}")
+        self.iec_var.set(self.iec_choice.get())
+        self.controller_card_feedback["startup_rom"] = "REFRESHED FROM CONTROL ONEROM"
+        self.controller_card_feedback["boot_iec"] = "REFRESHED FROM CONTROL ONEROM"
+        self.control_status.set("Saved ROM slot and boot IEC address refreshed from Control OneROM.")
+        self.finish_controller_transaction("settings_refresh")
+        self._hud_dirty = True
+        self.update_live_hud_fields()
+        return True
+
     def handle_controller_setting_reply(self, line: str) -> bool:
         """Paint an explicit Control OneROM OK/FAIL reply onto its source card."""
         upper = line.upper()
@@ -1722,6 +2091,9 @@ class TouchSimulator(tk.Tk):
             self.writable.set(self._confirmed_writable)
         if self._pending_controller_card == card_id:
             self._pending_controller_card = None
+        if card_id == "settings_refresh":
+            self.controller_card_feedback["startup_rom"] = "CONTROL REFRESH TIMEOUT"
+            self.controller_card_feedback["boot_iec"] = "CONTROL REFRESH TIMEOUT"
         self.controller_card_feedback[card_id] = "CONTROL RESPONSE TIMEOUT"
         self.control_status.set(f"Control OneROM response timeout: {card_id.replace('_', ' ')}.")
         self.append_usb_log("CONTROL", self.control_status.get())
@@ -1879,10 +2251,6 @@ class TouchSimulator(tk.Tk):
         y1 = (720 - height) // 2
         return x1, y1, x2, y1 + 92, row_height
 
-    def change_preview_scale(self, delta: int) -> None:
-        self.preview_scale.set(max(25, min(200, self.preview_scale.get() + delta)))
-        self.open_size_preview()
-
     @staticmethod
     def is_hex_color(color: str) -> bool:
         return bool(HEX_COLOR_RE.fullmatch(color))
@@ -1993,7 +2361,38 @@ class TouchSimulator(tk.Tk):
         self.preview_page = "settings"
         self.open_size_preview()
 
-    def open_size_preview(self, _restore_workspace: bool = False) -> None:
+    def close_preview(self) -> None:
+        """Persist the last usable touchscreen client size before exiting."""
+        preview = getattr(self, "preview", None)
+        if preview is not None and preview.winfo_exists():
+            width, height = preview.winfo_width(), preview.winfo_height()
+            if width >= 640 and height >= 360:
+                self.drive_binding.window_size = {"width": width, "height": height}
+                try:
+                    save_binding(self.binding_path, self.drive_binding)
+                except OSError:
+                    # A failed preference write must never prevent a clean
+                    # close of the hardware-monitor application.
+                    pass
+        self.destroy()
+
+    def toggle_preview_fullscreen(self, _event=None) -> str:
+        """Toggle a borderless Windows test view without changing saved size."""
+        preview = getattr(self, "preview", None)
+        if preview is not None and preview.winfo_exists():
+            preview.attributes("-fullscreen", not bool(preview.attributes("-fullscreen")))
+        return "break"
+
+    def handle_preview_escape(self, _event=None) -> str:
+        """Leave fullscreen first; otherwise close through geometry persistence."""
+        preview = getattr(self, "preview", None)
+        if preview is not None and preview.winfo_exists() and bool(preview.attributes("-fullscreen")):
+            preview.attributes("-fullscreen", False)
+        else:
+            self.close_preview()
+        return "break"
+
+    def open_size_preview(self, _restore_workspace: bool = False, _window_size: tuple[int, int] | None = None) -> None:
         """Render the simulator without replacing its on-screen window."""
         self.normalize_preview_page()
         old_hex_entry = getattr(self, "hex_entry", None)
@@ -2008,27 +2407,60 @@ class TouchSimulator(tk.Tk):
         # A VM commonly reports a generic logical DPI rather than the physical
         # monitor DPI.  The Settings values therefore take precedence.  At
         # 102.4 PPI and 100%, this is calibrated for the V226HQL.
-        ppi = float(self.preview_ppi.get()) * SEVEN_INCH_BASE_SCALE * (float(self.preview_scale.get()) / 100.0)
+        ppi = float(self.preview_ppi.get()) * SEVEN_INCH_BASE_SCALE
         width, height = round((155 / 25.4) * ppi), round((88 / 25.4) * ppi)
+        if _window_size is not None:
+            width, height = _window_size
+        elif not reusing_preview:
+            saved_size = self.drive_binding.window_size
+            saved_width, saved_height = saved_size.get("width"), saved_size.get("height")
+            if isinstance(saved_width, int) and isinstance(saved_height, int) and saved_width >= 640 and saved_height >= 360:
+                width, height = saved_width, saved_height
+        elif reusing_preview and getattr(self, "_preview_manual_size", False):
+            # Preserve an operator's mouse/maximize resize through ordinary
+            # card redraws instead of snapping back to calibrated size.
+            width, height = preview.winfo_width(), preview.winfo_height()
         geometry = f"{width}x{height}"
         if position:
             geometry += f"+{position[0]}+{position[1]}"
         if not reusing_preview:
             preview = tk.Toplevel(self)
             preview.title("1541 OneROM - 7-inch Touchscreen Simulator")
-            preview.resizable(False, False)
+            # The unused host-window area around the centered Pi HUD is a
+            # neutral black letterbox, not another part of the dashboard.
+            preview.configure(bg="#000000")
+            # A conventional desktop window should expose Windows' maximize
+            # control and permit mouse resizing. The Canvas redraw below uses
+            # the actual client size, so the HUD remains proportionate.
+            preview.resizable(True, True)
+            preview.minsize(640, 360)
+            # Match the native 1280×720 Pi/touchscreen canvas. Windows then
+            # changes width and height together during edge/corner resizing
+            # instead of distorting the dashboard's touch geometry.
             self.preview = preview
             canvas = tk.Canvas(preview, width=width, height=height, bg=BG, highlightthickness=0)
-            canvas.pack(fill="both", expand=True)
             self.preview_canvas = canvas
         else:
             canvas = self.preview_canvas
             # Keep the existing native surface alive. Repainting this canvas
             # is instant and avoids the white flash from window destruction.
-            canvas.configure(width=width, height=height, bg=BG)
+            canvas.configure(bg=BG)
             canvas.delete("all")
-        preview.geometry(geometry)
-        sx, sy = width / 1280, height / 720
+        if _window_size is None:
+            preview.geometry(geometry)
+        self._preview_render_size = (width, height)
+        # The drawing surface is always the largest centered 16:9 area in
+        # the Windows client area. A maximized ultrawide or 4:3 desktop gains
+        # clean dark margins instead of stretching the Pi touchscreen UI.
+        if width / height >= WIDTH / HEIGHT:
+            viewport_height = height
+            viewport_width = round(height * WIDTH / HEIGHT)
+        else:
+            viewport_width = width
+            viewport_height = round(width * HEIGHT / WIDTH)
+        canvas.configure(width=viewport_width, height=viewport_height)
+        canvas.place(x=(width - viewport_width) // 2, y=(height - viewport_height) // 2)
+        sx, sy = viewport_width / WIDTH, viewport_height / HEIGHT
         def text(x, y, value, size=16, fill=TEXT, bold=False, anchor="w", tag=None, width=None):
             canvas.create_text(x*sx, y*sy, text=value, fill=fill, anchor=anchor,
                                font=("Segoe UI Semibold" if bold else "Segoe UI", max(4, round(size*sy)), "normal"), tags=tag,
@@ -2189,6 +2621,9 @@ class TouchSimulator(tk.Tk):
                     # safe to expose as a direct, finger-sized card action.
                     canvas.create_rectangle(HUD_OVERRIDE_LEFT*sx, (y1 + 23)*sy, HUD_OVERRIDE_RIGHT*sx, (y1 + 87)*sy, fill=PANEL_ALT, outline=ACCENT)
                     text((HUD_OVERRIDE_LEFT + HUD_OVERRIDE_RIGHT) / 2, y1 + 55, "CLEAR DROPS", 14, ACCENT, True, "center")
+                elif card["id"] in {"startup_rom", "boot_iec"}:
+                    canvas.create_rectangle(HUD_REFRESH_LEFT*sx, (y1 + 23)*sy, HUD_REFRESH_RIGHT*sx, (y1 + 87)*sy, fill=PANEL_ALT, outline=ACCENT)
+                    text((HUD_REFRESH_LEFT + HUD_REFRESH_RIGHT) / 2, y1 + 55, "REFRESH", 14, ACCENT, True, "center")
             # Four finger-sized scrolling controls. The symbols intentionally
             # omit their former 5/1 labels: direction alone is clearer.
             if cards:
@@ -2297,21 +2732,6 @@ class TouchSimulator(tk.Tk):
             text(400, y1 + 64, "COLORS · CARD STYLE · TEXT · TAP TO OPEN MENU", 14, MUTED, True)
             canvas.create_polygon(1192*sx, (y1 + 36)*sy, 1232*sx, (y1 + 36)*sy, 1212*sx, (y1 + 66)*sy, fill=ACCENT, outline="")
 
-            y1 = 560.8
-            canvas.create_rectangle(24*sx, y1*sy, 1256*sx, (y1 + HUD_CARD_HEIGHT)*sy, fill=PANEL, outline=ACCENT, width=1)
-            text(50, y1 + 20, "DISPLAY SCALE", 14, MUTED, True)
-            text(50, y1 + 64, f"{self.preview_scale.get()}%", 24, TEXT, True)
-            text(270, y1 + 45, "25%", 14, MUTED, False, "center")
-            text(830, y1 + 45, "200%", 14, MUTED, False, "center")
-            canvas.create_line(270*sx, (y1 + 66)*sy, 830*sx, (y1 + 66)*sy, fill=MUTED, width=max(1, round(5*sy)))
-            # Slider is narrower than its older full-screen version so the
-            # step controls remain inside this single dashboard-height row.
-            knob_x = 270 + (self.preview_scale.get() - 25) / 175 * 560
-            canvas.create_oval((knob_x-12)*sx, (y1 + 54)*sy, (knob_x+12)*sx, (y1 + 78)*sy, fill=ACCENT, outline="")
-            canvas.create_rectangle(900*sx, (y1 + 31)*sy, 1060*sx, (y1 + 83)*sy, fill=PANEL_ALT, outline=ACCENT)
-            canvas.create_rectangle(1080*sx, (y1 + 31)*sy, 1240*sx, (y1 + 83)*sy, fill=ACCENT, outline=ACCENT)
-            text(980, y1 + 57, "− 1%", 17, TEXT, True, "center")
-            text(1160, y1 + 57, "+ 1%", 17, BG, True, "center")
         elif self.preview_page in ("controller_connection", "hud_connection"):
             role = "controller" if self.preview_page == "controller_connection" else "hud"
             role_title = "CONTROL ONEROM" if role == "controller" else "MONITOR ONEROM"
@@ -2717,10 +3137,6 @@ class TouchSimulator(tk.Tk):
                 role = "controller" if self.preview_page == "controller_connection" else "hud"
                 serial_var = self.controller_serial if role == "controller" else self.hud_serial
                 if 24 <= x <= 314 and 620 <= y <= 672:
-                    # This screen is a fixed physical 7-inch workflow.  Do
-                    # not carry an accidental preview-scale adjustment back
-                    # into the main settings layout.
-                    self.preview_scale.set(100)
                     self.preview_page = "settings"
                 elif 338 <= x <= 628 and 620 <= y <= 672:
                     self.refresh_usb_boards()
@@ -2786,20 +3202,12 @@ class TouchSimulator(tk.Tk):
                         self.confirm_write_protect_toggle()
                     elif card["id"] == "capture_health" and HUD_OVERRIDE_LEFT <= x <= HUD_OVERRIDE_RIGHT and row_y + 23 <= y <= row_y + 87:
                         self.confirm_clear_diagnostic_drops()
+                    elif card["id"] in {"startup_rom", "boot_iec"} and HUD_REFRESH_LEFT <= x <= HUD_REFRESH_RIGHT and row_y + 23 <= y <= row_y + 87:
+                        self.refresh_control_startup_settings()
                     elif card.get("kind") == "control" and card["id"] != "write_protect":
                         self.choose_dashboard_control(str(card["id"]), event)
                     self.open_size_preview()
                     return
-            elif self.preview_page == "settings" and 270 <= x <= 830 and 614 <= y <= 639:
-                self.preview_scale.set(max(25, min(200, round(25 + ((x - 270) / 560) * 175))))
-                self.open_size_preview()
-                return
-            elif self.preview_page == "settings" and 900 <= x <= 1060 and 591 <= y <= 644:
-                self.change_preview_scale(-1)
-                return
-            elif self.preview_page == "settings" and 1080 <= x <= 1240 and 591 <= y <= 644:
-                self.change_preview_scale(1)
-                return
             elif self.preview_page == "settings" and 378 <= y <= 430:
                 option_bounds = getattr(self, "settings_option_bounds", {})
                 if option_bounds.get("rom", (0, 0))[0] <= x <= option_bounds.get("rom", (0, 0))[1]:
@@ -2815,10 +3223,28 @@ class TouchSimulator(tk.Tk):
         # Bind directly to the drawing surface.  On some Windows/Tk builds a
         # Canvas does not reliably forward touch/mouse events to its Toplevel.
         canvas.bind("<Button-1>", clicked)
+        preview.bind("<F11>", self.toggle_preview_fullscreen)
         canvas.bind("<Motion>", lambda event: self.update_preview_tooltip(event, canvas, sx, sy))
         canvas.bind("<Leave>", lambda _event: canvas.delete("icon_tooltip"))
-        preview.bind("<Escape>", lambda _event: self.destroy())
-        preview.protocol("WM_DELETE_WINDOW", self.destroy)
+        preview.bind("<Escape>", self.handle_preview_escape)
+        preview.protocol("WM_DELETE_WINDOW", self.close_preview)
+        def resized(event):
+            if event.widget is not preview or event.width < 640 or event.height < 360:
+                return
+            size = (event.width, event.height)
+            if size == getattr(self, "_preview_render_size", None):
+                return
+            self._preview_manual_size = True
+            pending = getattr(self, "_preview_resize_after", None)
+            if pending is not None:
+                try:
+                    self.after_cancel(pending)
+                except tk.TclError:
+                    pass
+            self._preview_resize_after = self.after(
+                60, lambda current=size: self.open_size_preview(_window_size=current)
+            )
+        preview.bind("<Configure>", resized)
         previous_animation = getattr(self, "_preview_animation_id", None)
         if previous_animation is not None:
             try:
@@ -2868,6 +3294,10 @@ class TouchSimulator(tk.Tk):
         self.last_input = time.monotonic()
 
     def tick(self) -> None:
+        now = time.monotonic()
+        if now >= self._next_usb_presence_check:
+            self._next_usb_presence_check = now + 2.0
+            self.check_connected_board_presence()
         if self.ub4.get() and self.motor:
             self.sector = self.sector % 17 + 1
             self.sector_var.set(f"{self.sector:02d}")
@@ -2882,5 +3312,30 @@ class TouchSimulator(tk.Tk):
         self.after(20, self.poll_serial_loop)
 
 
+def capture_raw_cdc(port: str, output: Path, duration_seconds: float = 30.0) -> None:
+    """Capture raw CDC bytes for bench debugging without a second script."""
+    if serial is None:
+        raise RuntimeError("pyserial is not installed")
+    chunks: list[bytes] = []
+    with serial.Serial(port, BAUD_RATE, timeout=0.2) as device:
+        device.dtr = device.rts = False
+        time.sleep(0.2)
+        device.dtr = True
+        deadline = time.monotonic() + duration_seconds
+        while time.monotonic() < deadline:
+            chunk = device.read(4096)
+            if chunk:
+                chunks.append(chunk)
+    data = b"".join(chunks)
+    output.write_bytes(data)
+    print(data.decode("utf-8", errors="replace"))
+    print(f"Captured {len(data)} bytes to {output}")
+
+
 if __name__ == "__main__":
-    TouchSimulator().mainloop()
+    if len(sys.argv) >= 2 and sys.argv[1] == "--capture":
+        if len(sys.argv) not in (3, 4):
+            raise SystemExit("Usage: 1541_touchscreen_simulator.py --capture COMx [output-file]")
+        capture_raw_cdc(sys.argv[2], Path(sys.argv[3]) if len(sys.argv) == 4 else Path("ub4-raw-capture.txt"))
+    else:
+        TouchSimulator().mainloop()

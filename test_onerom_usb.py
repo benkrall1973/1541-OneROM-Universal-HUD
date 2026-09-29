@@ -5,11 +5,20 @@ from unittest.mock import patch
 from pathlib import Path
 from importlib import import_module
 
-TouchSimulator = import_module("1541_touchscreen_simulator").TouchSimulator
-from onerom_usb import (
-    BoardDescriptor, CdcBoardLink, DriveBinding, DriveTelemetryParser,
-    MAX_RX_BUFFER_BYTES, load_binding, save_binding,
-)
+touchscreen = import_module("1541_touchscreen_simulator")
+TouchSimulator = touchscreen.TouchSimulator
+BoardDescriptor = touchscreen.BoardDescriptor
+CdcBoardLink = touchscreen.CdcBoardLink
+DriveBinding = touchscreen.DriveBinding
+DriveTelemetryParser = touchscreen.DriveTelemetryParser
+MAX_RX_BUFFER_BYTES = touchscreen.MAX_RX_BUFFER_BYTES
+load_binding = touchscreen.load_binding
+save_binding = touchscreen.save_binding
+
+
+def mock_monotonic(value: float):
+    """Patch the in-process touchscreen module despite its numeric filename."""
+    return patch.object(touchscreen.time, "monotonic", return_value=value)
 
 
 class ControllerReplyProtocolTests(unittest.TestCase):
@@ -61,7 +70,7 @@ class _FakeCdcDevice:
 class DriveTelemetryParserHeadStateTests(unittest.TestCase):
     def test_successive_track_writes_set_requested_direction(self) -> None:
         parser = DriveTelemetryParser()
-        with patch("onerom_usb.time.monotonic", return_value=10.0):
+        with mock_monotonic(10.0):
             parser.process("MOTOR state=1")
             parser.process("TRACK_WRITE addr=$0022 data=$12 (18)")
             parser.process("TRACK_WRITE addr=$0022 data=$14 (20)")
@@ -71,7 +80,7 @@ class DriveTelemetryParserHeadStateTests(unittest.TestCase):
 
     def test_status_target_changes_set_requested_direction(self) -> None:
         parser = DriveTelemetryParser()
-        with patch("onerom_usb.time.monotonic", return_value=10.0):
+        with mock_monotonic(10.0):
             parser.process("STATE T0.0.16 TV=1 T=18 M=1")
             parser.process("STATE T0.0.16 TV=1 T=20 M=1")
             self.assertEqual(parser.state.head, "IN")
@@ -80,13 +89,13 @@ class DriveTelemetryParserHeadStateTests(unittest.TestCase):
 
     def test_repeated_status_target_does_not_hide_direction(self) -> None:
         parser = DriveTelemetryParser()
-        with patch("onerom_usb.time.monotonic", return_value=10.0):
+        with mock_monotonic(10.0):
             parser.process("STATE T0.0.16 TV=1 T=18 M=1")
             parser.process("STATE T0.0.16 TV=1 T=20 M=1")
-        with patch("onerom_usb.time.monotonic", return_value=10.1):
+        with mock_monotonic(10.1):
             parser.process("STATE T0.0.16 TV=1 T=20 M=1")
         self.assertEqual(parser.state.head, "IN")
-        with patch("onerom_usb.time.monotonic", return_value=10.8):
+        with mock_monotonic(10.8):
             self.assertEqual(parser.refresh().head, "STALL")
 
     def test_skipped_phase_stays_active_in_the_last_confirmed_direction(self) -> None:
@@ -95,12 +104,12 @@ class DriveTelemetryParserHeadStateTests(unittest.TestCase):
         parser.state.head = "OUT"
         parser._last_direction = "OUT"
         parser._last_motion = 1.0
-        with patch("onerom_usb.time.monotonic", return_value=10.0):
+        with mock_monotonic(10.0):
             parser.process("PHASE old=0 new=2 delta=2 motor=1")
         self.assertEqual(parser.state.head, "OUT")
-        with patch("onerom_usb.time.monotonic", return_value=10.79):
+        with mock_monotonic(10.79):
             self.assertEqual(parser.refresh().head, "OUT")
-        with patch("onerom_usb.time.monotonic", return_value=10.8):
+        with mock_monotonic(10.8):
             self.assertEqual(parser.refresh().head, "STALL")
 
     def test_head_stalls_after_eight_tenths_of_a_second_without_events(self) -> None:
@@ -108,19 +117,19 @@ class DriveTelemetryParserHeadStateTests(unittest.TestCase):
         parser.state.motor = True
         parser.state.head = "IN"
         parser._last_motion = 10.0
-        with patch("onerom_usb.time.monotonic", return_value=10.79):
+        with mock_monotonic(10.79):
             self.assertEqual(parser.refresh().head, "IN")
-        with patch("onerom_usb.time.monotonic", return_value=10.8):
+        with mock_monotonic(10.8):
             self.assertEqual(parser.refresh().head, "STALL")
 
     def test_first_target_write_resets_the_stall_interval_without_direction(self) -> None:
         parser = DriveTelemetryParser()
         parser.state.motor = True
         parser._last_motion = 1.0
-        with patch("onerom_usb.time.monotonic", return_value=20.0):
+        with mock_monotonic(20.0):
             parser.process("TRACK_WRITE addr=$0022 data=$12 (18)")
         self.assertEqual(parser._last_motion, 20.0)
-        with patch("onerom_usb.time.monotonic", return_value=20.79):
+        with mock_monotonic(20.79):
             self.assertNotEqual(parser.refresh().head, "PARK")
 
     def test_motor_off_parks_the_head(self) -> None:
@@ -150,6 +159,7 @@ class DriveBindingPersistenceTests(unittest.TestCase):
             appearance={"background": "#112233", "accent": "#AABBCC"},
             priorities={"track": 1, "capture_health": None, "sync_rate": 12},
             control_features={"rom_select": True, "iec_address": False, "write_protect_override": False},
+            window_size={"width": 1280, "height": 720},
         )
         # Exercise the actual JSON payload without creating an artifact in a
         # test environment that intentionally blocks Python file writes.
@@ -160,6 +170,7 @@ class DriveBindingPersistenceTests(unittest.TestCase):
                 appearance=binding.appearance,
                 priorities=binding.priorities,
                 control_features=binding.control_features,
+                window_size=binding.window_size,
             ))
         payload = write_text.call_args.args[0]
         with patch.object(Path, "read_text", return_value=payload):
@@ -170,6 +181,7 @@ class DriveBindingPersistenceTests(unittest.TestCase):
         self.assertEqual(loaded.appearance, {"background": "#112233", "accent": "#AABBCC"})
         self.assertEqual(loaded.priorities, {"track": 1, "capture_health": None, "sync_rate": 12})
         self.assertEqual(loaded.control_features, {"rom_select": True, "iec_address": False, "write_protect_override": False})
+        self.assertEqual(loaded.window_size, {"width": 1280, "height": 720})
 
     def test_unknown_config_fields_do_not_discard_known_settings(self) -> None:
         path = Path("onerom_drive_bindings.json")

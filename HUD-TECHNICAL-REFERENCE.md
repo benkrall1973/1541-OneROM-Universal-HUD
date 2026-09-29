@@ -1,4 +1,4 @@
-# 1541 OneROM Desktop Monitor V0.0.10 baseline
+# 1541 OneROM Desktop Monitor V0.0.11 baseline
 
 The desktop Monitor is a Python/Tkinter display for the passive Monitor OneROM
 firmware. It never controls the 1541 drive through the Monitor OneROM; the
@@ -9,9 +9,7 @@ ROM, IEC-address, and write-protect controls.
 
 | File | Purpose |
 |---|---|
-| `1541_touchscreen_simulator.py` | Fixed 7-inch Monitor UI, rendering, USB connection workflow, and card controls. |
-| `onerom_usb.py` | CDC board discovery, serial link, telemetry parser, and the compact health-status parser. |
-| `capture_ub4_serial.py` | Optional raw CDC capture helper for bench diagnostics. |
+| `1541_touchscreen_simulator.py` | Complete fixed 7-inch Monitor application: UI, CDC discovery/link, telemetry parser, binding storage, and optional raw capture mode. |
 | `Run-1541-Touchscreen-Simulator.cmd` | Windows launcher. |
 
 ## Diagnostics semantics
@@ -58,7 +56,7 @@ timeout after three seconds.
 
 ## Matching firmware baseline
 
-Desktop V0.0.10 uses the 1541HUD firmware V1.0.6 telemetry baseline. The firmware sends all
+Desktop V0.0.11 uses the 1541HUD firmware V1.0.6 telemetry baseline. The firmware sends all
 physical header events for responsive Recent Sectors while sampling RPM and
 disk-ID metadata to keep the USB diagnostic queue healthy. Its compact health
 record is:
@@ -71,4 +69,10 @@ Run the Monitor on Windows with:
 
 ```powershell
 python .\1541_touchscreen_simulator.py
+```
+
+For a short raw CDC capture while bench debugging, use the same file:
+
+```powershell
+python .\1541_touchscreen_simulator.py --capture COM3 ub4-raw-capture.txt
 ```
