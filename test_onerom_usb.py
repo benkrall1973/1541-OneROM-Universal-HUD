@@ -29,6 +29,7 @@ class ControllerReplyProtocolTests(unittest.TestCase):
         target._controller_transactions = {card_id: "timer"}
         target.controller_card_feedback = {}
         target._pending_controller_card = card_id
+        target._pending_controller_values = {"startup_rom": 2, "boot_iec": 11}
         target._hud_dirty = False
         target.finish_controller_transaction = lambda current: target._controller_transactions.pop(current, None)
         target.update_live_hud_fields = lambda: None
@@ -38,6 +39,19 @@ class ControllerReplyProtocolTests(unittest.TestCase):
                 pass
 
         target.control_status = Status()
+
+        class Var:
+            def __init__(self, value: str) -> None:
+                self.value = value
+            def set(self, value: str) -> None:
+                self.value = value
+            def get(self) -> str:
+                return self.value
+
+        target.rom_choice = Var("Slot 2 — JIFFYDOS")
+        target.rom_var = Var("Slot 2 — JIFFYDOS")
+        target.iec_choice = Var("Device 11")
+        target.iec_var = Var("Device 11")
         return target
 
     def test_iec_reply_record_confirms_boot_iec_transaction(self) -> None:
@@ -49,7 +63,7 @@ class ControllerReplyProtocolTests(unittest.TestCase):
 
     def test_set_reply_record_confirms_startup_rom_transaction(self) -> None:
         target = self.reply_target("startup_rom")
-        self.assertTrue(target.handle_controller_setting_reply("$ROMTEST,SET,OK,SLOT=2"))
+        self.assertTrue(target.handle_controller_setting_reply("$ROMTEST,SET,OK,SLOT=2,VERIFY=2"))
         self.assertEqual(target.controller_card_feedback["startup_rom"], "CONFIRMED BY CONTROL ONEROM")
         self.assertFalse(target._controller_transactions)
 
@@ -149,6 +163,20 @@ class CdcBoardLinkTests(unittest.TestCase):
         self.assertEqual(link.read_lines(), [])
         self.assertEqual(link._buffer, "")
 
+    def test_complete_burst_records_survive_buffer_guard(self) -> None:
+        link = CdcBoardLink(BoardDescriptor("TEST", "COM1", "Test device"))
+        payload = (b"SYNC T0.0.16 COUNT=1 LEVEL=0\n" * 1200)
+        link.device = _FakeCdcDevice(payload)
+        lines = link.read_lines()
+        self.assertEqual(len(lines), 1200)
+        self.assertTrue(all(line.startswith("SYNC ") for line in lines))
+
+
+class TelemetrySubscriptionTests(unittest.TestCase):
+    def test_background_subscription_keeps_all_evidence_classes_enabled(self) -> None:
+        target = TouchSimulator.__new__(TouchSimulator)
+        self.assertEqual(target.visible_hud_subscription_mask(), touchscreen.HUD_TELEMETRY_ALL_MASK)
+
 
 class DriveBindingPersistenceTests(unittest.TestCase):
     def test_serial_bindings_and_appearance_share_one_json_file(self) -> None:
@@ -161,19 +189,11 @@ class DriveBindingPersistenceTests(unittest.TestCase):
             control_features={"rom_select": True, "iec_address": False, "write_protect_override": False},
             window_size={"width": 1280, "height": 720},
         )
-        # Exercise the actual JSON payload without creating an artifact in a
-        # test environment that intentionally blocks Python file writes.
-        with patch.object(Path, "write_text") as write_text:
-            save_binding(path, DriveBinding(
-                controller_serial=binding.controller_serial,
-                hud_serial=binding.hud_serial,
-                appearance=binding.appearance,
-                priorities=binding.priorities,
-                control_features=binding.control_features,
-                window_size=binding.window_size,
-            ))
-        payload = write_text.call_args.args[0]
-        with patch.object(Path, "read_text", return_value=payload):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "onerom_drive_bindings.json"
+            save_binding(path, binding)
+            self.assertTrue(path.exists())
             loaded = load_binding(path)
 
         self.assertEqual(loaded.controller_serial, "CONTROL-123")
@@ -182,6 +202,67 @@ class DriveBindingPersistenceTests(unittest.TestCase):
         self.assertEqual(loaded.priorities, {"track": 1, "capture_health": None, "sync_rate": 12})
         self.assertEqual(loaded.control_features, {"rom_select": True, "iec_address": False, "write_protect_override": False})
         self.assertEqual(loaded.window_size, {"width": 1280, "height": 720})
+
+    def test_known_onerom_vid_pid_are_the_only_discoverable_boards(self) -> None:
+        class Port:
+            def __init__(self, serial_number, device, vid, pid):
+                self.serial_number = serial_number
+                self.device = device
+                self.description = "Test"
+                self.vid = vid
+                self.pid = pid
+        class Ports:
+            def __init__(self, values):
+                self.values = values
+            def comports(self):
+                return self.values
+        good = Port("GOOD", "COM1", touchscreen.ONEROM_USB_VID, touchscreen.ONEROM_USB_PID)
+        bad = Port("BAD", "COM2", 0x1234, 0x5678)
+        with patch.object(touchscreen, "list_ports", Ports([bad, good])):
+            boards = touchscreen.discover_cdc_boards()
+        self.assertEqual([board.serial_number for board in boards], ["GOOD"])
+
+
+class ControllerTransactionTests(unittest.TestCase):
+    def test_write_protect_does_not_transmit_while_another_request_is_pending(self) -> None:
+        target = TouchSimulator.__new__(TouchSimulator)
+        target._controller_transactions = {"settings_refresh": "timer"}
+        target._confirmed_writable = False
+        sent: list[str] = []
+        class Var:
+            def __init__(self, value): self.value = value
+            def get(self): return self.value
+            def set(self, value): self.value = value
+        class Status:
+            def __init__(self): self.value = ""
+            def set(self, value): self.value = value
+        target.writable = Var(True)
+        target.control_status = Status()
+        target.send_controller_command = sent.append
+        target.update_protection()
+        self.assertEqual(sent, [])
+        self.assertFalse(target.writable.value)
+
+    def test_wp_query_is_tracked_as_a_transaction(self) -> None:
+        target = TouchSimulator.__new__(TouchSimulator)
+        target._controller_transactions = {"write_protect_query": "timer"}
+        target._pending_wp_override = None
+        target.controller_wp_available = None
+        target._confirmed_writable = False
+        class Var:
+            def __init__(self): self.value = False
+            def set(self, value): self.value = value
+        class Status:
+            def set(self, _value): pass
+        target.writable = Var()
+        target.control_status = Status()
+        target.finish_controller_transaction = lambda current: target._controller_transactions.pop(current, None)
+        target.update_live_hud_fields = lambda: None
+        target.handle_controller_wp_reply("$ROMTEST,WP,STATE=OFF,AVAILABLE=1")
+        self.assertFalse(target._controller_transactions)
+        self.assertFalse(target.writable.value)
+        self.assertTrue(target.controller_wp_available)
+
 
     def test_unknown_config_fields_do_not_discard_known_settings(self) -> None:
         path = Path("onerom_drive_bindings.json")

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""1541 OneROM 7-inch touchscreen layout simulator.
+"""1541 OneROM touchscreen application with desktop preview mode.
 
-This is a personal Windows design prototype.  It deliberately has no serial,
-firmware, or repository connection: its purpose is to refine the Pi display
-layout before the hardware arrives.
+Provides the Raspberry Pi-oriented touchscreen UI plus a Windows preview for
+Control OneROM and passive Monitor OneROM operation.
 """
 from __future__ import annotations
 
@@ -15,6 +14,7 @@ import json
 import re
 import os
 import sys
+import tempfile
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
@@ -33,7 +33,10 @@ except ImportError:  # Keep GUI layout work usable before pyserial is installed.
 # application; its USB protocol behavior remains the same as the tested
 # standalone implementation it replaced.
 BAUD_RATE = 115200
+ONEROM_USB_VID = 0x1209
+ONEROM_USB_PID = 0xF542
 MAX_RX_BUFFER_BYTES = 16 * 1024
+HUD_TELEMETRY_ALL_MASK = 0x1F
 HEAD_STALL_TIMEOUT = 0.8
 STATE_RE = re.compile(r"STATE\s+([A-Za-z][0-9.]+)")
 STATUS_RE = re.compile(r"STATUS\s+([A-Za-z][0-9.]+)")
@@ -131,8 +134,11 @@ class TelemetryState:
 def discover_cdc_boards() -> list[BoardDescriptor]:
     if list_ports is None:
         return []
-    boards = [BoardDescriptor(str(p.serial_number), str(p.device), str(p.description or "USB Serial Device"), p.vid, p.pid)
-              for p in list_ports.comports() if p.serial_number]
+    boards = [
+        BoardDescriptor(str(p.serial_number), str(p.device), str(p.description or "OneROM USB"), p.vid, p.pid)
+        for p in list_ports.comports()
+        if p.serial_number and p.vid == ONEROM_USB_VID and p.pid == ONEROM_USB_PID
+    ]
     return sorted(boards, key=lambda board: (board.serial_number, board.port))
 
 
@@ -153,7 +159,23 @@ def load_binding(path: Path) -> DriveBinding:
 
 def save_binding(path: Path, binding: DriveBinding) -> None:
     binding.validate()
-    path.write_text(json.dumps(asdict(binding), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(asdict(binding), indent=2, sort_keys=True) + "\n"
+    # Atomic replace prevents a power loss or process crash from leaving a
+    # partially written JSON file on the Raspberry Pi.
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as temp:
+            temp.write(payload)
+            temp.flush()
+            os.fsync(temp.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
 class CdcBoardLink:
@@ -185,13 +207,23 @@ class CdcBoardLink:
         payload = self.device.read(4096)
         if payload:
             self._buffer += payload.decode("ascii", errors="ignore")
-            if len(self._buffer) > MAX_RX_BUFFER_BYTES:
-                self._buffer = ""
+
+        # Extract all complete records before applying the protection limit.
+        # A burst may contain thousands of already-complete CDC lines; those
+        # records are valid telemetry and must not be discarded merely because
+        # the combined receive buffer temporarily exceeds the fragment cap.
         lines: list[str] = []
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
-            if line.strip():
-                lines.append(line.strip())
+            line = line.strip()
+            if line:
+                lines.append(line)
+
+        # Only an unterminated fragment is bounded. If it grows beyond the cap
+        # there is no trustworthy record boundary to preserve, so discard that
+        # fragment and resume framing from the next newline-terminated record.
+        if len(self._buffer) > MAX_RX_BUFFER_BYTES:
+            self._buffer = ""
         return lines
 
     def write_command(self, command: str) -> None:
@@ -314,7 +346,7 @@ class DriveTelemetryParser:
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.13"
+APP_VERSION = "V0.0.14-BeforePI"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -548,6 +580,7 @@ class TouchSimulator(tk.Tk):
         # being queued from an explicit reply received over the CDC link.
         self.controller_card_feedback: dict[str, str] = {}
         self._pending_controller_card: str | None = None
+        self._pending_controller_values: dict[str, int] = {}
         self._controller_transactions: dict[str, str] = {}
         self.controller_wp_available: bool | None = None
         self._pending_wp_override: bool | None = None
@@ -909,6 +942,7 @@ class TouchSimulator(tk.Tk):
         if role == "hud":
             self.reset_monitor_state()
         if role == "controller":
+            self.reset_controller_session_state()
             self.controller_serial.set("")
         else:
             self.hud_serial.set("")
@@ -1156,6 +1190,7 @@ class TouchSimulator(tk.Tk):
             # See the Monitor failure path above: close() can block after a
             # USB pull, so state and Canvas redraw must happen before it.
             self.usb_links.pop("controller", None)
+            self.reset_controller_session_state()
             self.ub3.set(False)
             self.usb_status.set(f"Control OneROM serial link interrupted; reconnecting automatically: {exc}")
             self.append_usb_log("CONTROL", self.usb_status.get())
@@ -1185,8 +1220,8 @@ class TouchSimulator(tk.Tk):
             self.usb_links.pop(role, None)
             role_name = "Control OneROM" if role == "controller" else "Monitor OneROM"
             if role == "controller":
+                self.reset_controller_session_state()
                 self.ub3.set(False)
-                self.writable.set(False)
             else:
                 self.ub4.set(False)
                 self.reset_monitor_state()
@@ -1250,11 +1285,13 @@ class TouchSimulator(tk.Tk):
             link = CdcBoardLink(board)
             if role == "hud":
                 self.reset_monitor_state()
+            else:
+                self.reset_controller_session_state()
             link.open()
             self.usb_links[role] = link
             self.after(150, link.assert_dtr)
             if role == "controller":
-                self.after(300, self.request_controller_wp_state)
+                self.after(300, self.refresh_control_startup_settings)
             else:
                 # Startup/reconnect takes this path rather than the Settings
                 # save path, so it needs the same one-time passive telemetry
@@ -1700,30 +1737,14 @@ class TouchSimulator(tk.Tk):
         self.refresh_hud_subscription()
 
     def visible_hud_subscription_mask(self) -> int:
-        """Return the firmware telemetry classes needed by the visible cards."""
-        core, headers, metadata, rpm, sync = 1, 2, 4, 8, 16
-        needed = {
-            "track": core, "rotation": core | rpm | sync, "activity": core,
-            "physical_header": headers, "sector_coverage": headers, "sector_fifo": headers,
-            "capture_health": core, "disk_identity": headers | metadata,
-            "write_protect": core, "density": core, "head": core,
-            "header_rate": headers, "capture_rate": core, "sync_rate": sync,
-            "sync_per_rev": sync, "mechanism": core,
-            "recent_evidence": core | headers,
-        }
-        cards = self.scroll_hud_cards()
-        visible = cards[self.hud_scroll_index:self.hud_scroll_index + HUD_VISIBLE_CARD_COUNT]
-        # These are bit flags, not quantities.  Arithmetic addition breaks
-        # when two visible cards need the same class: for example two CORE
-        # cards made 1 + 1 == 2 (HEADERS), which accidentally turned CORE
-        # telemetry off.  Combine each required class exactly once.
-        # Keep compact STATUS/core records alive even on a control-only
-        # viewport. They preserve connection state and avoid a transition
-        # from "quiet" to an apparently dead monitor.
-        mask = core
-        for card in visible:
-            mask |= needed.get(str(card["id"]), 0)
-        return mask
+        """Return the stable background telemetry subscription.
+
+        Important physical evidence must not depend on which five cards happen
+        to be visible. The Monitor continuously collects CORE, HEADERS,
+        METADATA, RPM, and SYNC; the touchscreen independently limits rendering
+        and log history.
+        """
+        return HUD_TELEMETRY_ALL_MASK
 
     def update_hud_subscription(self, link: CdcBoardLink) -> None:
         """Tell the Monitor firmware to emit only telemetry used by this viewport."""
@@ -1733,15 +1754,15 @@ class TouchSimulator(tk.Tk):
             self._hud_subscription_mask = mask
 
     def refresh_hud_subscription(self) -> None:
-        """Apply a changed viewport subscription without disturbing the link."""
+        """Reassert the stable background telemetry subscription without disturbing the link."""
         link = self.usb_links.get("hud")
         if link is None or not link.connected:
             return
         try:
             self.update_hud_subscription(link)
         except Exception as exc:
-            # A failed optional configuration write must not tear down a
-            # healthy read-only telemetry session.
+            # A failed subscription write must not tear down a healthy
+            # read-only telemetry session; the next connection reasserts it.
             self._hud_subscription_mask = None
             self.append_usb_log("SYSTEM", f"Monitor viewport subscription update failed: {exc}")
 
@@ -1787,6 +1808,8 @@ class TouchSimulator(tk.Tk):
                     return label
         if self.preview_page == "settings" and 1178 <= x <= 1246 and 470 <= y <= 530:
             return "Customize appearance"
+        if self.preview_page == "hud" and 820 <= x <= 1010 and 676 <= y <= 710:
+            return "Open drive diagnostics"
         if self.preview_page in ("controller_connection", "hud_connection") and 24 <= x <= 314 and 620 <= y <= 672:
             return "Back to settings"
         if self.preview_page == "hud" and HUD_HELP_LEFT <= x <= HUD_HELP_RIGHT:
@@ -1934,8 +1957,10 @@ class TouchSimulator(tk.Tk):
         choice = self.rom_choice.get()
         try:
             slot = int(choice.split()[1])
+            if self._controller_transactions:
+                raise RuntimeError("Another Control OneROM command is awaiting confirmation")
             self.send_controller_command(f"ROMSET={slot}")
-            self.rom_var.set(choice)
+            self._pending_controller_values["startup_rom"] = slot
             self._pending_controller_card = "startup_rom"
             self.begin_controller_transaction("startup_rom")
             self.controller_card_feedback["startup_rom"] = "SENT · WAITING FOR CONFIRMATION"
@@ -1951,8 +1976,10 @@ class TouchSimulator(tk.Tk):
         choice = self.iec_choice.get()
         try:
             address = int(choice.split()[-1])
+            if self._controller_transactions:
+                raise RuntimeError("Another Control OneROM command is awaiting confirmation")
             self.send_controller_command(f"ROMIEC={address}")
-            self.iec_var.set(choice)
+            self._pending_controller_values["boot_iec"] = address
             self._pending_controller_card = "boot_iec"
             self.begin_controller_transaction("boot_iec")
             self.controller_card_feedback["boot_iec"] = "SENT · WAITING FOR CONFIRMATION"
@@ -2001,6 +2028,7 @@ class TouchSimulator(tk.Tk):
         self.controller_card_feedback["boot_iec"] = "REFRESHED FROM CONTROL ONEROM"
         self.control_status.set("Saved ROM slot and boot IEC address refreshed from Control OneROM.")
         self.finish_controller_transaction("settings_refresh")
+        self.after(100, self.request_controller_wp_state)
         self._hud_dirty = True
         self.update_live_hud_fields()
         return True
@@ -2019,6 +2047,30 @@ class TouchSimulator(tk.Tk):
         if card_id is None or card_id not in self._controller_transactions:
             return False
         if ",OK," in upper or upper.endswith(",OK"):
+            expected = self._pending_controller_values.get(card_id)
+            if card_id == "startup_rom":
+                slot_match = re.search(r"\bSLOT=(\d+)", line, re.IGNORECASE)
+                verify_match = re.search(r"\bVERIFY=(\d+)", line, re.IGNORECASE)
+                if expected is None or slot_match is None or verify_match is None or int(slot_match.group(1)) != expected or int(verify_match.group(1)) != expected:
+                    self.controller_card_feedback[card_id] = "CONTROL RESPONSE DID NOT VERIFY SAVE"
+                    self.control_status.set("Control OneROM ROM save response did not match the requested slot.")
+                    self.finish_controller_transaction(card_id)
+                    self._pending_controller_values.pop(card_id, None)
+                    self._pending_controller_card = None
+                    return True
+                self.rom_var.set(self.rom_choice.get())
+            else:
+                addr_match = re.search(r"\bADDRESS=(\d+)", line, re.IGNORECASE)
+                verify_match = re.search(r"\bVERIFY=(\d+)", line, re.IGNORECASE)
+                valid_match = re.search(r"\bVALID=(\d+)", line, re.IGNORECASE)
+                if expected is None or addr_match is None or verify_match is None or valid_match is None or int(addr_match.group(1)) != expected or int(verify_match.group(1)) != expected or valid_match.group(1) != "1":
+                    self.controller_card_feedback[card_id] = "CONTROL RESPONSE DID NOT VERIFY SAVE"
+                    self.control_status.set("Control OneROM IEC response did not match the requested address.")
+                    self.finish_controller_transaction(card_id)
+                    self._pending_controller_values.pop(card_id, None)
+                    self._pending_controller_card = None
+                    return True
+                self.iec_var.set(self.iec_choice.get())
             self.controller_card_feedback[card_id] = "CONFIRMED BY CONTROL ONEROM"
             self.control_status.set(f"Control OneROM confirmed {card_id.replace('_', ' ')}.")
         elif ",FAIL" in upper or ",ERROR," in upper:
@@ -2026,6 +2078,7 @@ class TouchSimulator(tk.Tk):
             self.control_status.set(f"Control OneROM rejected {card_id.replace('_', ' ')}.")
         else:
             return False
+        self._pending_controller_values.pop(card_id, None)
         self.finish_controller_transaction(card_id)
         self._pending_controller_card = None
         self._hud_dirty = True
@@ -2034,6 +2087,10 @@ class TouchSimulator(tk.Tk):
 
     def update_protection(self) -> None:
         desired = self.writable.get()
+        if self._controller_transactions:
+            self.writable.set(self._confirmed_writable)
+            self.control_status.set("Waiting for the prior Control OneROM confirmation.")
+            return
         try:
             self.send_controller_command("ROMWP=ON" if desired else "ROMWP=OFF")
             self._pending_wp_override = desired
@@ -2045,8 +2102,11 @@ class TouchSimulator(tk.Tk):
 
     def request_controller_wp_state(self) -> None:
         """Ask the Control OneROM to report whether its X2 override is usable."""
+        if self._controller_transactions:
+            return
         try:
             self.send_controller_command("ROMWP?")
+            self.begin_controller_transaction("write_protect_query")
             self.append_usb_log("SYSTEM", "Queried Control OneROM X2 write-protect override state.")
         except Exception as exc:
             self.append_usb_log("SYSTEM", f"Control OneROM X2 write-protect query was not sent: {exc}")
@@ -2063,6 +2123,21 @@ class TouchSimulator(tk.Tk):
         available = fields.get("AVAILABLE") == "1"
         reported_on = fields.get("STATE") == "ON"
         self.controller_wp_available = available
+        if "write_protect_query" in self._controller_transactions and self._pending_wp_override is None:
+            if available:
+                self._confirmed_writable = reported_on
+                self.writable.set(reported_on)
+                self.control_status.set(
+                    "Control OneROM X2 override is ON — forces writable."
+                    if reported_on else "Control OneROM X2 override is OFF — normal protection."
+                )
+            else:
+                self._confirmed_writable = False
+                self.writable.set(False)
+                self.control_status.set(fields.get("ERROR", "Control OneROM reports X2 write-protect override unavailable."))
+            self.finish_controller_transaction("write_protect_query")
+            self.update_live_hud_fields()
+            return
         if self._pending_wp_override is None:
             if available:
                 self._confirmed_writable = reported_on
@@ -2091,8 +2166,25 @@ class TouchSimulator(tk.Tk):
         self.finish_controller_transaction("write_protect")
         self.update_live_hud_fields()
 
+    def reset_controller_session_state(self) -> None:
+        """Invalidate pending controller state at a physical CDC session boundary."""
+        for after_id in tuple(self._controller_transactions.values()):
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self._controller_transactions.clear()
+        self._pending_controller_card = None
+        self._pending_controller_values.clear()
+        self._pending_wp_override = None
+        self.controller_wp_available = None
+        self._confirmed_writable = False
+        self.writable.set(False)
+
     def begin_controller_transaction(self, card_id: str) -> None:
         """Start a bounded UI transaction for one explicit Control command."""
+        if self._controller_transactions and card_id not in self._controller_transactions:
+            raise RuntimeError("Another Control OneROM command is awaiting confirmation")
         self.finish_controller_transaction(card_id)
         self._controller_transactions[card_id] = self.after(
             CONTROL_REPLY_TIMEOUT_MS,
@@ -2112,11 +2204,17 @@ class TouchSimulator(tk.Tk):
         """Make missing Control replies visible instead of waiting forever."""
         if self._controller_transactions.pop(card_id, None) is None:
             return
-        if card_id == "write_protect":
+        if card_id in {"write_protect", "write_protect_query"}:
             self._pending_wp_override = None
-            self.writable.set(self._confirmed_writable)
+            if card_id == "write_protect_query":
+                self.controller_wp_available = None
+                self._confirmed_writable = False
+                self.writable.set(False)
+            else:
+                self.writable.set(self._confirmed_writable)
         if self._pending_controller_card == card_id:
             self._pending_controller_card = None
+        self._pending_controller_values.pop(card_id, None)
         if card_id == "settings_refresh":
             self.controller_card_feedback["startup_rom"] = "CONTROL REFRESH TIMEOUT"
             self.controller_card_feedback["boot_iec"] = "CONTROL REFRESH TIMEOUT"
@@ -2219,10 +2317,16 @@ class TouchSimulator(tk.Tk):
 
     def request_dashboard_rom_choice(self, choice: str) -> None:
         """Require confirmation before changing the Control OneROM startup ROM."""
+        if self._controller_transactions:
+            self.control_status.set("Waiting for the prior Control OneROM confirmation.")
+            return
         self.dashboard_setting_prompt = {"kind": "rom", "choice": choice, "label": "STARTUP ROM"}
 
     def request_dashboard_iec_choice(self, choice: str) -> None:
         """Require confirmation before changing the Control OneROM IEC address."""
+        if self._controller_transactions:
+            self.control_status.set("Waiting for the prior Control OneROM confirmation.")
+            return
         self.dashboard_setting_prompt = {"kind": "iec", "choice": choice, "label": "IEC ADDRESS"}
 
     def apply_dashboard_setting(self) -> None:
@@ -2666,6 +2770,8 @@ class TouchSimulator(tk.Tk):
             list_status = (f"SHOWING {self.hud_scroll_index + 1}–{min(self.hud_scroll_index + HUD_VISIBLE_CARD_COUNT, len(cards))} OF {len(cards)}" if cards else "NO ACTIVE CARDS")
             text(24, 698, f"{list_status} · {telemetry_label} · ? HELP", 14, ACCENT, True)
             connection_status, connection_color = self.dashboard_connection_status()
+            canvas.create_rectangle(820*sx, 676*sy, 1010*sx, 710*sy, fill=PANEL_ALT, outline=ACCENT)
+            text(915, 693, "DIAGNOSTICS", 13, ACCENT, True, "center")
             text(1256, 698, connection_status, 14, connection_color, True, "e")
             if self.hud_help_card:
                 card = next((entry for entry in cards if entry["id"] == self.hud_help_card), None)
@@ -3192,6 +3298,10 @@ class TouchSimulator(tk.Tk):
                 return
             elif self.preview_page == "settings" and 24 <= x <= 1256 and 445 <= y <= 556:
                 self.choose_appearance_menu(event)
+                return
+            elif self.preview_page == "hud" and 820 <= x <= 1010 and 676 <= y <= 710:
+                self.preview_page = "diagnostics"
+                self.open_size_preview()
                 return
             elif self.preview_page == "hud" and HUD_SCROLL_LEFT <= x <= HUD_SCROLL_RIGHT:
                 if 100 <= y <= 240:
