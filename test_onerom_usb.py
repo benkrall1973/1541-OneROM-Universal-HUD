@@ -174,6 +174,15 @@ class DriveTelemetryParserHeadStateTests(unittest.TestCase):
         self.assertEqual(parser.state.track, "17.0")
         self.assertEqual(parser.state.position_source, "HEADER")
 
+    def test_new_home_reanchors_an_existing_track_count(self) -> None:
+        parser = DriveTelemetryParser()
+        parser.process("STATE T0.0.16 TV=1 T=30 M=1")
+        for _ in range(HOME_OUTWARD_HALF_STEPS):
+            parser.process("PHASE old=1 new=0 delta=3 motor=1")
+        parser.process("PHASE old=0 new=1 delta=1 motor=1")
+        self.assertEqual(parser.state.track, "01.0")
+        self.assertEqual(parser.state.position_source, "HOME EST.")
+
 
 class CdcBoardLinkTests(unittest.TestCase):
     def test_unterminated_receive_data_cannot_grow_the_buffer_forever(self) -> None:

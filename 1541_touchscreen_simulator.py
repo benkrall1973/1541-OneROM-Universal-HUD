@@ -347,7 +347,7 @@ class DriveTelemetryParser:
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.16"
+APP_VERSION = "V0.0.17"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -968,9 +968,21 @@ class TouchSimulator(tk.Tk):
         self.apply_device_state()
 
     def reset_monitor_state(self) -> None:
-        """Invalidate every passive reading when its physical CDC session changes."""
+        """Reset transient Monitor readings without discarding a tracked head."""
+        # A CDC reconnect does not move the stepper.  Retain a position already
+        # established from phase traffic, then let the next home/$0022/header
+        # observation correct it.  Throwing away a good mechanical count on
+        # every USB hiccup was needlessly making the HUD forgetful.
+        prior_state = getattr(self, "telemetry_parser", None)
+        prior_position = (
+            prior_state.state.position_half_tracks
+            if prior_state is not None else None
+        )
         self.telemetry_parser = DriveTelemetryParser()
-        self.live_track = "--.-"
+        if prior_position is not None:
+            self.telemetry_parser.state.position_half_tracks = prior_position
+            self.telemetry_parser.state.position_source = "CARRIED EST."
+        self.live_track = self.telemetry_parser.state.track
         self.live_density = None
         self.live_protected = None
         self.live_writing = None
@@ -1005,7 +1017,7 @@ class TouchSimulator(tk.Tk):
         self._hud_subscription_mask = None
         self._hud_telemetry_enabled = False
         for name, value in (
-            ("track_var", "--.-"), ("motor_var", "OFF"),
+            ("track_var", self.live_track), ("motor_var", "OFF"),
             ("rpm_var", "--.--"), ("sector_var", "--"), ("head_var", "PARK"),
         ):
             variable = getattr(self, name, None)
@@ -1615,7 +1627,7 @@ class TouchSimulator(tk.Tk):
             else f"{position_source} · HEADER WAITING"
         )
         cards = [
-            ("track", "Track / Position", self.live_track, track_detail, "UNANCHORED means no physical starting point is known. HOME EST. is established only after 84 observed outward half-steps followed by an inward step; it is a conventional 1541 home estimate. TARGET ($0022) and a checksum-valid physical HEADER override that estimate. HEADER Δ is the displayed position minus the latest physical header track."),
+            ("track", "Track / Position", self.live_track, track_detail, "UNANCHORED means no physical starting point is known. CARRIED EST. retains the last phase-tracked position across a Monitor USB reconnect. HOME EST. is established only after 84 observed outward half-steps followed by an inward step. TARGET ($0022) and a checksum-valid physical HEADER override any estimate. HEADER Δ is the displayed position minus the latest physical header track."),
             ("rotation", "Motor Status", f"{rpm:.2f}" if rpm is not None else "--.--", self.rpm_quality_detail(), "Primary RPM is SYNC-derived: pulses per second × 60 ÷ expected SYNC marks per revolution. Expected marks are D3=42, D2=38, D1=36, D0=34. FW is the firmware-reported RPM used independently by SYNC / Revolution. Readings outside 240–360 RPM are rejected; the platter arrows appear only while motor telemetry is ON."),
             ("activity", "Activity", self.disk_activity_label(), f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", "WRITING is an observed write-gate pulse. Otherwise a spinning disk is shown as READING; OFF means motor telemetry is off. WRITE PULSES and STEPS are cumulative observations since this Monitor connection began, not DOS file-operation counts."),
             ("physical_header", "Physical Header", header, "CONFIRMED HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER", "This is the newest decoded on-disk GCR header: physical track and sector, not a software estimate. It clears after a seek or motor stop because that old header would no longer describe the current head location."),
