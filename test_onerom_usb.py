@@ -140,16 +140,21 @@ class DriveTelemetryParserHeadStateTests(unittest.TestCase):
         parser.process("MOTOR state=0")
         self.assertEqual(parser.state.head, "PARK")
 
-    def test_full_outward_home_then_first_inward_step_establishes_track_one(self) -> None:
+    def test_full_outward_home_then_first_inward_step_advances_to_track_one_point_five(self) -> None:
         parser = DriveTelemetryParser()
         parser.process("MOTOR state=1")
         for _ in range(HOME_OUTWARD_HALF_STEPS):
             parser.process("PHASE old=1 new=0 delta=3 motor=1")
         self.assertIsNone(parser.state.position_half_tracks)
         parser.process("PHASE old=0 new=1 delta=1 motor=1")
-        self.assertEqual(parser.state.position_half_tracks, 2)
-        self.assertEqual(parser.state.track, "01.0")
+        self.assertEqual(parser.state.position_half_tracks, 3)
+        self.assertEqual(parser.state.track, "01.5")
         self.assertEqual(parser.state.position_source, "HOME EST.")
+        # The diagnostic cartridge's Track 18 seek emits 34 inward phases
+        # after its outward home pass (the first one was processed above).
+        for _ in range(33):
+            parser.process("PHASE old=0 new=1 delta=1 motor=1")
+        self.assertEqual(parser.state.track, "18.0")
 
     def test_short_outward_seek_cannot_claim_track_one(self) -> None:
         parser = DriveTelemetryParser()
@@ -180,7 +185,7 @@ class DriveTelemetryParserHeadStateTests(unittest.TestCase):
         for _ in range(HOME_OUTWARD_HALF_STEPS):
             parser.process("PHASE old=1 new=0 delta=3 motor=1")
         parser.process("PHASE old=0 new=1 delta=1 motor=1")
-        self.assertEqual(parser.state.track, "01.0")
+        self.assertEqual(parser.state.track, "01.5")
         self.assertEqual(parser.state.position_source, "HOME EST.")
 
 

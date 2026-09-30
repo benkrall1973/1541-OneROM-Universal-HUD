@@ -325,8 +325,11 @@ class DriveTelemetryParser:
         if self.state.motor: self._last_motion = time.monotonic()
         if delta == 1:
             if self._home_assumed:
-                # First inward step after a full outward home is Track 1.
-                self.state.position_half_tracks = 2
+                # The outward run ends with the head at the Track-1 bump.
+                # This inward phase transition then moves it to Track 1.5.
+                # The diagnostic cartridge proves this: 34 inward transitions
+                # after home land at selected Track 18.0.
+                self.state.position_half_tracks = 3
                 self.state.position_source = "HOME EST."
                 self._home_assumed = False
             elif self.state.position_half_tracks is not None:
@@ -347,7 +350,7 @@ class DriveTelemetryParser:
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.17"
+APP_VERSION = "V0.0.18"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -1627,7 +1630,7 @@ class TouchSimulator(tk.Tk):
             else f"{position_source} · HEADER WAITING"
         )
         cards = [
-            ("track", "Track / Position", self.live_track, track_detail, "UNANCHORED means no physical starting point is known. CARRIED EST. retains the last phase-tracked position across a Monitor USB reconnect. HOME EST. is established only after 84 observed outward half-steps followed by an inward step. TARGET ($0022) and a checksum-valid physical HEADER override any estimate. HEADER Δ is the displayed position minus the latest physical header track."),
+            ("track", "Track / Position", self.live_track, track_detail, "UNANCHORED means no physical starting point is known. CARRIED EST. retains the last phase-tracked position across a Monitor USB reconnect. HOME EST. is established only after 84 observed outward half-steps; the first inward transition then advances from the Track-1 bump to Track 1.5. TARGET ($0022) and a checksum-valid physical HEADER override any estimate. HEADER Δ is the displayed position minus the latest physical header track."),
             ("rotation", "Motor Status", f"{rpm:.2f}" if rpm is not None else "--.--", self.rpm_quality_detail(), "Primary RPM is SYNC-derived: pulses per second × 60 ÷ expected SYNC marks per revolution. Expected marks are D3=42, D2=38, D1=36, D0=34. FW is the firmware-reported RPM used independently by SYNC / Revolution. Readings outside 240–360 RPM are rejected; the platter arrows appear only while motor telemetry is ON."),
             ("activity", "Activity", self.disk_activity_label(), f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", "WRITING is an observed write-gate pulse. Otherwise a spinning disk is shown as READING; OFF means motor telemetry is off. WRITE PULSES and STEPS are cumulative observations since this Monitor connection began, not DOS file-operation counts."),
             ("physical_header", "Physical Header", header, "CONFIRMED HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER", "This is the newest decoded on-disk GCR header: physical track and sector, not a software estimate. It clears after a seek or motor stop because that old header would no longer describe the current head location."),
