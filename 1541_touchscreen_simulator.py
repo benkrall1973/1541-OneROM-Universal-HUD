@@ -35,6 +35,11 @@ except ImportError:  # Keep GUI layout work usable before pyserial is installed.
 BAUD_RATE = 115200
 MAX_RX_BUFFER_BYTES = 16 * 1024
 HEAD_STALL_TIMEOUT = 0.8
+# A 1541 has no track-zero switch.  A conventional home seek deliberately
+# drives the head outward past the complete 42-track envelope, then reverses.
+# We need 84 observed half-track transitions before treating that sequence as
+# a credible physical home rather than an ordinary outward seek.
+HOME_OUTWARD_HALF_STEPS = 84
 STATE_RE = re.compile(r"STATE\s+([A-Za-z][0-9.]+)")
 STATUS_RE = re.compile(r"STATUS\s+([A-Za-z][0-9.]+)")
 MOTOR_RE = re.compile(r"MOTOR\s+state=(\d+)")
@@ -105,6 +110,7 @@ class TelemetryState:
     writing: bool | None = None
     density: int | None = None
     position_half_tracks: int | None = None
+    position_source: str = "UNANCHORED"
     head: str = "PARK"
     rpm: float | None = None
     sector: int | None = None
@@ -228,6 +234,8 @@ class DriveTelemetryParser:
         self.state, self._last_motion = TelemetryState(), 0.0
         self._last_requested_track: int | None = None
         self._last_direction: str | None = None
+        self._outward_home_steps = 0
+        self._home_assumed = False
 
     def process(self, line: str) -> TelemetryState:
         self._refresh_head_state()
@@ -251,7 +259,14 @@ class DriveTelemetryParser:
         match = HDRMETA_RE.search(line)
         if match:
             self.state.header_id1, self.state.header_id2, self.state.header_checksum = int(match.group(1), 16), int(match.group(2), 16), int(match.group(3), 16)
-            self.state.header_checksum_valid = bool(int(match.group(4))); return self.state
+            self.state.header_checksum_valid = bool(int(match.group(4)))
+            # A checksum-valid physical header is genuine on-disk evidence,
+            # so it takes precedence over our mechanical home estimate.
+            if self.state.header_checksum_valid and self.state.header_track is not None:
+                self.state.position_half_tracks = max(2, self.state.header_track * 2)
+                self.state.position_source = "HEADER"
+                self._home_assumed = False
+            return self.state
         match = RPM_RE.search(line)
         if match: self.state.rpm = float(match.group(1)); return self.state
         match = SYNC_RE.search(line)
@@ -277,7 +292,9 @@ class DriveTelemetryParser:
             match = STATUS_CAPTURE_COMPACT_RE.search(line)
             if match: self.state.capture_count, self.state.ring_overrun, self.state.queue_overflow = map(int, match.groups())
         match = STATUS_POSITION_RE.search(line)
-        if match and int(match.group(1)): self.state.position_half_tracks = max(2, int(match.group(2)))
+        if match and int(match.group(1)):
+            self.state.position_half_tracks = max(2, int(match.group(2)))
+            self.state.position_source = "TARGET"
         else:
             match = STATUS_TRACK_RE.search(line)
             if match and int(match.group(1)): self._set_track(int(match.group(2)))
@@ -292,7 +309,11 @@ class DriveTelemetryParser:
         elif self._last_motion and time.monotonic() - self._last_motion >= HEAD_STALL_TIMEOUT: self.state.head = "STALL"
 
     def _set_track(self, track: int) -> None:
-        if self.state.position_half_tracks is None: self.state.position_half_tracks = max(2, track * 2)
+        # $0022 is explicit drive-code target information.  It is an anchor,
+        # not merely a starting hint, and must correct any home estimate.
+        self.state.position_half_tracks = max(2, track * 2)
+        self.state.position_source = "TARGET"
+        self._home_assumed = False
         previous, self._last_requested_track = self._last_requested_track, track
         if not self.state.motor: self.state.head = "PARK"; return
         if previous is None: self._last_motion = time.monotonic(); return
@@ -303,18 +324,30 @@ class DriveTelemetryParser:
     def _phase(self, delta: int) -> None:
         if self.state.motor: self._last_motion = time.monotonic()
         if delta == 1:
-            if self.state.position_half_tracks is not None: self.state.position_half_tracks += 1
+            if self._home_assumed:
+                # First inward step after a full outward home is Track 1.
+                self.state.position_half_tracks = 2
+                self.state.position_source = "HOME EST."
+                self._home_assumed = False
+            elif self.state.position_half_tracks is not None:
+                self.state.position_half_tracks += 1
             self.state.head = "IN" if self.state.motor else "PARK"
-            if self.state.motor: self._last_direction = "IN"
+            if self.state.motor:
+                self._last_direction = "IN"
+                self._outward_home_steps = 0
         elif delta == 3:
             if self.state.position_half_tracks is not None: self.state.position_half_tracks = max(2, self.state.position_half_tracks - 1)
             self.state.head = "OUT" if self.state.motor else "PARK"
-            if self.state.motor: self._last_direction = "OUT"
+            if self.state.motor:
+                self._last_direction = "OUT"
+                self._outward_home_steps += 1
+                if self._outward_home_steps >= HOME_OUTWARD_HALF_STEPS:
+                    self._home_assumed = True
         elif self.state.motor and self._last_direction is not None: self.state.head = self._last_direction
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.14"
+APP_VERSION = "V0.0.16"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -515,6 +548,8 @@ class TouchSimulator(tk.Tk):
         self.firmware_rpm: float | None = None
         self.live_sector: int | None = None
         self.live_sync_count: int | None = None
+        self.qualified_sync_count: int | None = None
+        self._sync_candidate_counts: list[int] = []
         self.last_stable_rpm: float | None = None
         self.rpm_samples: list[float] = []
         self.recent_sectors: list[int] = []
@@ -943,6 +978,8 @@ class TouchSimulator(tk.Tk):
         self.firmware_rpm = None
         self.live_sector = None
         self.live_sync_count = None
+        self.qualified_sync_count = None
+        self._sync_candidate_counts.clear()
         self.motor = False
         self.head_direction = "PARK"
         self.last_stable_rpm = None
@@ -1005,6 +1042,7 @@ class TouchSimulator(tk.Tk):
                     if motor_changed:
                         motor_visual_changed = True
                         self.record_activity("MOTOR ON" if state.motor else "MOTOR OFF")
+                        self.reset_sync_qualification()
                         if state.motor:
                             self.begin_disk_identity_verification()
                             self.header_timestamps.clear()
@@ -1026,13 +1064,12 @@ class TouchSimulator(tk.Tk):
                 if line.startswith("HDRPHY ") and state.sector is not None and self.motor:
                     self.live_sector = state.sector
                     self.sector_var.set(f"{state.sector:02d}")
-                if state.sync_count is not None:
+                if line.startswith("SYNC ") and state.sync_count is not None:
                     self.live_sync_count = state.sync_count
-                    if line.startswith("SYNC "):
-                        sample = self.effective_rpm()
-                        if sample is not None:
-                            self.rpm_samples.append(sample)
-                            del self.rpm_samples[:-5]
+                    sample = self.observe_sync_sample(state.sync_count)
+                    if sample is not None:
+                        self.rpm_samples.append(sample)
+                        del self.rpm_samples[:-5]
                 if state.capture_count is not None:
                     self.capture_count = state.capture_count
                     self.ring_overrun = state.ring_overrun
@@ -1062,6 +1099,7 @@ class TouchSimulator(tk.Tk):
                     # the current position, just as in the proven HUD GUI.
                     self.phase_event_count += 1
                     self.record_activity(f"SEEK {state.head}")
+                    self.reset_sync_qualification()
                     self.clear_current_header()
                     self.clear_recent_sectors()
                 elif line.startswith("HDRPHY ") and state.header_track is not None and state.sector is not None:
@@ -1408,18 +1446,55 @@ class TouchSimulator(tk.Tk):
         # margin before the Help and Priority controls.
         return " · ".join(entries[:15]), " · ".join(entries[15:])
 
+    def reset_sync_qualification(self) -> None:
+        """Discard samples that cannot describe one stable spindle state."""
+        self.qualified_sync_count = None
+        self._sync_candidate_counts.clear()
+        self.last_stable_rpm = None
+        self.rpm_samples.clear()
+
+    def observe_sync_sample(self, count: int) -> float | None:
+        """Accept only consecutive plausible one-second SYNC measurements."""
+        expected = {3: 42, 2: 38, 1: 36, 0: 34}.get(self.live_density)
+        if not self.motor or expected is None:
+            self.reset_sync_qualification()
+            return None
+        rpm = count * 60.0 / expected
+        if not 240.0 <= rpm <= 360.0:
+            # A partial start/stop/seek window is not a measurement. Do not
+            # turn it into a dramatic but meaningless dashboard flicker.
+            self.qualified_sync_count = None
+            self._sync_candidate_counts.clear()
+            self.last_stable_rpm = None
+            return None
+        self._sync_candidate_counts.append(count)
+        del self._sync_candidate_counts[:-2]
+        if len(self._sync_candidate_counts) < 2:
+            self.qualified_sync_count = None
+            self.last_stable_rpm = None
+            return None
+        first, second = self._sync_candidate_counts
+        if abs(second - first) > max(4, round(max(first, second) * 0.04)):
+            self._sync_candidate_counts[:] = [second]
+            self.qualified_sync_count = None
+            self.last_stable_rpm = None
+            return None
+        self.qualified_sync_count = round((first + second) / 2)
+        self.last_stable_rpm = self.qualified_sync_count * 60.0 / expected
+        return self.last_stable_rpm
+
     def sync_revolution_reading(self) -> tuple[float | None, int | None, int | None]:
         """Return the measured ratio, its physical-count display, and zone target."""
         expected_by_density = {3: 42, 2: 38, 1: 36, 0: 34}
         expected = expected_by_density.get(self.live_density)
         if (
             not self.motor
-            or self.live_sync_count is None
+            or self.qualified_sync_count is None
             or self.firmware_rpm is None
             or self.firmware_rpm <= 0
         ):
             return None, None, expected
-        estimate = self.live_sync_count * 60 / self.firmware_rpm
+        estimate = self.qualified_sync_count * 60 / self.firmware_rpm
         # Individual SYNC pulses are discrete.  The fraction belongs to the
         # one-second-window/RPM diagnostic, while the primary HUD value is
         # the nearest physical count per revolution.
@@ -1510,18 +1585,7 @@ class TouchSimulator(tk.Tk):
         self.open_size_preview()
 
     def effective_rpm(self) -> float | None:
-        """Return qualified RPM from SYNC/sec, rejecting partial windows."""
-        expected_by_density = {3: 42, 2: 38, 1: 36, 0: 34}
-        expected = expected_by_density.get(self.live_density)
-        if self.motor and expected and self.live_sync_count is not None and self.live_sync_count > 0:
-            # live_sync_count is SYNC pulses per second. Convert it to RPM
-            # using the density's physical SYNCs-per-revolution target.
-            derived_rpm = self.live_sync_count * 60.0 / expected
-            # Short seek/format windows can report a handful of pulses or a
-            # mixed count. Accept only a physically plausible 1541 spindle
-            # range, otherwise hold the last qualified reading.
-            if 240.0 <= derived_rpm <= 360.0:
-                self.last_stable_rpm = derived_rpm
+        """Return the RPM established by stable, plausible SYNC windows."""
         return self.last_stable_rpm
 
     def disk_activity_label(self) -> str:
@@ -1544,8 +1608,14 @@ class TouchSimulator(tk.Tk):
         header_rate = self.header_rate()
         history_first, history_second = self.diagnostic_history_lines()
         fifo_first, fifo_second = self.sector_fifo_lines()
+        position_source = self.telemetry_parser.state.position_source
+        track_detail = (
+            f"HEADER Δ {offset:+.1f} · {position_source}"
+            if offset is not None
+            else f"{position_source} · HEADER WAITING"
+        )
         cards = [
-            ("track", "Track / Position", self.live_track, f"HEADER Δ {offset:+.1f}" if offset is not None else "POSITION ESTIMATE · HEADER WAITING", "Position is estimated from observed target-track writes and phase transitions. A decoded physical header corrects that estimate. HEADER Δ is estimated position minus the latest physical header track; WAITING means no usable header has been decoded yet."),
+            ("track", "Track / Position", self.live_track, track_detail, "UNANCHORED means no physical starting point is known. HOME EST. is established only after 84 observed outward half-steps followed by an inward step; it is a conventional 1541 home estimate. TARGET ($0022) and a checksum-valid physical HEADER override that estimate. HEADER Δ is the displayed position minus the latest physical header track."),
             ("rotation", "Motor Status", f"{rpm:.2f}" if rpm is not None else "--.--", self.rpm_quality_detail(), "Primary RPM is SYNC-derived: pulses per second × 60 ÷ expected SYNC marks per revolution. Expected marks are D3=42, D2=38, D1=36, D0=34. FW is the firmware-reported RPM used independently by SYNC / Revolution. Readings outside 240–360 RPM are rejected; the platter arrows appear only while motor telemetry is ON."),
             ("activity", "Activity", self.disk_activity_label(), f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", "WRITING is an observed write-gate pulse. Otherwise a spinning disk is shown as READING; OFF means motor telemetry is off. WRITE PULSES and STEPS are cumulative observations since this Monitor connection began, not DOS file-operation counts."),
             ("physical_header", "Physical Header", header, "CONFIRMED HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER", "This is the newest decoded on-disk GCR header: physical track and sector, not a software estimate. It clears after a seek or motor stop because that old header would no longer describe the current head location."),
@@ -1557,7 +1627,7 @@ class TouchSimulator(tk.Tk):
             ("head", "Head", self.head_var.get(), f"POSITION {self.live_track} · {self.phase_event_count} STEPS", "IN means track/phase evidence moved toward higher tracks; OUT means lower tracks. STALL means the motor is running with no target or phase movement for 0.8 seconds. PARK means motor telemetry is off. Position remains an estimate until a physical header confirms it."),
             ("header_rate", "Header Rate", f"{header_rate:.1f}/S" if header_rate is not None else "WAITING", "Rate of checksum-decoded physical headers over a rolling five-second window. It is a passive observation rate, not a guarantee of disk health. WAITING means fewer than two valid header timestamps are available."),
             ("capture_rate", "Capture Rate", f"{self.capture_rate / 1000:.0f}K/S" if self.capture_rate is not None else "WAITING", "Passive firmware capture events per second, calculated from the change in CAP between periodic status records. WAITING means the Monitor has not yet received two usable capture-count samples."),
-            ("sync_rate", "SYNC Rate", f"{self.live_sync_count}/S" if self.live_sync_count is not None else "WAITING", "Raw SYNC pulses counted during the latest one-second capture interval. It feeds the qualified RPM calculation when motor state and density are known. A seek or formatting pass can make one interval partial or mixed."),
+            ("sync_rate", "SYNC Rate", "MOTOR OFF" if not self.motor else f"{self.qualified_sync_count}/S" if self.qualified_sync_count is not None else "ACQUIRING", "A stable two-window SYNC rate. Start, stop, and seek intervals are intentionally shown as ACQUIRING rather than reported as a misleading partial measurement."),
             ("sync_per_rev", "SYNC / REV EST.", str(sync_per_rev) if sync_per_rev is not None else "--", f"RAW {sync_estimate:.2f}" if sync_estimate is not None else "WAITING FOR SYNC", "Calculated as SYNC/sec × 60 ÷ RPM, then rounded to a physical count. This is an estimate until it is validated over a stable multi-revolution window. RAW is the unrounded ratio. Compare the result with the density expectation; nonstandard or copy-protected media may intentionally differ."),
             ("mechanism", "Mechanism", f"{self.phase_event_count} STEPS", f"TRACK {self.live_track} · HEAD {self.head_var.get()}", "Cumulative observed phase/step transitions since Monitor connection. It is useful for seeing mechanical activity and repeated seeking, but it does not reset per disk and is not an absolute head-position counter."),
             ("recent_evidence", "Recent Evidence", history_first, history_second or "PASSIVE EVENT HISTORY", "A compact chronological trace of decoded headers, seek events, write-gate activity, and motor changes. It is passive evidence for what the Monitor observed most recently; DOS errors, retries, and directory activity are not exposed by this telemetry."),

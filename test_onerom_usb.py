@@ -11,6 +11,7 @@ BoardDescriptor = touchscreen.BoardDescriptor
 CdcBoardLink = touchscreen.CdcBoardLink
 DriveBinding = touchscreen.DriveBinding
 DriveTelemetryParser = touchscreen.DriveTelemetryParser
+HOME_OUTWARD_HALF_STEPS = touchscreen.HOME_OUTWARD_HALF_STEPS
 MAX_RX_BUFFER_BYTES = touchscreen.MAX_RX_BUFFER_BYTES
 load_binding = touchscreen.load_binding
 save_binding = touchscreen.save_binding
@@ -139,6 +140,40 @@ class DriveTelemetryParserHeadStateTests(unittest.TestCase):
         parser.process("MOTOR state=0")
         self.assertEqual(parser.state.head, "PARK")
 
+    def test_full_outward_home_then_first_inward_step_establishes_track_one(self) -> None:
+        parser = DriveTelemetryParser()
+        parser.process("MOTOR state=1")
+        for _ in range(HOME_OUTWARD_HALF_STEPS):
+            parser.process("PHASE old=1 new=0 delta=3 motor=1")
+        self.assertIsNone(parser.state.position_half_tracks)
+        parser.process("PHASE old=0 new=1 delta=1 motor=1")
+        self.assertEqual(parser.state.position_half_tracks, 2)
+        self.assertEqual(parser.state.track, "01.0")
+        self.assertEqual(parser.state.position_source, "HOME EST.")
+
+    def test_short_outward_seek_cannot_claim_track_one(self) -> None:
+        parser = DriveTelemetryParser()
+        parser.process("MOTOR state=1")
+        for _ in range(HOME_OUTWARD_HALF_STEPS - 1):
+            parser.process("PHASE old=1 new=0 delta=3 motor=1")
+        parser.process("PHASE old=0 new=1 delta=1 motor=1")
+        self.assertIsNone(parser.state.position_half_tracks)
+        self.assertEqual(parser.state.position_source, "UNANCHORED")
+
+    def test_target_write_and_valid_header_override_home_estimate(self) -> None:
+        parser = DriveTelemetryParser()
+        parser.process("MOTOR state=1")
+        for _ in range(HOME_OUTWARD_HALF_STEPS):
+            parser.process("PHASE old=1 new=0 delta=3 motor=1")
+        parser.process("PHASE old=0 new=1 delta=1 motor=1")
+        parser.process("TRACK_WRITE addr=$0022 data=$12 (18)")
+        self.assertEqual(parser.state.track, "18.0")
+        self.assertEqual(parser.state.position_source, "TARGET")
+        parser.process("HDRPHY T=17 S=4")
+        parser.process("HDRMETA ID1=$AA ID2=$BB CHK=$00 OK=1")
+        self.assertEqual(parser.state.track, "17.0")
+        self.assertEqual(parser.state.position_source, "HEADER")
+
 
 class CdcBoardLinkTests(unittest.TestCase):
     def test_unterminated_receive_data_cannot_grow_the_buffer_forever(self) -> None:
@@ -148,6 +183,38 @@ class CdcBoardLinkTests(unittest.TestCase):
 
         self.assertEqual(link.read_lines(), [])
         self.assertEqual(link._buffer, "")
+
+
+class SyncQualificationTests(unittest.TestCase):
+    def qualifier_target(self) -> TouchSimulator:
+        target = TouchSimulator.__new__(TouchSimulator)
+        target.motor = True
+        target.live_density = 2
+        target.qualified_sync_count = None
+        target._sync_candidate_counts = []
+        target.last_stable_rpm = None
+        target.rpm_samples = []
+        return target
+
+    def test_partial_spinup_sample_stays_acquiring(self) -> None:
+        target = self.qualifier_target()
+        self.assertIsNone(target.observe_sync_sample(117))
+        self.assertIsNone(target.qualified_sync_count)
+        self.assertIsNone(target.last_stable_rpm)
+
+    def test_two_consistent_samples_produce_qualified_rpm(self) -> None:
+        target = self.qualifier_target()
+        self.assertIsNone(target.observe_sync_sample(190))
+        self.assertAlmostEqual(target.observe_sync_sample(190), 300.0)
+        self.assertEqual(target.qualified_sync_count, 190)
+
+    def test_reset_discards_existing_sync_measurement(self) -> None:
+        target = self.qualifier_target()
+        target.observe_sync_sample(190)
+        target.observe_sync_sample(190)
+        target.reset_sync_qualification()
+        self.assertIsNone(target.qualified_sync_count)
+        self.assertIsNone(target.effective_rpm())
 
 
 class DriveBindingPersistenceTests(unittest.TestCase):
