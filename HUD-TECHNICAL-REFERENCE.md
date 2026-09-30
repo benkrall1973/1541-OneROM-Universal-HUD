@@ -1,4 +1,4 @@
-# 1541 OneROM Desktop Monitor V0.0.13 baseline
+# 1541 OneROM Desktop Monitor V0.0.22
 
 The desktop Monitor is a Python/Tkinter display for the passive Monitor OneROM
 firmware. It never controls the 1541 drive through the Monitor OneROM; the
@@ -13,6 +13,30 @@ ROM, IEC-address, and write-protect controls.
 | `Run-1541-Touchscreen-Simulator.cmd` | Windows launcher. |
 
 ## Diagnostics semantics
+
+### Track position and `SYNC 18`
+
+The Track / Position card follows observed UC2 stepper-phase transitions in
+half-track increments. A long outward seek followed by an inward transition
+establishes a HOME estimate; `$0022` target-track writes and checksum-valid
+physical headers can subsequently correct that estimate.
+
+`SYNC 18` is a **local display calibration** button. Use it only after a known
+operation has placed the real head on directory Track 18—for example:
+
+```basic
+OPEN 15,8,15,"I":CLOSE 15
+```
+
+or after loading the directory. Tapping the button sets the displayed counter
+to `18.0 · MANUAL SYNC 18`; later observed phase steps continue from that
+position. It does not send IEC, Control OneROM, or Monitor OneROM commands and
+does not move the head. A later HOME sequence, `$0022` write, or valid physical
+header may re-anchor the display automatically.
+
+The Track card turns red above Track 35.0 to call out movement beyond standard
+35-track DOS media. The measurement remains visible because 36–42-track media
+and diagnostic operations are real, not a reason for the HUD to hide data.
 
 Physical Header is the most recently decoded header, for example `T35 S09`.
 Sector Coverage is a recent-observation count such as `SEEN 8/17`; normal DOS
@@ -40,9 +64,11 @@ or interrupting passive firmware capture.
 ## Session and configuration safety
 
 Monitor readings are session-scoped. A Monitor disconnect, release, or
-reconnect clears parser state and all derived disk/header/RPM/capture evidence
-before the next CDC session is displayed. Every complete CDC record is parsed;
-only the visible USB log is bounded.
+reconnect clears transient disk/header/RPM/capture evidence before the next CDC
+session is displayed. An already established track estimate is retained as
+`CARRIED EST.` across that reconnect and is corrected by later HOME, `$0022`, or
+physical-header evidence. Every complete CDC record is parsed; only the visible
+USB log is bounded.
 
 The shared `onerom_drive_bindings.json` stores the binding schema version,
 Control and Monitor USB serials, appearance colors, HUD card priorities, and
