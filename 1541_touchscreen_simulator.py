@@ -314,7 +314,7 @@ class DriveTelemetryParser:
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.13"
+APP_VERSION = "V0.0.14"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -1558,7 +1558,7 @@ class TouchSimulator(tk.Tk):
             ("header_rate", "Header Rate", f"{header_rate:.1f}/S" if header_rate is not None else "WAITING", "Rate of checksum-decoded physical headers over a rolling five-second window. It is a passive observation rate, not a guarantee of disk health. WAITING means fewer than two valid header timestamps are available."),
             ("capture_rate", "Capture Rate", f"{self.capture_rate / 1000:.0f}K/S" if self.capture_rate is not None else "WAITING", "Passive firmware capture events per second, calculated from the change in CAP between periodic status records. WAITING means the Monitor has not yet received two usable capture-count samples."),
             ("sync_rate", "SYNC Rate", f"{self.live_sync_count}/S" if self.live_sync_count is not None else "WAITING", "Raw SYNC pulses counted during the latest one-second capture interval. It feeds the qualified RPM calculation when motor state and density are known. A seek or formatting pass can make one interval partial or mixed."),
-            ("sync_per_rev", "SYNC / Revolution", str(sync_per_rev) if sync_per_rev is not None else "--", f"EST {sync_estimate:.2f}" if sync_estimate is not None else "WAITING FOR SYNC", "Calculated as SYNC/sec × 60 ÷ RPM, then rounded to a physical count. EST is the unrounded ratio. Compare the result with the density expectation; nonstandard or copy-protected media may intentionally differ."),
+            ("sync_per_rev", "SYNC / REV EST.", str(sync_per_rev) if sync_per_rev is not None else "--", f"RAW {sync_estimate:.2f}" if sync_estimate is not None else "WAITING FOR SYNC", "Calculated as SYNC/sec × 60 ÷ RPM, then rounded to a physical count. This is an estimate until it is validated over a stable multi-revolution window. RAW is the unrounded ratio. Compare the result with the density expectation; nonstandard or copy-protected media may intentionally differ."),
             ("mechanism", "Mechanism", f"{self.phase_event_count} STEPS", f"TRACK {self.live_track} · HEAD {self.head_var.get()}", "Cumulative observed phase/step transitions since Monitor connection. It is useful for seeing mechanical activity and repeated seeking, but it does not reset per disk and is not an absolute head-position counter."),
             ("recent_evidence", "Recent Evidence", history_first, history_second or "PASSIVE EVENT HISTORY", "A compact chronological trace of decoded headers, seek events, write-gate activity, and motor changes. It is passive evidence for what the Monitor observed most recently; DOS errors, retries, and directory activity are not exposed by this telemetry."),
         ]
