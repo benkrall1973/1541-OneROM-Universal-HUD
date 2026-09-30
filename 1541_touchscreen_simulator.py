@@ -356,7 +356,7 @@ class DriveTelemetryParser:
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.20"
+APP_VERSION = "V0.0.21"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -1694,7 +1694,10 @@ class TouchSimulator(tk.Tk):
             result.append({"id": card_id, "title": title, "value": value, "detail": detail,
                            "help": help_text, "priority": self.hud_card_priorities.get(card_id),
                            "kind": "control" if card_id in {"startup_rom", "boot_iec", "write_protect"} else "telemetry",
-                           "alert": card_id == "track" and track_overrange})
+                           "alert": (
+                               (card_id == "track" and track_overrange)
+                               or (card_id == "write_protect" and self._confirmed_writable)
+                           )})
         return sorted(
             result,
             key=lambda card: (
@@ -1938,7 +1941,7 @@ class TouchSimulator(tk.Tk):
                     value = f"{value[:21]}..."
                 canvas.itemconfigure(f"scroll_{card_id}_value", text=value)
                 canvas.itemconfigure(f"scroll_{card_id}_detail", text=detail)
-                if card_id == "track":
+                if card_id in {"track", "write_protect"}:
                     alert = bool(card.get("alert"))
                     canvas.itemconfigure(
                         f"scroll_{card_id}_background",
@@ -2749,7 +2752,7 @@ class TouchSimulator(tk.Tk):
                     text(48, y1 + 50, value, 15, TEXT, True, tag=f"scroll_{card['id']}_value")
                     text(48, y1 + 80, detail, 15, TEXT, True, tag=f"scroll_{card['id']}_detail")
                 else:
-                    value_color = OFFLINE if (alert or (card["id"] == "write_protect" and self._confirmed_writable)) else TEXT
+                    value_color = OFFLINE if alert else TEXT
                     text(48, y1 + 64, display_value, 24, value_color, True, tag=f"scroll_{card['id']}_value")
                     text(400, y1 + 64, detail, 14, OFFLINE if alert else MUTED, True, tag=f"scroll_{card['id']}_detail")
                 priority = card["priority"]
