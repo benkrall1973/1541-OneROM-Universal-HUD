@@ -356,7 +356,7 @@ class DriveTelemetryParser:
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.21"
+APP_VERSION = "V0.0.22"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -1608,6 +1608,20 @@ class TouchSimulator(tk.Tk):
         self.clear_drops_prompt = True
         self.open_size_preview()
 
+    def sync_track_to_18(self) -> None:
+        """Manually anchor the passive step counter at the known directory track."""
+        state = self.telemetry_parser.state
+        state.position_half_tracks = 36
+        state.position_source = "MANUAL SYNC 18"
+        self.live_track = state.track
+        self.track_var.set(self.live_track)
+        self.clear_current_header()
+        self.clear_recent_sectors()
+        self.record_activity("MANUAL SYNC T18")
+        self.append_usb_log("SYSTEM", "Track counter manually synchronized to Track 18.0 (display only).")
+        self._hud_dirty = True
+        self.update_live_hud_fields()
+
     def effective_rpm(self) -> float | None:
         """Return the RPM established by stable, plausible SYNC windows."""
         return self.last_stable_rpm
@@ -1642,7 +1656,7 @@ class TouchSimulator(tk.Tk):
         if track_overrange:
             track_detail = f"OVER 35.0 · {position_source}"
         cards = [
-            ("track", "Track / Position", self.live_track, track_detail, "UNANCHORED means no physical starting point is known. CARRIED EST. retains the last phase-tracked position across a Monitor USB reconnect. HOME EST. is established only after 84 observed outward half-steps; the first inward transition then advances from the Track-1 bump to Track 1.5. TARGET ($0022) and a checksum-valid physical HEADER override any estimate. HEADER Δ is the displayed position minus the latest physical header track."),
+            ("track", "Track / Position", self.live_track, track_detail, "SYNC 18 manually anchors the display at directory Track 18.0 and sends no drive command; use it only after an initialize or directory operation has placed the head there. UNANCHORED means no physical starting point is known. CARRIED EST. retains the last phase-tracked position across a Monitor USB reconnect. HOME EST. is established only after 84 observed outward half-steps; the first inward transition then advances from the Track-1 bump to Track 1.5. TARGET ($0022) and a checksum-valid physical HEADER override any estimate."),
             ("rotation", "Motor Status", f"{rpm:.2f}" if rpm is not None else "--.--", self.rpm_quality_detail(), "Primary RPM is SYNC-derived: pulses per second × 60 ÷ expected SYNC marks per revolution. Expected marks are D3=42, D2=38, D1=36, D0=34. FW is the firmware-reported RPM used independently by SYNC / Revolution. Readings outside 240–360 RPM are rejected; the platter arrows appear only while motor telemetry is ON."),
             ("activity", "Activity", self.disk_activity_label(), f"WRITE PULSES {self.write_pulse_count} · STEPS {self.phase_event_count}", "WRITING is an observed write-gate pulse. Otherwise a spinning disk is shown as READING; OFF means motor telemetry is off. WRITE PULSES and STEPS are cumulative observations since this Monitor connection began, not DOS file-operation counts."),
             ("physical_header", "Physical Header", header, "CONFIRMED HEADER" if self.last_header_track is not None else "NO CONFIRMED HEADER", "This is the newest decoded on-disk GCR header: physical track and sector, not a software estimate. It clears after a seek or motor stop because that old header would no longer describe the current head location."),
@@ -2771,6 +2785,12 @@ class TouchSimulator(tk.Tk):
                     action_color = OFFLINE if self._confirmed_writable else ACCENT
                     canvas.create_rectangle(HUD_OVERRIDE_LEFT*sx, (y1 + 23)*sy, HUD_OVERRIDE_RIGHT*sx, (y1 + 87)*sy, fill=PANEL_ALT, outline=action_color, tags=f"scroll_{card['id']}_action_box")
                     text((HUD_OVERRIDE_LEFT + HUD_OVERRIDE_RIGHT) / 2, y1 + 55, action, 13, action_color, True, "center", tag=f"scroll_{card['id']}_action_text")
+                elif card["id"] == "track":
+                    # This is a local calibration marker, never a drive
+                    # command.  It mirrors the dedicated Sync control found
+                    # on physical step-counting track displays.
+                    canvas.create_rectangle(HUD_OVERRIDE_LEFT*sx, (y1 + 23)*sy, HUD_OVERRIDE_RIGHT*sx, (y1 + 87)*sy, fill=PANEL_ALT, outline=ACCENT)
+                    text((HUD_OVERRIDE_LEFT + HUD_OVERRIDE_RIGHT) / 2, y1 + 55, "SYNC 18", 14, ACCENT, True, "center")
                 elif card["id"] == "capture_health":
                     # Health reset is local to the diagnostic window and is
                     # safe to expose as a direct, finger-sized card action.
@@ -3353,6 +3373,8 @@ class TouchSimulator(tk.Tk):
                         self.priority_prompt_card = str(card["id"])
                         priority = card["priority"]
                         self.priority_prompt_value = str(priority) if priority is not None else ""
+                    elif card["id"] == "track" and HUD_OVERRIDE_LEFT <= x <= HUD_OVERRIDE_RIGHT and row_y + 23 <= y <= row_y + 87:
+                        self.sync_track_to_18()
                     elif card["id"] == "write_protect" and HUD_OVERRIDE_LEFT <= x <= HUD_OVERRIDE_RIGHT and row_y + 23 <= y <= row_y + 87:
                         self.confirm_write_protect_toggle()
                     elif card["id"] == "capture_health" and HUD_OVERRIDE_LEFT <= x <= HUD_OVERRIDE_RIGHT and row_y + 23 <= y <= row_y + 87:

@@ -205,6 +205,36 @@ class CdcBoardLinkTests(unittest.TestCase):
         self.assertEqual(link._buffer, "")
 
 
+class TrackSyncTests(unittest.TestCase):
+    def test_manual_sync_sets_directory_track_without_a_drive_command(self) -> None:
+        target = TouchSimulator.__new__(TouchSimulator)
+        target.telemetry_parser = DriveTelemetryParser()
+        target.live_track = "--.-"
+        target._hud_dirty = False
+        events = []
+
+        class TrackVariable:
+            value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        target.track_var = TrackVariable()
+        target.clear_current_header = lambda: events.append("clear-header")
+        target.clear_recent_sectors = lambda: events.append("clear-sectors")
+        target.record_activity = lambda event: events.append(event)
+        target.append_usb_log = lambda role, message: events.append((role, message))
+        target.update_live_hud_fields = lambda: events.append("redraw")
+
+        target.sync_track_to_18()
+
+        self.assertEqual(target.telemetry_parser.state.track, "18.0")
+        self.assertEqual(target.telemetry_parser.state.position_source, "MANUAL SYNC 18")
+        self.assertEqual(target.track_var.value, "18.0")
+        self.assertIn("MANUAL SYNC T18", events)
+        self.assertTrue(target._hud_dirty)
+
+
 class SyncQualificationTests(unittest.TestCase):
     def qualifier_target(self) -> TouchSimulator:
         target = TouchSimulator.__new__(TouchSimulator)
