@@ -356,7 +356,7 @@ class DriveTelemetryParser:
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.19"
+APP_VERSION = "V0.0.20"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -389,6 +389,9 @@ MUTED = "#a9bbc4"
 ACCENT = "#33c3a5"
 WARNING = "#f6c85f"
 OFFLINE = "#ef6b73"
+# A muted red surface makes an overrange Track row unmistakable without
+# replacing the whole dashboard with a flashing emergency sign.
+TRACK_ALERT_PANEL = "#3a2029"
 HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 COLOR_PALETTES = {
@@ -1936,13 +1939,23 @@ class TouchSimulator(tk.Tk):
                 canvas.itemconfigure(f"scroll_{card_id}_value", text=value)
                 canvas.itemconfigure(f"scroll_{card_id}_detail", text=detail)
                 if card_id == "track":
+                    alert = bool(card.get("alert"))
+                    canvas.itemconfigure(
+                        f"scroll_{card_id}_background",
+                        fill=TRACK_ALERT_PANEL if alert else PANEL,
+                        outline=OFFLINE if alert else ACCENT,
+                    )
+                    canvas.itemconfigure(
+                        f"scroll_{card_id}_title",
+                        fill=OFFLINE if alert else MUTED,
+                    )
                     canvas.itemconfigure(
                         f"scroll_{card_id}_value",
-                        fill=OFFLINE if bool(card.get("alert")) else TEXT,
+                        fill=OFFLINE if alert else TEXT,
                     )
                     canvas.itemconfigure(
                         f"scroll_{card_id}_detail",
-                        fill=OFFLINE if bool(card.get("alert")) else MUTED,
+                        fill=OFFLINE if alert else MUTED,
                     )
                 if card_id == "write_protect":
                     canvas.itemconfigure(
@@ -2719,8 +2732,15 @@ class TouchSimulator(tk.Tk):
                 y2 = y1 + HUD_CARD_HEIGHT
                 alert = bool(card.get("alert"))
                 card_color = OFFLINE if alert else ACCENT
-                canvas.create_rectangle(24*sx, y1*sy, HUD_CARD_RIGHT*sx, y2*sy, fill=PANEL, outline=card_color, width=1)
-                text(48, y1 + 20, str(card["title"]).upper(), 14, OFFLINE if alert else MUTED, True)
+                canvas.create_rectangle(
+                    24*sx, y1*sy, HUD_CARD_RIGHT*sx, y2*sy,
+                    fill=TRACK_ALERT_PANEL if alert else PANEL,
+                    outline=card_color, width=1,
+                    tags=f"scroll_{card['id']}_background",
+                )
+                text(48, y1 + 20, str(card["title"]).upper(), 14,
+                     OFFLINE if alert else MUTED, True,
+                     tag=f"scroll_{card['id']}_title")
                 value, detail = self.scroll_card_paint_text(card)
                 display_value = value if len(value) <= 24 else f"{value[:21]}..."
                 # Values retain a consistent visual weight across every
