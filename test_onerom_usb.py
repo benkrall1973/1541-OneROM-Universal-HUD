@@ -12,6 +12,7 @@ CdcBoardLink = touchscreen.CdcBoardLink
 DriveBinding = touchscreen.DriveBinding
 DriveTelemetryParser = touchscreen.DriveTelemetryParser
 HOME_OUTWARD_HALF_STEPS = touchscreen.HOME_OUTWARD_HALF_STEPS
+track_is_over_dos_range = touchscreen.track_is_over_dos_range
 MAX_RX_BUFFER_BYTES = touchscreen.MAX_RX_BUFFER_BYTES
 load_binding = touchscreen.load_binding
 save_binding = touchscreen.save_binding
@@ -69,6 +70,11 @@ class _FakeCdcDevice:
 
 
 class DriveTelemetryParserHeadStateTests(unittest.TestCase):
+    def test_track_overrange_starts_above_track_thirty_five(self) -> None:
+        self.assertFalse(track_is_over_dos_range(None))
+        self.assertFalse(track_is_over_dos_range(70))
+        self.assertTrue(track_is_over_dos_range(71))
+
     def test_successive_track_writes_set_requested_direction(self) -> None:
         parser = DriveTelemetryParser()
         with mock_monotonic(10.0):

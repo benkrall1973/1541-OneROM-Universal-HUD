@@ -40,6 +40,7 @@ HEAD_STALL_TIMEOUT = 0.8
 # We need 84 observed half-track transitions before treating that sequence as
 # a credible physical home rather than an ordinary outward seek.
 HOME_OUTWARD_HALF_STEPS = 84
+DOS_MAX_TRACK_HALF_STEPS = 70  # Track 35.0
 STATE_RE = re.compile(r"STATE\s+([A-Za-z][0-9.]+)")
 STATUS_RE = re.compile(r"STATUS\s+([A-Za-z][0-9.]+)")
 MOTOR_RE = re.compile(r"MOTOR\s+state=(\d+)")
@@ -132,6 +133,11 @@ class TelemetryState:
         if self.position_half_tracks is None:
             return "--.-"
         return f"{self.position_half_tracks // 2:02d}{'.5' if self.position_half_tracks & 1 else '.0'}"
+
+
+def track_is_over_dos_range(position_half_tracks: int | None) -> bool:
+    """Whether a tracked head position is beyond standard 35-track DOS media."""
+    return position_half_tracks is not None and position_half_tracks > DOS_MAX_TRACK_HALF_STEPS
 
 
 def discover_cdc_boards() -> list[BoardDescriptor]:
@@ -350,7 +356,7 @@ class DriveTelemetryParser:
 
 
 WIDTH, HEIGHT = 1280, 720
-APP_VERSION = "V0.0.18"
+APP_VERSION = "V0.0.19"
 HUD_VISIBLE_CARD_COUNT = 5
 HUD_CARD_TOP = 100
 # Five rows exactly fill the same y=100…672 span as the four scroll
@@ -1621,6 +1627,7 @@ class TouchSimulator(tk.Tk):
         ring_overrun, queue_overflow = self.diagnostic_drop_counts()
         sync_estimate, sync_per_rev, sync_expected = self.sync_revolution_reading()
         header_rate = self.header_rate()
+        track_overrange = track_is_over_dos_range(self.telemetry_parser.state.position_half_tracks)
         history_first, history_second = self.diagnostic_history_lines()
         fifo_first, fifo_second = self.sector_fifo_lines()
         position_source = self.telemetry_parser.state.position_source
@@ -1629,6 +1636,8 @@ class TouchSimulator(tk.Tk):
             if offset is not None
             else f"{position_source} · HEADER WAITING"
         )
+        if track_overrange:
+            track_detail = f"OVER 35.0 · {position_source}"
         cards = [
             ("track", "Track / Position", self.live_track, track_detail, "UNANCHORED means no physical starting point is known. CARRIED EST. retains the last phase-tracked position across a Monitor USB reconnect. HOME EST. is established only after 84 observed outward half-steps; the first inward transition then advances from the Track-1 bump to Track 1.5. TARGET ($0022) and a checksum-valid physical HEADER override any estimate. HEADER Δ is the displayed position minus the latest physical header track."),
             ("rotation", "Motor Status", f"{rpm:.2f}" if rpm is not None else "--.--", self.rpm_quality_detail(), "Primary RPM is SYNC-derived: pulses per second × 60 ÷ expected SYNC marks per revolution. Expected marks are D3=42, D2=38, D1=36, D0=34. FW is the firmware-reported RPM used independently by SYNC / Revolution. Readings outside 240–360 RPM are rejected; the platter arrows appear only while motor telemetry is ON."),
@@ -1681,7 +1690,8 @@ class TouchSimulator(tk.Tk):
             help_text = DETAILED_CARD_HELP.get(card_id, help_text)
             result.append({"id": card_id, "title": title, "value": value, "detail": detail,
                            "help": help_text, "priority": self.hud_card_priorities.get(card_id),
-                           "kind": "control" if card_id in {"startup_rom", "boot_iec", "write_protect"} else "telemetry"})
+                           "kind": "control" if card_id in {"startup_rom", "boot_iec", "write_protect"} else "telemetry",
+                           "alert": card_id == "track" and track_overrange})
         return sorted(
             result,
             key=lambda card: (
@@ -1925,6 +1935,15 @@ class TouchSimulator(tk.Tk):
                     value = f"{value[:21]}..."
                 canvas.itemconfigure(f"scroll_{card_id}_value", text=value)
                 canvas.itemconfigure(f"scroll_{card_id}_detail", text=detail)
+                if card_id == "track":
+                    canvas.itemconfigure(
+                        f"scroll_{card_id}_value",
+                        fill=OFFLINE if bool(card.get("alert")) else TEXT,
+                    )
+                    canvas.itemconfigure(
+                        f"scroll_{card_id}_detail",
+                        fill=OFFLINE if bool(card.get("alert")) else MUTED,
+                    )
                 if card_id == "write_protect":
                     canvas.itemconfigure(
                         f"scroll_{card_id}_value",
@@ -2698,8 +2717,10 @@ class TouchSimulator(tk.Tk):
                 # one more operating measurement in the default viewport.
                 y1 = HUD_CARD_TOP + index * HUD_CARD_PITCH
                 y2 = y1 + HUD_CARD_HEIGHT
-                canvas.create_rectangle(24*sx, y1*sy, HUD_CARD_RIGHT*sx, y2*sy, fill=PANEL, outline=ACCENT, width=1)
-                text(48, y1 + 20, str(card["title"]).upper(), 14, MUTED, True)
+                alert = bool(card.get("alert"))
+                card_color = OFFLINE if alert else ACCENT
+                canvas.create_rectangle(24*sx, y1*sy, HUD_CARD_RIGHT*sx, y2*sy, fill=PANEL, outline=card_color, width=1)
+                text(48, y1 + 20, str(card["title"]).upper(), 14, OFFLINE if alert else MUTED, True)
                 value, detail = self.scroll_card_paint_text(card)
                 display_value = value if len(value) <= 24 else f"{value[:21]}..."
                 # Values retain a consistent visual weight across every
@@ -2708,9 +2729,9 @@ class TouchSimulator(tk.Tk):
                     text(48, y1 + 50, value, 15, TEXT, True, tag=f"scroll_{card['id']}_value")
                     text(48, y1 + 80, detail, 15, TEXT, True, tag=f"scroll_{card['id']}_detail")
                 else:
-                    value_color = OFFLINE if card["id"] == "write_protect" and self._confirmed_writable else TEXT
+                    value_color = OFFLINE if (alert or (card["id"] == "write_protect" and self._confirmed_writable)) else TEXT
                     text(48, y1 + 64, display_value, 24, value_color, True, tag=f"scroll_{card['id']}_value")
-                    text(400, y1 + 64, detail, 14, MUTED, True, tag=f"scroll_{card['id']}_detail")
+                    text(400, y1 + 64, detail, 14, OFFLINE if alert else MUTED, True, tag=f"scroll_{card['id']}_detail")
                 priority = card["priority"]
                 # Help precedes the display priority, matching the natural
                 # left-to-right reading order: what it means, then its rank.
